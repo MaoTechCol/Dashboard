@@ -711,23 +711,16 @@ th {
   font-weight: 700;
 }
 
-.trend-chip-row {
-  max-height: 10rem;
-  overflow: auto;
-  padding-right: 0.2rem;
+.chart-scroll-x {
+  width: 100%;
+  height: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 0.35rem;
 }
 
-.trend-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45rem;
-}
-
-.trend-chip-dot {
-  width: 0.55rem;
-  height: 0.55rem;
-  border-radius: 999px;
-  flex: 0 0 auto;
+.chart-wide-content {
+  height: 100%;
 }
 
 .report-year + .report-year {

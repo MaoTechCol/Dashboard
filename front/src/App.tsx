@@ -782,13 +782,14 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
       borderRadius: 8,
     })),
   };
+  const trendDates = snapshot.dms.semana.fechas.map(formatShortDate);
   const lineData = {
-    labels: snapshot.dms.semana.fechas.map(formatShortDate),
-    datasets: trendEntries.map(([plate, values], index) => ({
-      label: plate,
-      data: values,
-      borderColor: vehicleColor(index),
-      backgroundColor: vehicleColor(index),
+    labels: trendEntries.map(([plate]) => plate),
+    datasets: trendDates.map((dateLabel, dateIndex) => ({
+      label: dateLabel,
+      data: trendEntries.map(([, values]) => values[dateIndex] ?? 0),
+      borderColor: vehicleColor(dateIndex),
+      backgroundColor: vehicleColor(dateIndex),
       borderWidth: 2,
       pointRadius: 2,
       pointHoverRadius: 4,
@@ -798,13 +799,30 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
   };
   const trendOptions: ChartOptions<"line"> = {
     ...LINE_OPTIONS,
+    scales: {
+      x: {
+        ticks: {
+          color: TICK_COLOR,
+          maxRotation: 55,
+          minRotation: 55,
+          autoSkip: false,
+        },
+        grid: { color: GRID_COLOR },
+      },
+      y: {
+        ticks: { color: TICK_COLOR },
+        grid: { color: GRID_COLOR },
+      },
+    },
     plugins: {
       ...LINE_OPTIONS.plugins,
       legend: {
-        display: false,
+        position: "bottom",
+        labels: { color: "#eef2ff", boxWidth: 14, boxHeight: 14 },
       },
     },
   };
+  const trendMinWidth = Math.max(trendEntries.length * 56, 720);
 
   return (
     <section className="stack">
@@ -819,24 +837,10 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
       </ChartPanel>
 
       <ChartPanel title="Tendencia diaria por vehiculo">
-        <Line data={lineData} options={trendOptions} />
-      </ChartPanel>
-
-      <ChartPanel title={`Placas incluidas en la tendencia (${trendEntries.length})`}>
-        <div className="chip-row trend-chip-row">
-          {trendEntries.map(([plate], index) => (
-            <span
-              key={plate}
-              className="chip trend-chip"
-              style={{
-                borderColor: `${vehicleColor(index)}66`,
-                backgroundColor: `${vehicleColor(index)}1a`,
-              }}
-            >
-              <span className="trend-chip-dot" style={{ backgroundColor: vehicleColor(index) }} />
-              {plate}
-            </span>
-          ))}
+        <div className="chart-scroll-x">
+          <div className="chart-wide-content" style={{ minWidth: `${trendMinWidth}px` }}>
+            <Line data={lineData} options={trendOptions} />
+          </div>
         </div>
       </ChartPanel>
 
