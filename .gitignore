@@ -1,0 +1,14 @@
+.DS_Store
+front/node_modules
+front/dist
+back/.venv
+back/.env
+back/*.db
+*.egg-info/
+back/storage/*
+!back/storage/uploads/
+!back/storage/tmp/
+!back/storage/uploads/.gitkeep
+!back/storage/tmp/.gitkeep
+*.pyc
+__pycache__/

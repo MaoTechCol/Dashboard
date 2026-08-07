@@ -1,0 +1,57 @@
+[
+  {
+    "slug": "ismocol",
+    "name": "ISMOCOL UTIJP",
+    "customer": "Monitoreo Cotaba",
+    "timezone": "America/Bogota",
+    "subdomain": "dashboard.monitoreocotaba.com",
+    "fleet_ids": [
+      "249AE68E-B59D485F-90A283AF-D955C293"
+    ],
+    "device_ids": [],
+    "allowed_categories": [
+      "Uso de celular",
+      "Fatiga en progresion",
+      "Ojos cerrados",
+      "Riesgo de colision",
+      "Bostezo",
+      "Camara cubierta",
+      "Fumando",
+      "Distraccion"
+    ],
+    "subtype_map": {
+      "65": "Ojos cerrados"
+    },
+    "notes": "La tabla subtype_map queda preparada para completar los codigos tp reales del cliente cuando se confirmen.",
+    "quality_notes": [],
+    "brand": {
+      "eyebrow": "Monitoreo de Conduccion \u00b7 DMS",
+      "title": "ISMOCOL UTIJP \u2014 Panel de Seguridad de Flota",
+      "subtitle": "Captura Howen VSS \u00b7 Dashboard multiempresa local",
+      "accent": "#10b981",
+      "warning": "#f97316",
+      "danger": "#ef4444",
+      "muted": "#8a90a8"
+    },
+    "rules": {
+      "streak_window_minutes": 15,
+      "collision_window_minutes": 30,
+      "yawn_window_minutes": 60,
+      "eyes_closed_critical_threshold": 3,
+      "collision_pattern_threshold": 3,
+      "yawn_fatigue_threshold": 5,
+      "fatigue_merge_window_minutes": 60,
+      "echo_window_seconds": 60,
+      "anti_noise_daily_cap": 20,
+      "alert_close_after_hours": 2,
+      "night_window_start": 22,
+      "night_window_end": 5,
+      "ingestion_cycle_minutes": 15,
+      "feed_late_threshold_minutes": 20,
+      "feed_stopped_threshold_minutes": 45,
+      "spike_threshold_multiplier": 1.5,
+      "fatigue_profile_min_alarms": 40,
+      "night_profile_min_alarms": 15
+    }
+  }
+]

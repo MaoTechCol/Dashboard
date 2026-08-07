@@ -1,0 +1,26 @@
+[project]
+name = "dms-dashboard-back"
+version = "0.1.0"
+description = "FastAPI backend for the local DMS dashboard"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "eval_type_backport>=0.2.2",
+  "fastapi>=0.116.1",
+  "httpx>=0.28.1",
+  "pydantic-settings>=2.10.1",
+  "python-multipart>=0.0.20",
+  "sqlalchemy>=2.0.43",
+  "uvicorn[standard]>=0.35.0",
+  "websockets>=15.0.1",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
