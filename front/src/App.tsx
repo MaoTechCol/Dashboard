@@ -784,44 +784,29 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
   };
   const trendDates = snapshot.dms.semana.fechas.map(formatShortDate);
   const trendData = {
-    labels: trendEntries.map(([plate]) => plate),
-    datasets: trendDates.map((dateLabel, dateIndex) => ({
-      label: dateLabel,
-      data: trendEntries.map(([, values]) => values[dateIndex] ?? 0),
-      backgroundColor: `${vehicleColor(dateIndex)}cc`,
-      borderColor: vehicleColor(dateIndex),
-      borderWidth: 1,
-      borderRadius: 4,
-      barPercentage: 0.88,
-      categoryPercentage: 0.78,
+    labels: trendDates,
+    datasets: trendEntries.map(([plate, values], index) => ({
+      label: plate,
+      data: values,
+      borderColor: vehicleColor(index),
+      backgroundColor: vehicleColor(index),
+      borderWidth: 2,
+      pointRadius: 2,
+      pointHoverRadius: 4,
+      tension: 0.35,
+      fill: false,
     })),
   };
-  const trendOptions: ChartOptions<"bar"> = {
-    ...STACKED_BAR_OPTIONS,
-    scales: {
-      x: {
-        ticks: {
-          color: TICK_COLOR,
-          maxRotation: 55,
-          minRotation: 55,
-          autoSkip: false,
-        },
-        grid: { color: GRID_COLOR },
-      },
-      y: {
-        ticks: { color: TICK_COLOR },
-        grid: { color: GRID_COLOR },
-      },
-    },
+  const trendOptions: ChartOptions<"line"> = {
+    ...LINE_OPTIONS,
     plugins: {
-      ...STACKED_BAR_OPTIONS.plugins,
+      ...LINE_OPTIONS.plugins,
       legend: {
         position: "bottom",
         labels: { color: "#eef2ff", boxWidth: 14, boxHeight: 14 },
       },
     },
   };
-  const trendMinWidth = Math.max(trendEntries.length * 56, 720);
 
   return (
     <section className="stack">
@@ -836,11 +821,7 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
       </ChartPanel>
 
       <ChartPanel title="Tendencia diaria por vehiculo">
-        <div className="chart-scroll-x">
-          <div className="chart-wide-content" style={{ minWidth: `${trendMinWidth}px` }}>
-            <Bar data={trendData} options={trendOptions} />
-          </div>
-        </div>
+        <Line data={trendData} options={trendOptions} />
       </ChartPanel>
 
       <div className="panel">
