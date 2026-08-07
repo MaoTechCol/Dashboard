@@ -242,7 +242,6 @@ class DashboardService:
 
         table_rows.sort(key=lambda row: (row["riesgo100km"] is None, -(row["riesgo100km"] or 0), row["placa"]))
         weekly_top = [row["placa"] for row in table_rows]
-        weekly_line = [row["placa"] for row in table_rows[:5]]
         semana = {
             "veh": weekly_top,
             "cat_veh": {
@@ -259,7 +258,7 @@ class DashboardService:
             "fechas": [day_key.isoformat() for day_key in dates_7],
             "linea_veh": {
                 plate: [events_by_vehicle_day.get(plate, Counter()).get(day_key, 0) for day_key in dates_7]
-                for plate in weekly_line
+                for plate in weekly_top
             },
             "total": sum(len(event_dates.get(day_key, [])) for day_key in dates_7),
         }

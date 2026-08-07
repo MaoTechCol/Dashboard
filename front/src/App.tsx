@@ -772,6 +772,7 @@ function Last24Tab({ onTimelineFilterChange, snapshot, timelineFilter }: Last24T
 
 function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
   const labels = snapshot.dms.semana.veh;
+  const trendEntries = Object.entries(snapshot.dms.semana.linea_veh);
   const categoryData = {
     labels,
     datasets: snapshot.dms.cat_order.map((category) => ({
@@ -783,14 +784,26 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
   };
   const lineData = {
     labels: snapshot.dms.semana.fechas.map(formatShortDate),
-    datasets: Object.entries(snapshot.dms.semana.linea_veh).map(([plate, values], index) => ({
+    datasets: trendEntries.map(([plate, values], index) => ({
       label: plate,
       data: values,
       borderColor: vehicleColor(index),
       backgroundColor: vehicleColor(index),
+      borderWidth: 2,
+      pointRadius: 2,
+      pointHoverRadius: 4,
       tension: 0.35,
       fill: false,
     })),
+  };
+  const trendOptions: ChartOptions<"line"> = {
+    ...LINE_OPTIONS,
+    plugins: {
+      ...LINE_OPTIONS.plugins,
+      legend: {
+        display: false,
+      },
+    },
   };
 
   return (
@@ -806,7 +819,25 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
       </ChartPanel>
 
       <ChartPanel title="Tendencia diaria por vehiculo">
-        <Line data={lineData} options={LINE_OPTIONS} />
+        <Line data={lineData} options={trendOptions} />
+      </ChartPanel>
+
+      <ChartPanel title={`Placas incluidas en la tendencia (${trendEntries.length})`}>
+        <div className="chip-row trend-chip-row">
+          {trendEntries.map(([plate], index) => (
+            <span
+              key={plate}
+              className="chip trend-chip"
+              style={{
+                borderColor: `${vehicleColor(index)}66`,
+                backgroundColor: `${vehicleColor(index)}1a`,
+              }}
+            >
+              <span className="trend-chip-dot" style={{ backgroundColor: vehicleColor(index) }} />
+              {plate}
+            </span>
+          ))}
+        </div>
       </ChartPanel>
 
       <div className="panel">

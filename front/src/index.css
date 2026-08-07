@@ -711,6 +711,25 @@ th {
   font-weight: 700;
 }
 
+.trend-chip-row {
+  max-height: 10rem;
+  overflow: auto;
+  padding-right: 0.2rem;
+}
+
+.trend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.trend-chip-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
 .report-year + .report-year {
   margin-top: 1.25rem;
 }
