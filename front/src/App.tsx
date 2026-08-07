@@ -783,22 +783,21 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
     })),
   };
   const trendDates = snapshot.dms.semana.fechas.map(formatShortDate);
-  const lineData = {
+  const trendData = {
     labels: trendEntries.map(([plate]) => plate),
     datasets: trendDates.map((dateLabel, dateIndex) => ({
       label: dateLabel,
       data: trendEntries.map(([, values]) => values[dateIndex] ?? 0),
+      backgroundColor: `${vehicleColor(dateIndex)}cc`,
       borderColor: vehicleColor(dateIndex),
-      backgroundColor: vehicleColor(dateIndex),
-      borderWidth: 2,
-      pointRadius: 2,
-      pointHoverRadius: 4,
-      tension: 0.35,
-      fill: false,
+      borderWidth: 1,
+      borderRadius: 4,
+      barPercentage: 0.88,
+      categoryPercentage: 0.78,
     })),
   };
-  const trendOptions: ChartOptions<"line"> = {
-    ...LINE_OPTIONS,
+  const trendOptions: ChartOptions<"bar"> = {
+    ...STACKED_BAR_OPTIONS,
     scales: {
       x: {
         ticks: {
@@ -815,7 +814,7 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
       },
     },
     plugins: {
-      ...LINE_OPTIONS.plugins,
+      ...STACKED_BAR_OPTIONS.plugins,
       legend: {
         position: "bottom",
         labels: { color: "#eef2ff", boxWidth: 14, boxHeight: 14 },
@@ -839,7 +838,7 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
       <ChartPanel title="Tendencia diaria por vehiculo">
         <div className="chart-scroll-x">
           <div className="chart-wide-content" style={{ minWidth: `${trendMinWidth}px` }}>
-            <Line data={lineData} options={trendOptions} />
+            <Bar data={trendData} options={trendOptions} />
           </div>
         </div>
       </ChartPanel>
