@@ -308,6 +308,11 @@ export interface RecentAudit {
   grouped_episodes: number;
   visible_alerts: number;
   dismissed_alerts: number;
+  suppressed_by_rule: number;
+  visible_raw_events: number;
+  non_dms_hidden: number;
+  unmapped_hidden: number;
+  future_rejected: number;
 }
 
 export interface AlarmAudit {
@@ -332,6 +337,54 @@ export interface AdminAudit {
   alarms: AlarmAudit;
   anomalies: AnomalyAudit;
   recent_24h: RecentAudit;
+}
+
+export interface ReconciliationSummary {
+  company_slug: string;
+  company_name: string;
+  window_type: "calendar_day_local" | "rolling_24h";
+  range_start: string;
+  range_end: string;
+  raw_portal_equivalent: number;
+  ingested_live: number;
+  ingested_backfill: number;
+  classified_dms: number;
+  classified_non_dms: number;
+  visible_episodes: number;
+  visible_raw_events: number;
+  suppressed_by_rule: number;
+  rejected_temporal: number;
+  unmapped: number;
+  missing_local: number;
+}
+
+export interface ReconciliationDrilldownRow {
+  guid: string;
+  plate_no: string | null;
+  device_id: string | null;
+  raw_alarm_type: string | null;
+  raw_tp: string | null;
+  raw_event_code: string | null;
+  observed_at: string | null;
+  classification_status: string;
+  visibility_status: string;
+  source: string;
+  category: string | null;
+  subtype: string | null;
+  reason: string;
+  episode_guid: string | null;
+  episode_title: string | null;
+}
+
+export interface KmQualitySummary {
+  company_slug: string;
+  company_name: string;
+  vehicles_with_valid_day_km: number;
+  vehicles_with_invalid_day_km: number;
+  vehicles_with_total_regression: number;
+  current_day_km_source: string;
+  repaired_rows: number;
+  sample_invalid_vehicles: string[];
 }
 
 export interface AdminVehicle {

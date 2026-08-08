@@ -194,6 +194,11 @@ class RecentAuditView(BaseModel):
     grouped_episodes: int = 0
     visible_alerts: int = 0
     dismissed_alerts: int = 0
+    suppressed_by_rule: int = 0
+    visible_raw_events: int = 0
+    non_dms_hidden: int = 0
+    unmapped_hidden: int = 0
+    future_rejected: int = 0
 
 
 class AlarmAuditView(BaseModel):
@@ -218,6 +223,69 @@ class AdminAuditView(BaseModel):
     alarms: AlarmAuditView
     anomalies: AnomalyAuditView
     recent_24h: RecentAuditView
+
+
+class ReconciliationRunRequest(BaseModel):
+    company_slug: str
+    from_at: datetime = Field(alias="from")
+    to_at: datetime = Field(alias="to")
+    window_type: Literal["calendar_day_local", "rolling_24h"] = "calendar_day_local"
+
+    model_config = {"populate_by_name": True}
+
+
+class ReconciliationSummary(BaseModel):
+    company_slug: str
+    company_name: str
+    window_type: Literal["calendar_day_local", "rolling_24h"]
+    range_start: datetime
+    range_end: datetime
+    raw_portal_equivalent: int = 0
+    ingested_live: int = 0
+    ingested_backfill: int = 0
+    classified_dms: int = 0
+    classified_non_dms: int = 0
+    visible_episodes: int = 0
+    visible_raw_events: int = 0
+    suppressed_by_rule: int = 0
+    rejected_temporal: int = 0
+    unmapped: int = 0
+    missing_local: int = 0
+
+
+class ReconciliationDrilldownRow(BaseModel):
+    guid: str
+    plate_no: str | None = None
+    device_id: str | None = None
+    raw_alarm_type: str | None = None
+    raw_tp: str | None = None
+    raw_event_code: str | None = None
+    observed_at: datetime | None = None
+    classification_status: str
+    visibility_status: str
+    source: str
+    category: str | None = None
+    subtype: str | None = None
+    reason: str
+    episode_guid: str | None = None
+    episode_title: str | None = None
+
+
+class KmRepairRequest(BaseModel):
+    company_slug: str
+    start_date: date | None = None
+    end_date: date | None = None
+
+
+class KmQualitySummary(BaseModel):
+    company_slug: str
+    company_name: str
+    vehicles_with_valid_day_km: int = 0
+    vehicles_with_invalid_day_km: int = 0
+    vehicles_with_total_regression: int = 0
+    current_day_km_source: str = "device_state_validated"
+    repaired_rows: int = 0
+    sample_invalid_vehicles: list[str] = Field(default_factory=list)
 
 
 class AdminVehicleView(BaseModel):
@@ -344,6 +412,8 @@ class NormalizedStatus(BaseModel):
     driver_name: str | None = None
     device_name: str | None = None
     raw_event_time: str | None = None
+    raw_total_value: str | None = None
+    raw_day_value: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -355,6 +425,11 @@ class NormalizedAlarm(BaseModel):
     subtype: str | None = None
     mapping_source: str | None = None
     event_code: str | None = None
+    raw_alarm_type: str | None = None
+    raw_tp: str | None = None
+    raw_event_code: str | None = None
+    classification_status: Literal["classified_dms", "classified_non_dms", "unmapped"] = "unmapped"
+    visibility_status: str = "hidden_unmapped"
     start_at: datetime | None = None
     end_at: datetime | None = None
     plate_no: str | None = None

@@ -64,4 +64,7 @@ CATEGORY_META = {
 
 DEFAULT_SUBTYPE_MAP = {
     "65": "Ojos cerrados",
+    "66": "Bostezo",
+    "67": "Distraccion",
+    "68": "Uso de celular",
 }

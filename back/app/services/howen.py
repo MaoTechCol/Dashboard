@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncIterator
@@ -33,17 +34,40 @@ LOGIN_RATE_LIMIT_HINTS = (
     "too frequent",
 )
 
+NO_DATA_HINTS = (
+    "no data",
+    "no record",
+    "not data",
+)
+
 HISTORICAL_ALARM_TYPE_MAP = {
     "eye closed": "Ojos cerrados",
     "yawning": "Bostezo",
     "fcw (forward collision warning)": "Riesgo de colision",
+    "forward collision warning": "Riesgo de colision",
     "phone call alarm": "Uso de celular",
+    "using phone while driving": "Uso de celular",
     "distracted driving": "Distraccion",
     "dms camera covered": "Camara cubierta",
     "camera undetected": "Camara cubierta",
     "ir-blocking sunglasses": "Camara cubierta",
     "smoking": "Fumando",
+    "driver smoking": "Fumando",
     "fatigue driving alarm": "Fatiga en progresion",
+}
+
+LIVE_TP_MAP = {
+    "65": "Ojos cerrados",
+    "66": "Bostezo",
+    "67": "Distraccion",
+    "68": "Uso de celular",
+}
+
+LIVE_EVENT_CODE_MAP = {
+    "121": "Ojos cerrados",
+    "122": "Bostezo",
+    "123": "Distraccion",
+    "124": "Uso de celular",
 }
 
 
@@ -81,9 +105,12 @@ class HowenClient:
         message = str(error).lower()
         return any(hint in message for hint in LOGIN_RATE_LIMIT_HINTS)
 
+    def is_no_data_error(self, error: object) -> bool:
+        message = str(error).lower()
+        return any(hint in message for hint in NO_DATA_HINTS)
+
     def is_ignorable_historical_alarm(self, payload: dict[str, Any]) -> bool:
-        alarm_type = _normalize_alarm_type(payload.get("alarmTypeValue"))
-        return bool(alarm_type) and alarm_type not in HISTORICAL_ALARM_TYPE_MAP
+        return False
 
     def _bootstrap_session(self) -> HowenSession | None:
         if self.settings.howen_token and self.settings.howen_pid:
@@ -200,6 +227,8 @@ class HowenClient:
             response.raise_for_status()
             payload = response.json()
         if payload.get("status") != 10000:
+            if self.is_no_data_error(payload.get("msg") or ""):
+                return []
             raise RuntimeError(payload.get("msg") or "Unable to fetch historical alarms")
         return _extract_rows(payload)
 
@@ -282,13 +311,15 @@ class HowenClient:
         return NormalizedStatus(
             device_id=device_id,
             observed_at=observed_at,
-            total_km=_normalize_distance_km(mileage.get("total")),
-            day_km=_normalize_distance_km(mileage.get("todayDay")),
+            total_km=_normalize_distance_field_km(mileage.get("total")),
+            day_km=_normalize_distance_field_km(mileage.get("todayDay")),
             plate_no=plate_no,
             fleet_id=fleet_id,
             driver_name=_pick_value(driver, "name", "drivername"),
             device_name=_pick_value(payload.get("ext") or {}, "deviceName", "devicename") or plate_no,
             raw_event_time=str(event_time) if event_time else None,
+            raw_total_value=_raw_string(mileage.get("total")),
+            raw_day_value=_raw_string(mileage.get("todayDay")),
             raw=payload,
         )
 
@@ -311,17 +342,20 @@ class HowenClient:
             fleet_id=fleet_id,
             fallback=self.settings.default_timezone,
         )
+        raw_alarm_type = _pick_alarm_text(payload, detail)
+        raw_tp = _pick_alarm_tp(payload, detail)
+        raw_event_code = _pick_alarm_event_code(payload, detail)
+        category, mapping_source, classification_status = _classify_alarm(
+            raw_alarm_type=raw_alarm_type,
+            raw_tp=raw_tp,
+            raw_event_code=raw_event_code,
+            payload_category=payload.get("category") or detail.get("category"),
+            detail_category=detail.get("detail", {}).get("category") if isinstance(detail.get("detail"), dict) else None,
+            registry_subtype_map=self.registry.subtype_map(),
+        )
+        visibility_status = _visibility_for_classification(classification_status)
+
         if det:
-            subtype = str(det.get("tp")) if det.get("tp") is not None else None
-            mapped_category = self.registry.subtype_map().get(subtype or "")
-            payload_category = payload.get("category") or detail.get("category")
-            category = mapped_category or payload_category or "Sin clasificar"
-            if mapped_category:
-                mapping_source = "subtype_map"
-            elif payload_category:
-                mapping_source = "payload_category"
-            else:
-                mapping_source = "unclassified"
             location = payload.get("location") or {}
             event_time = detail.get("dtu") or detail.get("st") or location.get("dtu") or payload.get("dtu")
             occurred_at = parse_timestamp(event_time, timezone_name)
@@ -334,15 +368,20 @@ class HowenClient:
                 start_at=parse_timestamp(detail.get("st"), timezone_name),
                 end_at=parse_timestamp(detail.get("et"), timezone_name),
                 category=category,
-                subtype=subtype,
+                subtype=raw_tp or raw_alarm_type,
                 mapping_source=mapping_source,
-                event_code=str(detail.get("ec")) if detail.get("ec") is not None else None,
+                event_code=raw_event_code,
+                raw_alarm_type=raw_alarm_type,
+                raw_tp=raw_tp,
+                raw_event_code=raw_event_code,
+                classification_status=classification_status,
+                visibility_status=visibility_status,
                 plate_no=plate_no,
                 fleet_id=fleet_id,
                 driver_name=_pick_value(detail, "drname", "drivername"),
                 latitude=_safe_float(location.get("latitude")),
                 longitude=_safe_float(location.get("longitude")),
-                total_mileage_km=_normalize_distance_km(
+                total_mileage_km=_normalize_distance_field_km(
                     payload.get("totalMileage")
                     or detail.get("totalMileage")
                     or (payload.get("mileage") or {}).get("total")
@@ -351,11 +390,9 @@ class HowenClient:
                 raw=payload,
             )
 
-        historical_type = _normalize_alarm_type(detail.get("alarmTypeValue"))
-        historical_category = HISTORICAL_ALARM_TYPE_MAP.get(historical_type)
-        if not historical_category:
-            return None
-        event_time = detail.get("reportTime") or detail.get("startTime") or detail.get("endTime")
+        # In Howen historical alarms, reportTime is often stored five hours ahead of
+        # the portal-visible event time. Prefer the operational end/start time first.
+        event_time = detail.get("endTime") or detail.get("startTime") or detail.get("reportTime")
         occurred_at = parse_timestamp(event_time, timezone_name)
         if not occurred_at:
             return None
@@ -364,18 +401,23 @@ class HowenClient:
             guid=guid,
             device_id=device_id,
             occurred_at=occurred_at,
-            start_at=parse_timestamp(detail.get("startTime"), timezone_name),
-            end_at=parse_timestamp(detail.get("endTime"), timezone_name),
-            category=historical_category,
-            subtype=str(detail.get("alarmTypeValue")).strip() if detail.get("alarmTypeValue") else None,
-            mapping_source="history_alarm_type",
-            event_code=None,
+            start_at=parse_timestamp(detail.get("startTime") or detail.get("endTime"), timezone_name),
+            end_at=parse_timestamp(detail.get("endTime") or detail.get("reportTime"), timezone_name),
+            category=category,
+            subtype=raw_alarm_type or raw_tp,
+            mapping_source=mapping_source,
+            event_code=raw_event_code,
+            raw_alarm_type=raw_alarm_type,
+            raw_tp=raw_tp,
+            raw_event_code=raw_event_code,
+            classification_status=classification_status,
+            visibility_status=visibility_status,
             plate_no=plate_no,
             fleet_id=fleet_id,
             driver_name=_pick_value(detail, "driverName", "drivername"),
             latitude=latitude,
             longitude=longitude,
-            total_mileage_km=_normalize_distance_km(detail.get("totalMileage")),
+            total_mileage_km=_normalize_distance_field_km(detail.get("totalMileage")),
             raw_event_time=str(event_time) if event_time else None,
             raw=payload,
         )
@@ -410,6 +452,95 @@ def _normalize_alarm_type(value: object) -> str:
     return str(value or "").strip().lower()
 
 
+def _raw_string(value: object) -> str | None:
+    if value in (None, "", "-"):
+        return None
+    return str(value).strip()
+
+
+def _pick_alarm_text(payload: dict[str, Any], detail: dict[str, Any]) -> str | None:
+    for candidate in (
+        detail.get("alarmTypeValue"),
+        payload.get("alarmTypeValue"),
+        detail.get("alarmType"),
+        payload.get("alarmType"),
+        detail.get("alarmtypeValue"),
+        payload.get("alarmtypeValue"),
+    ):
+        raw = _raw_string(candidate)
+        if raw:
+            return raw
+    return None
+
+
+def _pick_alarm_tp(payload: dict[str, Any], detail: dict[str, Any]) -> str | None:
+    det = detail.get("det") or {}
+    direct = _raw_string(det.get("tp")) or _raw_string(detail.get("tp")) or _raw_string(payload.get("tp"))
+    if direct:
+        return direct
+    for candidate in (_raw_string(detail.get("alarmvalue")), _raw_string(payload.get("alarmvalue")), _raw_string(payload.get("alarmDetail"))):
+        if not candidate:
+            continue
+        match = re.search(r"tp:(\d+)", candidate)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _pick_alarm_event_code(payload: dict[str, Any], detail: dict[str, Any]) -> str | None:
+    return (
+        _raw_string(detail.get("ec"))
+        or _raw_string(payload.get("ec"))
+        or _raw_string(detail.get("alarmtype"))
+        or _raw_string(payload.get("alarmtype"))
+        or _raw_string(detail.get("alarmType"))
+        or _raw_string(payload.get("alarmType"))
+    )
+
+
+def _classify_alarm(
+    *,
+    raw_alarm_type: str | None,
+    raw_tp: str | None,
+    raw_event_code: str | None,
+    payload_category: object,
+    detail_category: object,
+    registry_subtype_map: dict[str, str],
+) -> tuple[str, str, str]:
+    text_key = _normalize_alarm_type(raw_alarm_type)
+    if text_key in HISTORICAL_ALARM_TYPE_MAP:
+        return HISTORICAL_ALARM_TYPE_MAP[text_key], "text_alarm_type", "classified_dms"
+    if text_key:
+        return "No DMS", "text_alarm_type", "classified_non_dms"
+
+    normalized_tp = _raw_string(raw_tp)
+    tp_map = registry_subtype_map.get(normalized_tp or "") or LIVE_TP_MAP.get(normalized_tp or "")
+    if tp_map:
+        return tp_map, "subtype_map", "classified_dms"
+
+    normalized_event_code = _raw_string(raw_event_code)
+    event_map = LIVE_EVENT_CODE_MAP.get(normalized_event_code or "")
+    if event_map:
+        return event_map, "event_code_map", "classified_dms"
+
+    for candidate in (payload_category, detail_category):
+        normalized_candidate = _normalize_alarm_type(candidate)
+        if normalized_candidate in HISTORICAL_ALARM_TYPE_MAP:
+            return HISTORICAL_ALARM_TYPE_MAP[normalized_candidate], "payload_category", "classified_dms"
+        if normalized_candidate:
+            return "No DMS", "payload_category", "classified_non_dms"
+
+    return "Sin clasificar", "unclassified", "unmapped"
+
+
+def _visibility_for_classification(classification_status: str) -> str:
+    if classification_status == "classified_dms":
+        return "candidate"
+    if classification_status == "classified_non_dms":
+        return "hidden_non_dms"
+    return "hidden_unmapped"
+
+
 def _parse_alarm_gps(value: object) -> tuple[float | None, float | None]:
     if value in (None, "", "-"):
         return None, None
@@ -420,12 +551,19 @@ def _parse_alarm_gps(value: object) -> tuple[float | None, float | None]:
     return _safe_float(lat), _safe_float(lon)
 
 
-def _normalize_distance_km(value: object) -> float | None:
-    parsed = _safe_float(value)
+def _normalize_distance_field_km(value: object) -> float | None:
+    if value in (None, "", "-"):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if isinstance(value, int):
+        return round(value / 1000, 1)
+    if isinstance(value, float) and not value.is_integer():
+        return round(value, 1)
+    if re.fullmatch(r"-?\d+", raw):
+        return round(float(raw) / 1000, 1)
+    parsed = _safe_float(raw)
     if parsed is None:
         return None
-    if parsed >= 1_000_000:
-        return round(parsed / 1000, 1)
-    if parsed >= 10_000:
-        return round(parsed / 1000, 1)
     return round(parsed, 1)

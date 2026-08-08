@@ -9,7 +9,15 @@ from sqlalchemy import select
 
 from app.api.deps import get_context, get_current_user, require_admin, resolve_company_slug
 from app.models import ReportAsset
-from app.schemas import AuthMeResponse, BackfillRequest, CompanyAssignmentRequest, LoginRequest, LoginResponse
+from app.schemas import (
+    AuthMeResponse,
+    BackfillRequest,
+    CompanyAssignmentRequest,
+    KmRepairRequest,
+    LoginRequest,
+    LoginResponse,
+    ReconciliationRunRequest,
+)
 
 router = APIRouter()
 
@@ -282,6 +290,77 @@ def admin_audit(
     if start_at >= end_at:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from debe ser menor que to")
     return context.dashboard.build_admin_audit(company_slug, start_at=start_at, end_at=end_at)
+
+
+@router.post("/admin/reconciliation/run")
+async def admin_reconciliation_run(request: Request, payload: ReconciliationRunRequest) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    return await context.dashboard.run_reconciliation(payload)
+
+
+@router.get("/admin/reconciliation/summary")
+async def admin_reconciliation_summary(
+    request: Request,
+    company: str | None = Query(default=None),
+    from_at: datetime | None = Query(default=None, alias="from"),
+    to_at: datetime | None = Query(default=None, alias="to"),
+    window_type: str = Query(default="calendar_day_local"),
+) -> dict[str, object]:
+    user = require_admin(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
+    context = get_context(request)
+    end_at = to_at or datetime.now().astimezone()
+    start_at = from_at or (end_at - timedelta(days=1))
+    if start_at >= end_at:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from debe ser menor que to")
+    return await context.dashboard.build_reconciliation_summary(
+        company_slug=company_slug,
+        start_at=start_at,
+        end_at=end_at,
+        window_type=window_type,
+    )
+
+
+@router.get("/admin/reconciliation/drilldown")
+async def admin_reconciliation_drilldown(
+    request: Request,
+    company: str | None = Query(default=None),
+    from_at: datetime | None = Query(default=None, alias="from"),
+    to_at: datetime | None = Query(default=None, alias="to"),
+    window_type: str = Query(default="calendar_day_local"),
+) -> list[dict[str, object]]:
+    user = require_admin(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
+    context = get_context(request)
+    end_at = to_at or datetime.now().astimezone()
+    start_at = from_at or (end_at - timedelta(days=1))
+    if start_at >= end_at:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from debe ser menor que to")
+    return await context.dashboard.build_reconciliation_drilldown(
+        company_slug=company_slug,
+        start_at=start_at,
+        end_at=end_at,
+        window_type=window_type,
+    )
+
+
+@router.get("/admin/km/quality")
+def admin_km_quality(
+    request: Request,
+    company: str | None = Query(default=None),
+) -> dict[str, object]:
+    user = require_admin(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
+    context = get_context(request)
+    return context.dashboard.build_km_quality(company_slug)
+
+
+@router.post("/admin/km/repair")
+def admin_km_repair(request: Request, payload: KmRepairRequest) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    return context.dashboard.repair_km(payload)
 
 
 @router.get("/admin/vehicles")

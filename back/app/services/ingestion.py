@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import delete, select
 
 from app.core.time import ensure_utc, to_local_date, utc_now
-from app.models import AlarmEvent, DailyMileageSnapshot, DeviceRecord, IngestState, IngestionAnomaly, MileageReading
+from app.models import AlarmEvent, AlarmEventAudit, DailyMileageSnapshot, DeviceRecord, IngestState, IngestionAnomaly, MileageReading
 from app.schemas import BackfillRequest, NormalizedAlarm, NormalizedStatus
 from app.services.company_registry import CompanyRegistry
 from app.services.dashboard import DashboardService
@@ -274,9 +274,12 @@ class IngestionService:
                 device_id = str(row.get("deviceno") or row.get("deviceID") or row.get("deviceid") or "").strip()
                 if not device_id:
                     continue
+                fleet_id = row.get("fleetid") or row.get("fleetId")
+                company = self.registry.resolve_company(device_id=device_id, fleet_id=fleet_id)
                 record = session.get(DeviceRecord, device_id) or DeviceRecord(device_id=device_id)
                 record.plate_no = row.get("plateno") or row.get("plateNo") or row.get("plate") or record.plate_no
-                record.fleet_id = row.get("fleetid") or row.get("fleetId") or record.fleet_id
+                record.company_slug = company.slug if company else record.company_slug
+                record.fleet_id = fleet_id or record.fleet_id
                 record.fleet_name = row.get("fleetname") or row.get("fleetName") or record.fleet_name
                 record.device_name = row.get("devicename") or row.get("deviceName") or record.device_name
                 record.record_source = "live"
@@ -292,23 +295,60 @@ class IngestionService:
     async def ingest_status(self, status: NormalizedStatus, *, received_at, update_feed_state: bool = True) -> None:
         received_at = ensure_utc(received_at) or utc_now()
         observed_at = ensure_utc(status.observed_at) or status.observed_at
+        company = self.registry.resolve_company(device_id=status.device_id, fleet_id=status.fleet_id)
+        company_slug = company.slug if company else None
         timezone_name = self.registry.timezone_for(
             device_id=status.device_id,
             fleet_id=status.fleet_id,
             fallback=self.settings.default_timezone,
         )
         snapshot_date = to_local_date(observed_at, timezone_name)
+        anomaly_reasons: list[str] = []
         with self.session_factory() as session:
             record = session.get(DeviceRecord, status.device_id) or DeviceRecord(device_id=status.device_id)
+            previous_total_km = record.last_total_km
+            validated_total_km = status.total_km
+            validated_day_km = status.day_km
+            validation_status = "valid"
+            validation_reason: str | None = None
+
+            if (
+                validated_total_km is not None
+                and previous_total_km is not None
+                and validated_total_km + 0.1 < previous_total_km
+            ):
+                validation_status = "invalid"
+                validation_reason = "total_regression"
+                anomaly_reasons.append(validation_reason)
+                validated_total_km = None
+
+            total_reference = validated_total_km if validated_total_km is not None else previous_total_km
+            if (
+                validated_day_km is not None
+                and total_reference is not None
+                and validated_day_km > total_reference + 0.1
+            ):
+                validation_status = "invalid"
+                validation_reason = _append_reason(validation_reason, "day_gt_total")
+                anomaly_reasons.append("day_gt_total")
+                validated_day_km = None
+
             record.plate_no = status.plate_no or record.plate_no
+            record.company_slug = company_slug or record.company_slug
             record.fleet_id = status.fleet_id or record.fleet_id
             record.driver_name = status.driver_name or record.driver_name
             record.device_name = status.device_name or record.device_name
             record.last_seen_at = observed_at
             record.last_received_at = received_at
-            record.last_total_km = status.total_km if status.total_km is not None else record.last_total_km
-            record.last_day_km = status.day_km if status.day_km is not None else record.last_day_km
+            if validated_total_km is not None:
+                record.last_total_km = validated_total_km
+            if validated_day_km is not None:
+                record.last_day_km = validated_day_km
             record.record_source = "live"
+            record.raw_total_value = status.raw_total_value
+            record.raw_day_value = status.raw_day_value
+            record.km_validation_status = validation_status
+            record.km_validation_reason = validation_reason
             record.raw_payload = json.dumps(status.raw, ensure_ascii=True)
             session.add(record)
 
@@ -323,21 +363,31 @@ class IngestionService:
                     device_id=status.device_id,
                     snapshot_date=snapshot_date,
                     observed_at=observed_at,
-                    total_km=status.total_km or record.last_total_km or 0.0,
-                    day_km=status.day_km,
+                    total_km=validated_total_km or record.last_total_km or 0.0,
+                    day_km=validated_day_km,
                     plate_no=record.plate_no,
+                    company_slug=record.company_slug,
                     fleet_id=record.fleet_id,
+                    raw_total_value=status.raw_total_value,
+                    raw_day_value=status.raw_day_value,
+                    km_validation_status=validation_status,
+                    km_validation_reason=validation_reason,
                     source="live",
                 )
             else:
                 snapshot.observed_at = observed_at
                 snapshot.plate_no = record.plate_no
+                snapshot.company_slug = record.company_slug
                 snapshot.fleet_id = record.fleet_id
+                snapshot.raw_total_value = status.raw_total_value
+                snapshot.raw_day_value = status.raw_day_value
+                snapshot.km_validation_status = validation_status
+                snapshot.km_validation_reason = validation_reason
                 snapshot.source = "live"
-                if status.total_km is not None:
-                    snapshot.total_km = status.total_km
-                if status.day_km is not None:
-                    snapshot.day_km = max(snapshot.day_km or 0.0, status.day_km)
+                if validated_total_km is not None:
+                    snapshot.total_km = validated_total_km
+                if validated_day_km is not None:
+                    snapshot.day_km = validated_day_km
             session.add(snapshot)
 
             state = session.get(IngestState, "global")
@@ -350,11 +400,23 @@ class IngestionService:
                 state.last_status_at = _max_datetime(state.last_status_at, observed_at)
                 state.last_error = None
             session.commit()
+        for reason in anomaly_reasons:
+            await self._record_anomaly(
+                source_type="status",
+                device_id=status.device_id,
+                company_slug=company_slug,
+                received_at=received_at,
+                raw_event_time=status.raw_event_time,
+                reason=reason,
+                payload=status.raw,
+            )
         self.mark_dirty()
 
     async def ingest_alarm(self, alarm: NormalizedAlarm, *, received_at, source: str) -> bool:
         received_at = ensure_utc(received_at) or utc_now()
         occurred_at = ensure_utc(alarm.occurred_at) or alarm.occurred_at
+        company = self.registry.resolve_company(device_id=alarm.device_id, fleet_id=alarm.fleet_id)
+        company_slug = company.slug if company else None
         timezone_name = self.registry.timezone_for(
             device_id=alarm.device_id,
             fleet_id=alarm.fleet_id,
@@ -368,21 +430,40 @@ class IngestionService:
             plate_no = alarm.plate_no or (record.plate_no if record else None)
             fleet_id = alarm.fleet_id or (record.fleet_id if record else None)
             driver_name = alarm.driver_name or (record.driver_name if record else None)
+            if not record:
+                record = DeviceRecord(device_id=alarm.device_id)
+            record.plate_no = plate_no or record.plate_no
+            record.company_slug = company_slug or record.company_slug
+            record.fleet_id = fleet_id or record.fleet_id
+            record.driver_name = driver_name or record.driver_name
+            record.last_seen_at = _max_datetime(record.last_seen_at, occurred_at)
+            if alarm.total_mileage_km is not None:
+                if record.last_total_km is None or record.last_total_km > alarm.total_mileage_km or alarm.total_mileage_km >= record.last_total_km:
+                    record.last_total_km = alarm.total_mileage_km
+            session.add(record)
 
             session.add(
                 AlarmEvent(
                     guid=alarm.guid,
                     device_id=alarm.device_id,
                     plate_no=plate_no,
+                    company_slug=company_slug,
                     fleet_id=fleet_id,
                     driver_name=driver_name,
                     category=alarm.category,
                     subtype=alarm.subtype,
                     mapping_source=alarm.mapping_source,
+                    classification_status=alarm.classification_status,
+                    visibility_status=alarm.visibility_status,
                     event_code=alarm.event_code,
+                    raw_alarm_type=alarm.raw_alarm_type,
+                    raw_tp=alarm.raw_tp,
+                    raw_event_code=alarm.raw_event_code,
                     occurred_at=occurred_at,
+                    received_at=received_at,
                     start_at=alarm.start_at,
                     end_at=alarm.end_at,
+                    raw_event_time=alarm.raw_event_time,
                     latitude=alarm.latitude,
                     longitude=alarm.longitude,
                     total_mileage_km=alarm.total_mileage_km,
@@ -390,6 +471,23 @@ class IngestionService:
                     raw_payload=json.dumps(alarm.raw, ensure_ascii=True),
                 )
             )
+            if alarm.classification_status != "classified_dms":
+                self._append_alarm_audit(
+                    session,
+                    guid=alarm.guid,
+                    company_slug=company_slug,
+                    device_id=alarm.device_id,
+                    fleet_id=fleet_id,
+                    plate_no=plate_no,
+                    observed_at=occurred_at,
+                    received_at=received_at,
+                    raw_alarm_type=alarm.raw_alarm_type,
+                    raw_tp=alarm.raw_tp,
+                    raw_event_code=alarm.raw_event_code,
+                    stage="classification",
+                    reason=alarm.classification_status,
+                    payload=alarm.raw,
+                )
 
             if alarm.total_mileage_km is not None:
                 snapshot = session.scalar(
@@ -406,15 +504,19 @@ class IngestionService:
                         total_km=alarm.total_mileage_km,
                         day_km=None,
                         plate_no=plate_no,
+                        company_slug=company_slug,
                         fleet_id=fleet_id,
+                        raw_total_value=_payload_value(alarm.raw, "totalMileage", "total"),
                         source=source,
                     )
                 else:
-                    if occurred_at > ensure_utc(snapshot.observed_at):
+                    if occurred_at >= (ensure_utc(snapshot.observed_at) or occurred_at):
                         snapshot.observed_at = occurred_at
-                    snapshot.total_km = max(snapshot.total_km or 0.0, alarm.total_mileage_km)
+                        snapshot.total_km = alarm.total_mileage_km
                     snapshot.plate_no = plate_no or snapshot.plate_no
+                    snapshot.company_slug = company_slug or snapshot.company_slug
                     snapshot.fleet_id = fleet_id or snapshot.fleet_id
+                    snapshot.raw_total_value = _payload_value(alarm.raw, "totalMileage", "total")
                     if snapshot.source != "live":
                         snapshot.source = source
                 session.add(snapshot)
@@ -519,6 +621,11 @@ class IngestionService:
         payload: dict[str, Any],
     ) -> None:
         with self.session_factory() as session:
+            raw_alarm_type = _payload_alarm_type(payload)
+            raw_tp = _payload_alarm_tp(payload)
+            raw_event_code = _payload_alarm_event_code(payload)
+            plate_no = _payload_value(payload, "plateNo", "plateno", "plate")
+            fleet_id = _payload_value(payload, "fleetID", "fleetId", "fleetid")
             session.add(
                 IngestionAnomaly(
                     source_type=source_type,
@@ -530,11 +637,88 @@ class IngestionService:
                     payload_json=json.dumps(payload, ensure_ascii=True),
                 )
             )
+            self._append_alarm_audit(
+                session,
+                guid=_payload_value(payload, "alarmID", "guid", "uuid"),
+                company_slug=company_slug,
+                device_id=device_id,
+                fleet_id=fleet_id,
+                plate_no=plate_no,
+                observed_at=None,
+                received_at=received_at,
+                raw_alarm_type=raw_alarm_type,
+                raw_tp=raw_tp,
+                raw_event_code=raw_event_code,
+                stage=source_type,
+                reason=reason,
+                payload=payload,
+            )
             state = session.get(IngestState, "global")
             if state:
                 state.last_anomaly_at = received_at
             session.commit()
         self.mark_dirty()
+
+    def _append_alarm_audit(
+        self,
+        session,
+        *,
+        guid: str | None,
+        company_slug: str | None,
+        device_id: str | None,
+        fleet_id: str | None,
+        plate_no: str | None,
+        observed_at,
+        received_at,
+        raw_alarm_type: str | None,
+        raw_tp: str | None,
+        raw_event_code: str | None,
+        stage: str,
+        reason: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if guid:
+            existing = session.scalar(
+                select(AlarmEventAudit.id).where(
+                    AlarmEventAudit.guid == guid,
+                    AlarmEventAudit.stage == stage,
+                    AlarmEventAudit.reason == reason,
+                )
+            )
+            if existing:
+                return
+        session.add(
+            AlarmEventAudit(
+                guid=guid,
+                company_slug=company_slug,
+                device_id=device_id,
+                fleet_id=fleet_id,
+                plate_no=plate_no,
+                observed_at=ensure_utc(observed_at),
+                received_at=ensure_utc(received_at) or utc_now(),
+                raw_alarm_type=raw_alarm_type,
+                raw_tp=raw_tp,
+                raw_event_code=raw_event_code,
+                stage=stage,
+                reason=reason,
+                payload_json=json.dumps(payload, ensure_ascii=True),
+            )
+        )
+
+    async def _purge_if_needed(self) -> None:
+        now = utc_now()
+        if self._last_purge_at and now - self._last_purge_at < timedelta(hours=1):
+            return
+        live_cutoff = now - timedelta(days=self.settings.live_retention_days)
+        anomaly_cutoff = now - timedelta(days=self.settings.anomaly_retention_days)
+        with self.session_factory() as session:
+            session.execute(delete(AlarmEvent).where(AlarmEvent.occurred_at < live_cutoff))
+            session.execute(delete(MileageReading).where(MileageReading.recorded_at < live_cutoff))
+            session.execute(delete(DailyMileageSnapshot).where(DailyMileageSnapshot.observed_at < live_cutoff))
+            session.execute(delete(IngestionAnomaly).where(IngestionAnomaly.received_at < anomaly_cutoff))
+            session.execute(delete(AlarmEventAudit).where(AlarmEventAudit.received_at < anomaly_cutoff))
+            session.commit()
+        self._last_purge_at = now
 
     def _should_sync_devices(self) -> bool:
         if not self._last_device_sync_at:
@@ -551,20 +735,6 @@ def _max_datetime(left, right):
         return left
     return max(left, right)
 
-    async def _purge_if_needed(self) -> None:
-        now = utc_now()
-        if self._last_purge_at and now - self._last_purge_at < timedelta(hours=1):
-            return
-        live_cutoff = now - timedelta(days=self.settings.live_retention_days)
-        anomaly_cutoff = now - timedelta(days=self.settings.anomaly_retention_days)
-        with self.session_factory() as session:
-            session.execute(delete(AlarmEvent).where(AlarmEvent.occurred_at < live_cutoff))
-            session.execute(delete(MileageReading).where(MileageReading.recorded_at < live_cutoff))
-            session.execute(delete(DailyMileageSnapshot).where(DailyMileageSnapshot.observed_at < live_cutoff))
-            session.execute(delete(IngestionAnomaly).where(IngestionAnomaly.received_at < anomaly_cutoff))
-            session.commit()
-        self._last_purge_at = now
-
 
 def _payload_value(payload: dict[str, Any], *keys: str) -> str | None:
     for key in keys:
@@ -578,3 +748,41 @@ def _payload_value(payload: dict[str, Any], *keys: str) -> str | None:
             if nested_value:
                 return nested_value
     return None
+
+
+def _payload_alarm_type(payload: dict[str, Any]) -> str | None:
+    return _payload_value(payload, "alarmTypeValue", "alarmType", "alarmtypeValue")
+
+
+def _payload_alarm_tp(payload: dict[str, Any]) -> str | None:
+    direct = _payload_value(payload, "tp")
+    if direct:
+        return direct
+    alarm_detail = _payload_value(payload, "alarmvalue", "alarmDetail")
+    if not alarm_detail:
+        return None
+    marker = "tp:"
+    if marker not in alarm_detail:
+        return None
+    tail = alarm_detail.split(marker, 1)[1]
+    digits = ""
+    for char in tail:
+        if char.isdigit():
+            digits += char
+            continue
+        break
+    return digits or None
+
+
+def _payload_alarm_event_code(payload: dict[str, Any]) -> str | None:
+    return _payload_value(payload, "ec", "alarmtype", "alarmType")
+
+
+def _append_reason(current: str | None, reason: str) -> str:
+    if not current:
+        return reason
+    reasons = [item for item in current.split(",") if item]
+    if reason in reasons:
+        return current
+    reasons.append(reason)
+    return ",".join(reasons)

@@ -43,7 +43,10 @@ import type {
   DashboardSnapshot,
   FeedState,
   IngestionAnomaly,
+  KmQualitySummary,
   MockDataPurgeResult,
+  ReconciliationDrilldownRow,
+  ReconciliationSummary,
   RecentEvent,
   ReportFile,
   TimelineFilter,
@@ -1744,36 +1747,45 @@ function AdminAuditModule({
   const [audit, setAudit] = useState<AdminAudit | null>(null);
   const [anomalies, setAnomalies] = useState<IngestionAnomaly[]>([]);
   const [vehicles, setVehicles] = useState<AdminVehicle[]>([]);
+  const [kmQuality, setKmQuality] = useState<KmQualitySummary | null>(null);
+  const [reconciliation, setReconciliation] = useState<ReconciliationSummary | null>(null);
+  const [drilldown, setDrilldown] = useState<ReconciliationDrilldownRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [windowType, setWindowType] = useState<"calendar_day_local" | "rolling_24h">("calendar_day_local");
   const [range, setRange] = useState({
     from: `${dayjs().subtract(7, "day").format("YYYY-MM-DD")}T00:00`,
     to: `${dayjs().format("YYYY-MM-DD")}T23:59`,
   });
+  const timezoneName = company?.timezone ?? "America/Bogota";
 
   const loadAudit = useCallback(async () => {
     const params = new URLSearchParams({
       company: selectedCompany,
-      from: new Date(range.from).toISOString(),
-      to: new Date(range.to).toISOString(),
+      from: toCompanyIso(range.from, timezoneName),
+      to: toCompanyIso(range.to, timezoneName),
     });
 
     try {
-      const [nextAudit, nextAnomalies, nextVehicles] = await Promise.all([
+      const [nextAudit, nextAnomalies, nextVehicles, nextKmQuality] = await Promise.all([
         apiJson<AdminAudit>(`/admin/audit?${params.toString()}`),
         apiJson<IngestionAnomaly[]>(`/admin/anomalies?company=${encodeURIComponent(selectedCompany)}&limit=100`),
         apiJson<AdminVehicle[]>(`/admin/vehicles?company=${encodeURIComponent(selectedCompany)}`),
+        apiJson<KmQualitySummary>(`/admin/km/quality?company=${encodeURIComponent(selectedCompany)}`),
       ]);
       setAudit(nextAudit);
       setAnomalies(nextAnomalies);
       setVehicles(nextVehicles);
+      setKmQuality(nextKmQuality);
       setError(null);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "No se pudo cargar la auditoria");
     } finally {
       setLoading(false);
     }
-  }, [range.from, range.to, selectedCompany]);
+  }, [range.from, range.to, selectedCompany, timezoneName]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -1785,6 +1797,66 @@ function AdminAuditModule({
     return () => window.clearInterval(timer);
   }, [enabled, loadAudit]);
 
+  const runReconciliation = async () => {
+    try {
+      setActionLoading(true);
+      setError(null);
+      setSuccess(null);
+      const body = {
+        company_slug: selectedCompany,
+        from: toCompanyIso(range.from, timezoneName),
+        to: toCompanyIso(range.to, timezoneName),
+        window_type: windowType,
+      };
+      const params = new URLSearchParams({
+        company: selectedCompany,
+        from: toCompanyIso(range.from, timezoneName),
+        to: toCompanyIso(range.to, timezoneName),
+        window_type: windowType,
+      });
+      const [nextSummary, nextDrilldown] = await Promise.all([
+        apiJson<ReconciliationSummary>("/admin/reconciliation/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        apiJson<ReconciliationDrilldownRow[]>(`/admin/reconciliation/drilldown?${params.toString()}`),
+      ]);
+      setReconciliation(nextSummary);
+      setDrilldown(nextDrilldown);
+      setSuccess("Reconciliacion ejecutada contra Howen y base local actualizada para este rango.");
+      await loadAudit();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "No se pudo ejecutar la reconciliacion");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const repairKm = async () => {
+    try {
+      setActionLoading(true);
+      setError(null);
+      setSuccess(null);
+      const result = await apiJson<KmQualitySummary & { repaired_rows: number }>("/admin/km/repair", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          company_slug: selectedCompany,
+          start_date: range.from.slice(0, 10),
+          end_date: range.to.slice(0, 10),
+        }),
+      });
+      setKmQuality(result);
+      setSuccess(`Reparacion de kilometros completada. Filas reparadas: ${result.repaired_rows}.`);
+      await loadAudit();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "No se pudo reparar kilometraje");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
   return (
     <main className="page-grid">
       <section className="panel">
@@ -1792,6 +1864,7 @@ function AdminAuditModule({
         <h3>Conciliacion live de {company?.name ?? selectedCompany}</h3>
         <p className="panel-copy">
           Aqui validamos lo recibido, lo aceptado por reglas y lo que finalmente queda visible en el dashboard operativo.
+          Todos los rangos de esta vista se interpretan en la hora local de {company?.timezone ?? "America/Bogota"}.
         </p>
       </section>
 
@@ -1813,20 +1886,126 @@ function AdminAuditModule({
               onChange={(event) => setRange((current) => ({ ...current, to: event.target.value }))}
             />
           </label>
+          <label>
+            Ventana
+            <select value={windowType} onChange={(event) => setWindowType(event.target.value as "calendar_day_local" | "rolling_24h")}>
+              <option value="calendar_day_local">Dia calendario local</option>
+              <option value="rolling_24h">Rolling 24h</option>
+            </select>
+          </label>
           <button className="ghost-btn" type="button" onClick={() => void loadAudit()}>
             <RefreshCw size={16} />
             Refrescar auditoria
+          </button>
+          <button className="primary-btn" type="button" onClick={() => void runReconciliation()} disabled={actionLoading}>
+            <RefreshCw size={16} />
+            Correr reconciliacion exacta
+          </button>
+          <button className="ghost-btn" type="button" onClick={() => void repairKm()} disabled={actionLoading}>
+            <Gauge size={16} />
+            Reparar km
           </button>
         </div>
       </section>
 
       {error ? <div className="banner error">{error}</div> : null}
+      {success ? <div className="banner success">{success}</div> : null}
 
       <section className="metric-grid four">
         <MetricCard label="Alarmas aceptadas" value={String(audit?.alarms.accepted_total ?? (loading ? "..." : 0))} detail="Entraron al almacenamiento analitico" />
         <MetricCard label="Visibles por reglas" value={String(audit?.alarms.visible_total ?? (loading ? "..." : 0))} detail="Despues de filtros y agrupacion" />
-        <MetricCard label="Alertas 24h visibles" value={String(audit?.recent_24h.visible_alerts ?? (loading ? "..." : 0))} detail={`Descartadas: ${audit?.recent_24h.dismissed_alerts ?? 0}`} />
+        <MetricCard
+          label="Suprimidas por regla"
+          value={String(audit?.recent_24h.suppressed_by_rule ?? (loading ? "..." : 0))}
+          detail={`Visible raw: ${audit?.recent_24h.visible_raw_events ?? 0}`}
+        />
+        <MetricCard
+          label="Ocultas no-DMS / unmapped"
+          value={`${audit?.recent_24h.non_dms_hidden ?? 0} / ${audit?.recent_24h.unmapped_hidden ?? 0}`}
+          detail={`Futuro rechazado: ${audit?.recent_24h.future_rejected ?? 0}`}
+        />
         <MetricCard label="Vehiculos live" value={String(vehicles.length)} detail="Ultimo estado reconciliado por vehiculo" />
+      </section>
+
+      <section className="double-panel">
+        <div className="panel">
+          <h3>Reconciliacion exacta vs Howen</h3>
+          {reconciliation ? (
+            <div className="key-value-list">
+              <div className="key-value-row">
+                <span>Crudas portal equivalente</span>
+                <strong>{reconciliation.raw_portal_equivalent}</strong>
+              </div>
+              <div className="key-value-row">
+                <span>DMS / no-DMS / unmapped</span>
+                <strong>
+                  {reconciliation.classified_dms} / {reconciliation.classified_non_dms} / {reconciliation.unmapped}
+                </strong>
+              </div>
+              <div className="key-value-row">
+                <span>Ingestadas live / backfill</span>
+                <strong>
+                  {reconciliation.ingested_live} / {reconciliation.ingested_backfill}
+                </strong>
+              </div>
+              <div className="key-value-row">
+                <span>Episodios visibles / crudas visibles</span>
+                <strong>
+                  {reconciliation.visible_episodes} / {reconciliation.visible_raw_events}
+                </strong>
+              </div>
+              <div className="key-value-row">
+                <span>Suprimidas / faltantes locales</span>
+                <strong>
+                  {reconciliation.suppressed_by_rule} / {reconciliation.missing_local}
+                </strong>
+              </div>
+              <div className="key-value-row">
+                <span>Temporalidad rechazada</span>
+                <strong>{reconciliation.rejected_temporal}</strong>
+              </div>
+            </div>
+          ) : (
+            <div className="empty-copy">
+              Ejecuta la reconciliacion exacta para comparar el rango contra Howen usando la hora local de {company?.name ?? selectedCompany}.
+            </div>
+          )}
+        </div>
+
+        <div className="panel">
+          <h3>Calidad de kilometros</h3>
+          {kmQuality ? (
+            <div className="key-value-list">
+              <div className="key-value-row">
+                <span>Vehiculos con day_km valido</span>
+                <strong>{kmQuality.vehicles_with_valid_day_km}</strong>
+              </div>
+              <div className="key-value-row">
+                <span>Vehiculos con day_km invalido</span>
+                <strong>{kmQuality.vehicles_with_invalid_day_km}</strong>
+              </div>
+              <div className="key-value-row">
+                <span>Regresiones de total</span>
+                <strong>{kmQuality.vehicles_with_total_regression}</strong>
+              </div>
+              <div className="key-value-row">
+                <span>Fuente del dia actual</span>
+                <strong>{kmQuality.current_day_km_source}</strong>
+              </div>
+              <div className="key-value-row">
+                <span>Filas reparadas</span>
+                <strong>{kmQuality.repaired_rows}</strong>
+              </div>
+            </div>
+          ) : (
+            <div className="empty-copy">Aun no hay resumen de calidad de kilometros.</div>
+          )}
+          {kmQuality?.sample_invalid_vehicles.length ? (
+            <div className="panel-copy" style={{ marginTop: "1rem" }}>
+              Muestra invalida: {kmQuality.sample_invalid_vehicles.join(", ")}
+            </div>
+          ) : null}
+        </div>
       </section>
 
       <section className="double-panel">
@@ -1857,7 +2036,7 @@ function AdminAuditModule({
             ))}
           </div>
           <div className="panel-copy" style={{ marginTop: "1rem" }}>
-            Episodios 24h agrupados: {audit?.recent_24h.grouped_episodes ?? 0} · crudos 24h: {audit?.recent_24h.raw_events ?? 0}
+            Episodios agrupados: {audit?.recent_24h.grouped_episodes ?? 0} · crudos visibles 24h: {audit?.recent_24h.raw_events ?? 0}
           </div>
         </div>
       </section>
@@ -1891,6 +2070,45 @@ function AdminAuditModule({
           </div>
           <div className="panel-copy">Total de anomalias en rango: {audit?.anomalies.total ?? 0}</div>
         </div>
+      </section>
+
+      <section className="panel table-wrap">
+        <h3>Drilldown de reconciliacion</h3>
+        {drilldown.length === 0 ? (
+          <div className="empty-copy">
+            Aun no hay drilldown exacto cargado. Corre la reconciliacion para ver, por evento, si quedo visible, fusionado, suprimido, sin mapa o faltante local.
+          </div>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Hora</th>
+                <th>Placa</th>
+                <th>Tipo crudo</th>
+                <th>Categoria</th>
+                <th>Estado</th>
+                <th>Motivo</th>
+                <th>Fuente</th>
+              </tr>
+            </thead>
+            <tbody>
+              {drilldown.slice(0, 80).map((row) => (
+                <tr key={row.guid}>
+                  <td>{row.observed_at ? formatDateTime(row.observed_at, timezoneName) : "-"}</td>
+                  <td>{row.plate_no ?? row.device_id ?? "-"}</td>
+                  <td>{row.raw_alarm_type ?? `tp ${row.raw_tp ?? "-"} / ec ${row.raw_event_code ?? "-"}`}</td>
+                  <td>{row.category ? formatCategory(row.category) : "-"}</td>
+                  <td>{row.visibility_status}</td>
+                  <td>
+                    {formatAuditReason(row.reason)}
+                    {row.episode_title ? ` · ${row.episode_title}` : ""}
+                  </td>
+                  <td>{row.source}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </section>
 
       <section className="panel table-wrap">
@@ -2177,6 +2395,10 @@ function formatDateTime(value: string, timezoneName = "America/Bogota") {
   return dayjs(value).tz(timezoneName).format("DD/MM/YYYY HH:mm");
 }
 
+function toCompanyIso(value: string, timezoneName = "America/Bogota") {
+  return dayjs.tz(value, timezoneName).toISOString();
+}
+
 function formatClockTime(value: string, timezoneName = "America/Bogota") {
   return dayjs(value).tz(timezoneName).format("HH:mm");
 }
@@ -2231,6 +2453,21 @@ function humanBytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatAuditReason(value: string) {
+  return value
+    .replaceAll("_", " ")
+    .replace("classified non dms", "clasificada como no DMS")
+    .replace("missing local", "no existe en local")
+    .replace("stored local unmapped", "guardada local sin mapa")
+    .replace("stored local classified non dms", "guardada local como no DMS")
+    .replace("suppressed by rule", "suprimida por regla")
+    .replace("rejected temporal", "rechazada por temporalidad")
+    .replace("fused in episode", "fusionada en episodio")
+    .replace("visible episode", "abre episodio")
+    .replace("missing dashboard mapping", "oculta por mapeo local")
+    .replace("normalization failed", "fallo de normalizacion");
 }
 
 function vehicleColor(index: number) {

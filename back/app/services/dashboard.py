@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
+import json
 from statistics import mean
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -10,7 +11,7 @@ from sqlalchemy import or_, select
 
 from app.core.catalog import CATEGORY_META, CATEGORY_ORDER
 from app.core.time import as_timezone, ensure_utc, utc_now
-from app.models import AlarmEvent, DailyMileageSnapshot, DeviceRecord, IngestState, IngestionAnomaly, MileageReading, ReportAsset
+from app.models import AlarmEvent, AlarmEventAudit, DailyMileageSnapshot, DeviceRecord, IngestState, IngestionAnomaly, MileageReading, ReportAsset
 from app.schemas import (
     AdminLiveSetupView,
     AdminAuditView,
@@ -25,15 +26,21 @@ from app.schemas import (
     FleetCandidateView,
     FeedSocketPayload,
     FeedState,
+    KmQualitySummary,
+    KmRepairRequest,
     KmSummaryView,
     MockDataPurgeResult,
     MockDataSummaryView,
+    ReconciliationDrilldownRow,
+    ReconciliationRunRequest,
+    ReconciliationSummary,
     RecentAuditView,
     ReportFileView,
     ReportsSummaryView,
     UnclassifiedCodeView,
 )
 from app.services.company_registry import CompanyRegistry
+from app.services.howen import HowenClient
 
 ACTIVE_EVENT_SOURCES = ("live", "backfill")
 ACTIVE_SNAPSHOT_SOURCES = ("live", "backfill")
@@ -47,6 +54,7 @@ class DashboardService:
         self.session_factory = session_factory
         self.registry = registry
         self.settings = settings
+        self.howen = HowenClient(settings=settings, registry=registry)
 
     def build_snapshot(self, company_slug: str) -> dict[str, Any]:
         company = self.registry.get(company_slug)
@@ -735,6 +743,17 @@ class DashboardService:
                     .order_by(IngestionAnomaly.received_at.desc())
                 )
             )
+            alarm_audits = list(
+                session.scalars(
+                    select(AlarmEventAudit)
+                    .where(
+                        AlarmEventAudit.company_slug == company_slug,
+                        AlarmEventAudit.received_at >= start_at,
+                        AlarmEventAudit.received_at <= end_at,
+                    )
+                    .order_by(AlarmEventAudit.received_at.desc())
+                )
+            )
             baseline_snapshots = [
                 snapshot
                 for snapshot in session.scalars(
@@ -752,10 +771,29 @@ class DashboardService:
             event.occurred_at = ensure_utc(event.occurred_at) or event.occurred_at
         for snapshot in baseline_snapshots:
             snapshot.observed_at = ensure_utc(snapshot.observed_at) or snapshot.observed_at
-        visible_alarms = [event for event in all_company_alarms if self.registry.category_allowed(company, event.category)]
+        for audit_row in alarm_audits:
+            audit_row.received_at = ensure_utc(audit_row.received_at) or audit_row.received_at
+            audit_row.observed_at = ensure_utc(audit_row.observed_at)
+        visible_alarms = [event for event in all_company_alarms if event.classification_status == "classified_dms"]
         recent_visible_alarms = [event for event in visible_alarms if event.occurred_at >= recent_24h_start]
         daily_km_by_vehicle, _ = _build_daily_km(baseline_snapshots, [], all_company_alarms, tz)
-        recent_metrics = _build_recent_episode_metrics(recent_visible_alarms, company, tz, daily_km_by_vehicle)
+        recent_analysis = _build_recent_episode_analysis(recent_visible_alarms, company, tz, daily_km_by_vehicle)
+        recent_metrics = dict(recent_analysis["metrics"])
+        recent_metrics["non_dms_hidden"] = sum(
+            1
+            for event in all_company_alarms
+            if event.occurred_at >= recent_24h_start and event.classification_status == "classified_non_dms"
+        )
+        recent_metrics["unmapped_hidden"] = sum(
+            1
+            for event in all_company_alarms
+            if event.occurred_at >= recent_24h_start and event.classification_status == "unmapped"
+        )
+        recent_metrics["future_rejected"] = sum(
+            1
+            for audit_row in alarm_audits
+            if audit_row.received_at >= recent_24h_start and audit_row.reason == "future_timestamp"
+        )
 
         return AdminAuditView(
             company_slug=company.slug,
@@ -765,12 +803,14 @@ class DashboardService:
             alarms=AlarmAuditView(
                 accepted_total=len(all_company_alarms),
                 visible_total=len(visible_alarms),
-                unclassified_total=sum(1 for event in visible_alarms if event.category == "Sin clasificar"),
-                mapping_sources=dict(Counter(event.mapping_source or "unknown" for event in visible_alarms)),
-                by_category=dict(Counter(event.category for event in visible_alarms)),
+                unclassified_total=sum(1 for event in all_company_alarms if event.classification_status == "unmapped"),
+                mapping_sources=dict(Counter(event.mapping_source or "unknown" for event in all_company_alarms)),
+                by_category=dict(Counter(event.category for event in all_company_alarms)),
                 by_subtype=[
                     {"subtype": subtype or "sin_subtipo", "count": count}
-                    for subtype, count in Counter(event.subtype or "" for event in visible_alarms).most_common(20)
+                    for subtype, count in Counter(
+                        event.raw_alarm_type or event.subtype or event.raw_tp or "" for event in all_company_alarms
+                    ).most_common(20)
                 ],
             ),
             anomalies=AnomalyAuditView(
@@ -779,6 +819,629 @@ class DashboardService:
             ),
             recent_24h=RecentAuditView(**recent_metrics),
         ).model_dump(mode="json")
+
+    async def run_reconciliation(self, payload: ReconciliationRunRequest) -> dict[str, Any]:
+        company = self.registry.get(payload.company_slug)
+        range_start, range_end = _resolve_reconciliation_range(
+            company=company,
+            start_at=payload.from_at,
+            end_at=payload.to_at,
+            window_type=payload.window_type,
+            fallback_timezone=self.settings.default_timezone,
+        )
+        portal_rows = await self._fetch_portal_rows(company, range_start=range_start, range_end=range_end)
+        self._sync_portal_rows(company=company, portal_rows=portal_rows)
+        summary, _ = self._build_reconciliation_report(
+            company=company,
+            range_start=range_start,
+            range_end=range_end,
+            window_type=payload.window_type,
+            portal_rows=portal_rows,
+        )
+        return summary
+
+    async def build_reconciliation_summary(
+        self,
+        *,
+        company_slug: str,
+        start_at: datetime,
+        end_at: datetime,
+        window_type: str,
+    ) -> dict[str, Any]:
+        company = self.registry.get(company_slug)
+        range_start, range_end = _resolve_reconciliation_range(
+            company=company,
+            start_at=start_at,
+            end_at=end_at,
+            window_type=window_type,
+            fallback_timezone=self.settings.default_timezone,
+        )
+        portal_rows = await self._fetch_portal_rows(company, range_start=range_start, range_end=range_end)
+        summary, _ = self._build_reconciliation_report(
+            company=company,
+            range_start=range_start,
+            range_end=range_end,
+            window_type=window_type,
+            portal_rows=portal_rows,
+        )
+        return summary
+
+    async def build_reconciliation_drilldown(
+        self,
+        *,
+        company_slug: str,
+        start_at: datetime,
+        end_at: datetime,
+        window_type: str,
+    ) -> list[dict[str, Any]]:
+        company = self.registry.get(company_slug)
+        range_start, range_end = _resolve_reconciliation_range(
+            company=company,
+            start_at=start_at,
+            end_at=end_at,
+            window_type=window_type,
+            fallback_timezone=self.settings.default_timezone,
+        )
+        portal_rows = await self._fetch_portal_rows(company, range_start=range_start, range_end=range_end)
+        _, rows = self._build_reconciliation_report(
+            company=company,
+            range_start=range_start,
+            range_end=range_end,
+            window_type=window_type,
+            portal_rows=portal_rows,
+        )
+        return rows
+
+    def build_km_quality(self, company_slug: str) -> dict[str, Any]:
+        company = self.registry.get(company_slug)
+        now_local = utc_now().astimezone(ZoneInfo(company.timezone or self.settings.default_timezone))
+        today = now_local.date()
+        with self.session_factory() as session:
+            devices = [
+                device
+                for device in session.scalars(select(DeviceRecord).where(DeviceRecord.record_source == "live").order_by(DeviceRecord.plate_no))
+                if self.registry.device_belongs(company, device.device_id, device.fleet_id)
+            ]
+            snapshots = [
+                snapshot
+                for snapshot in session.scalars(
+                    select(DailyMileageSnapshot)
+                    .where(DailyMileageSnapshot.snapshot_date == today)
+                    .order_by(DailyMileageSnapshot.observed_at.desc())
+                )
+                if self.registry.device_belongs(company, snapshot.device_id, snapshot.fleet_id)
+            ]
+
+        latest_snapshot_by_device: dict[str, DailyMileageSnapshot] = {}
+        for snapshot in snapshots:
+            latest_snapshot_by_device.setdefault(snapshot.device_id, snapshot)
+
+        valid_day = 0
+        invalid_day = 0
+        total_regression = 0
+        samples: list[str] = []
+        for device in devices:
+            snapshot = latest_snapshot_by_device.get(device.device_id)
+            if device.km_validation_reason and "total_regression" in device.km_validation_reason:
+                total_regression += 1
+            total_reference = device.last_total_km
+            device_valid = _is_valid_day_km(device.last_day_km, total_reference)
+            snapshot_valid = bool(snapshot and _is_valid_day_km(snapshot.day_km, snapshot.total_km))
+            is_valid = device_valid or snapshot_valid
+            if is_valid:
+                valid_day += 1
+            else:
+                invalid_day += 1
+                if device.plate_no and len(samples) < 8:
+                    samples.append(device.plate_no)
+            if snapshot and snapshot.km_validation_reason and "total_regression" in snapshot.km_validation_reason:
+                total_regression += 1
+
+        repaired_rows = sum(1 for snapshot in snapshots if snapshot.repaired_at is not None)
+        return KmQualitySummary(
+            company_slug=company.slug,
+            company_name=company.name,
+            vehicles_with_valid_day_km=valid_day,
+            vehicles_with_invalid_day_km=invalid_day,
+            vehicles_with_total_regression=total_regression,
+            current_day_km_source="device_state_or_alarm_derived",
+            repaired_rows=repaired_rows,
+            sample_invalid_vehicles=samples,
+        ).model_dump(mode="json")
+
+    def repair_km(self, payload: KmRepairRequest) -> dict[str, Any]:
+        company = self.registry.get(payload.company_slug)
+        tz = ZoneInfo(company.timezone or self.settings.default_timezone)
+        start_date = payload.start_date or (utc_now().astimezone(tz).date() - timedelta(days=30))
+        end_date = payload.end_date or utc_now().astimezone(tz).date()
+        start_bound = datetime.combine(start_date, datetime.min.time(), tzinfo=tz).astimezone(ZoneInfo("UTC"))
+        end_bound = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=tz).astimezone(ZoneInfo("UTC"))
+        repaired_rows = 0
+
+        with self.session_factory() as session:
+            devices = [
+                device
+                for device in session.scalars(select(DeviceRecord).where(DeviceRecord.record_source == "live").order_by(DeviceRecord.device_id))
+                if self.registry.device_belongs(company, device.device_id, device.fleet_id)
+            ]
+            alarms = [
+                alarm
+                for alarm in session.scalars(
+                    select(AlarmEvent)
+                    .where(
+                        AlarmEvent.occurred_at >= start_bound,
+                        AlarmEvent.occurred_at < end_bound,
+                    )
+                    .order_by(AlarmEvent.occurred_at)
+                )
+                if self.registry.device_belongs(company, alarm.device_id, alarm.fleet_id)
+            ]
+            snapshots = [
+                snapshot
+                for snapshot in session.scalars(
+                    select(DailyMileageSnapshot)
+                    .where(
+                        DailyMileageSnapshot.snapshot_date >= start_date,
+                        DailyMileageSnapshot.snapshot_date <= end_date,
+                    )
+                    .order_by(DailyMileageSnapshot.device_id, DailyMileageSnapshot.snapshot_date, DailyMileageSnapshot.observed_at)
+                )
+                if self.registry.device_belongs(company, snapshot.device_id, snapshot.fleet_id)
+            ]
+
+            alarm_totals_by_device_day: dict[str, dict[date, list[tuple[datetime, float]]]] = defaultdict(lambda: defaultdict(list))
+            for alarm in alarms:
+                raw_payload = _parse_json(alarm.raw_payload)
+                normalized_total = _normalize_distance_payload_value(
+                    _nested_value(raw_payload, "totalMileage")
+                    or _nested_value(raw_payload, "total")
+                )
+                if normalized_total is not None and alarm.total_mileage_km != normalized_total:
+                    alarm.total_mileage_km = normalized_total
+                if alarm.total_mileage_km is None:
+                    continue
+                normalized_persisted = _normalize_persisted_alarm_km(alarm.total_mileage_km)
+                if normalized_persisted is None:
+                    continue
+                occurred_at = ensure_utc(alarm.occurred_at) or alarm.occurred_at
+                day_key = occurred_at.astimezone(tz).date()
+                alarm_totals_by_device_day[alarm.device_id][day_key].append((occurred_at, normalized_persisted))
+
+            derived_day_km_by_device_day: dict[str, dict[date, float]] = defaultdict(dict)
+            latest_total_by_device: dict[str, float] = {}
+            for device_id, days in alarm_totals_by_device_day.items():
+                previous_day_max: float | None = None
+                for day_key in sorted(days):
+                    samples = sorted(days[day_key], key=lambda item: item[0])
+                    values = [value for _, value in samples]
+                    if not values:
+                        continue
+                    day_min = min(values)
+                    day_max = max(values)
+                    derived_km = max(day_max - day_min, 0.0)
+                    if derived_km <= 0 and previous_day_max is not None and day_max >= previous_day_max:
+                        derived_km = max(day_max - previous_day_max, 0.0)
+                    derived_day_km_by_device_day[device_id][day_key] = round(derived_km, 1)
+                    previous_day_max = day_max
+                    latest_total_by_device[device_id] = day_max
+
+            for device in devices:
+                raw_payload = _parse_json(device.raw_payload)
+                mileage = raw_payload.get("mileage") if isinstance(raw_payload.get("mileage"), dict) else {}
+                normalized_total = _normalize_distance_payload_value(mileage.get("total"))
+                normalized_day = _normalize_distance_payload_value(mileage.get("todayDay"))
+                derived_total = latest_total_by_device.get(device.device_id)
+                derived_day = derived_day_km_by_device_day.get(device.device_id, {}).get(end_date)
+                if derived_total is not None and (normalized_total is None or derived_total > normalized_total):
+                    normalized_total = derived_total
+                if derived_day is not None:
+                    normalized_day = derived_day
+                if normalized_total is not None:
+                    device.last_total_km = normalized_total
+                if _is_valid_day_km(normalized_day, normalized_total):
+                    device.last_day_km = normalized_day
+                    device.km_validation_status = "valid"
+                    device.km_validation_reason = None
+                else:
+                    device.km_validation_status = "invalid"
+                    device.km_validation_reason = "day_gt_total" if normalized_day is not None else "missing_day_km"
+                device.raw_total_value = _string_or_none(mileage.get("total"))
+                device.raw_day_value = _string_or_none(mileage.get("todayDay"))
+
+            snapshots_by_device: dict[str, list[DailyMileageSnapshot]] = defaultdict(list)
+            for snapshot in snapshots:
+                snapshots_by_device[snapshot.device_id].append(snapshot)
+
+            devices_by_id = {device.device_id: device for device in devices}
+            for device_id, rows in snapshots_by_device.items():
+                rows.sort(key=lambda item: (item.snapshot_date, item.observed_at))
+                previous_total: float | None = None
+                for snapshot in rows:
+                    derived_total = latest_total_by_device.get(device_id) if snapshot.snapshot_date == end_date else None
+                    normalized_total = derived_total if derived_total is not None else snapshot.total_km
+                    candidate_day = derived_day_km_by_device_day.get(device_id, {}).get(snapshot.snapshot_date, snapshot.day_km)
+                    repaired_day = _sanitize_day_km_value(candidate_day, normalized_total, previous_total)
+                    next_validation_reason = None if repaired_day is not None else "day_gt_total"
+                    device = devices_by_id.get(device_id)
+                    if snapshot.snapshot_date == end_date and device and _is_valid_day_km(device.last_day_km, device.last_total_km):
+                        repaired_day = round(device.last_day_km or 0.0, 1)
+                        next_validation_reason = None
+                        normalized_total = device.last_total_km if device.last_total_km is not None else normalized_total
+                    if normalized_total is not None and snapshot.total_km != normalized_total:
+                        snapshot.total_km = normalized_total
+                        snapshot.repair_reason = "normalized_from_raw_payload"
+                        snapshot.repaired_at = utc_now()
+                        repaired_rows += 1
+                    if repaired_day != snapshot.day_km:
+                        snapshot.day_km = repaired_day
+                        snapshot.repair_reason = "normalized_from_raw_payload"
+                        snapshot.repaired_at = utc_now()
+                        repaired_rows += 1
+                    snapshot.km_validation_status = "valid" if repaired_day is not None else "invalid"
+                    snapshot.km_validation_reason = next_validation_reason
+                    previous_total = normalized_total if normalized_total is not None else previous_total
+
+            session.commit()
+
+        return self.build_km_quality(company.slug) | {"repaired_rows": repaired_rows}
+
+    async def _fetch_portal_rows(
+        self,
+        company: CompanyConfig,
+        *,
+        range_start: datetime,
+        range_end: datetime,
+    ) -> list[dict[str, Any]]:
+        session = await self.howen.resolve_session(force_login=False)
+        tz = ZoneInfo(company.timezone or self.settings.default_timezone)
+        start_local = ensure_utc(range_start).astimezone(tz)
+        end_local = ensure_utc(range_end).astimezone(tz)
+        with self.session_factory() as db:
+            device_ids = [
+                device.device_id
+                for device in db.scalars(select(DeviceRecord).where(DeviceRecord.record_source == "live").order_by(DeviceRecord.device_id))
+                if self.registry.device_belongs(company, device.device_id, device.fleet_id)
+            ]
+        if not device_ids and company.device_ids:
+            device_ids = list(company.device_ids)
+
+        portal_rows: list[dict[str, Any]] = []
+        for device_id in device_ids:
+            try:
+                portal_rows.extend(
+                    await self.howen.fetch_historical_alarms(
+                        session.token,
+                        device_id=device_id,
+                        start_at=start_local,
+                        end_at=end_local,
+                    )
+                )
+            except Exception as exc:
+                if not self.howen.is_auth_error(exc):
+                    raise
+                self.howen.clear_cached_session()
+                session = await self.howen.resolve_session(force_login=True)
+                portal_rows.extend(
+                    await self.howen.fetch_historical_alarms(
+                        session.token,
+                        device_id=device_id,
+                        start_at=start_local,
+                        end_at=end_local,
+                    )
+                )
+        return portal_rows
+
+    def _build_reconciliation_report(
+        self,
+        *,
+        company: CompanyConfig,
+        range_start: datetime,
+        range_end: datetime,
+        window_type: str,
+        portal_rows: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        tz = ZoneInfo(company.timezone or self.settings.default_timezone)
+        baseline_start = ensure_utc(range_end).astimezone(tz).date() - timedelta(days=30)
+        with self.session_factory() as session:
+            local_alarms = [
+                event
+                for event in session.scalars(
+                    select(AlarmEvent)
+                    .where(
+                        AlarmEvent.source.in_(ACTIVE_EVENT_SOURCES),
+                        AlarmEvent.occurred_at >= range_start,
+                        AlarmEvent.occurred_at <= range_end,
+                    )
+                    .order_by(AlarmEvent.occurred_at)
+                )
+                if self.registry.device_belongs(company, event.device_id, event.fleet_id)
+            ]
+            baseline_snapshots = [
+                snapshot
+                for snapshot in session.scalars(
+                    select(DailyMileageSnapshot)
+                    .where(DailyMileageSnapshot.snapshot_date >= baseline_start)
+                    .order_by(DailyMileageSnapshot.snapshot_date, DailyMileageSnapshot.observed_at)
+                )
+                if self.registry.device_belongs(company, snapshot.device_id, snapshot.fleet_id)
+            ]
+
+        for event in local_alarms:
+            event.occurred_at = ensure_utc(event.occurred_at) or event.occurred_at
+        for snapshot in baseline_snapshots:
+            snapshot.observed_at = ensure_utc(snapshot.observed_at) or snapshot.observed_at
+
+        local_by_guid = {event.guid: event for event in local_alarms}
+        dms_local_alarms = [event for event in local_alarms if event.classification_status == "classified_dms"]
+        daily_km_by_vehicle, _ = _build_daily_km(baseline_snapshots, [], local_alarms, tz)
+        episode_analysis = _build_recent_episode_analysis(dms_local_alarms, company, tz, daily_km_by_vehicle)
+        guid_status = episode_analysis["guid_status"]
+
+        raw_portal_equivalent = 0
+        ingested_live = 0
+        ingested_backfill = 0
+        classified_dms = 0
+        classified_non_dms = 0
+        visible_raw_events = 0
+        suppressed_by_rule = 0
+        rejected_temporal = 0
+        unmapped = 0
+        missing_local = 0
+        rows: list[dict[str, Any]] = []
+        seen_guids: set[str] = set()
+
+        for portal_row in portal_rows:
+            normalized = self.howen.normalize_alarm(portal_row)
+            guid = normalized.guid if normalized else (_payload_guid(portal_row) or f"raw-{raw_portal_equivalent + 1}")
+            if guid in seen_guids:
+                continue
+            seen_guids.add(guid)
+            raw_portal_equivalent += 1
+
+            if not normalized:
+                unmapped += 1
+                rows.append(
+                    ReconciliationDrilldownRow(
+                        guid=guid,
+                        plate_no=_payload_plate(portal_row),
+                        device_id=_payload_device(portal_row),
+                        raw_alarm_type=_payload_alarm_type(portal_row),
+                        raw_tp=_payload_alarm_tp(portal_row),
+                        raw_event_code=_payload_alarm_event_code(portal_row),
+                        observed_at=None,
+                        classification_status="unmapped",
+                        visibility_status="hidden_unmapped",
+                        source="portal_raw",
+                        category=None,
+                        subtype=None,
+                        reason="normalization_failed",
+                    ).model_dump(mode="json")
+                )
+                continue
+
+            future_rejected = _is_future_event(
+                normalized.occurred_at,
+                tolerance_minutes=self.settings.anomaly_future_tolerance_minutes,
+            )
+            local_match = local_by_guid.get(normalized.guid)
+            if local_match and local_match.source == "live":
+                ingested_live += 1
+            elif local_match and local_match.source == "backfill":
+                ingested_backfill += 1
+
+            if normalized.classification_status == "classified_dms":
+                classified_dms += 1
+            elif normalized.classification_status == "classified_non_dms":
+                classified_non_dms += 1
+            else:
+                unmapped += 1
+
+            reason = "classified_non_dms"
+            visibility_status = normalized.visibility_status
+            episode_guid = None
+            episode_title = None
+            source_label = local_match.source if local_match else "portal_raw"
+            category = local_match.category if local_match else normalized.category
+            subtype = local_match.subtype if local_match else normalized.subtype
+
+            if future_rejected:
+                rejected_temporal += 1
+                reason = "rejected_temporal"
+                visibility_status = "rejected_temporal"
+            elif normalized.classification_status == "classified_non_dms":
+                reason = "classified_non_dms"
+                visibility_status = "hidden_non_dms"
+            elif normalized.classification_status == "unmapped":
+                reason = "unmapped"
+                visibility_status = "hidden_unmapped"
+            elif not local_match:
+                missing_local += 1
+                reason = "missing_local"
+                visibility_status = "missing_local"
+            elif local_match.classification_status != "classified_dms":
+                missing_local += 1
+                reason = f"stored_local_{local_match.classification_status or 'unknown'}"
+                visibility_status = "missing_dashboard_mapping"
+            else:
+                local_visibility = guid_status.get(normalized.guid)
+                if not local_visibility:
+                    suppressed_by_rule += 1
+                    reason = "suppressed_by_rule"
+                    visibility_status = "suppressed_by_rule"
+                else:
+                    reason = local_visibility["reason"]
+                    visibility_status = local_visibility["visibility_status"]
+                    episode_guid = local_visibility.get("episode_guid")
+                    episode_title = local_visibility.get("episode_title")
+                    if visibility_status in {"visible_episode", "fused_in_episode"}:
+                        visible_raw_events += 1
+                    elif visibility_status == "suppressed_by_rule":
+                        suppressed_by_rule += 1
+
+            rows.append(
+                ReconciliationDrilldownRow(
+                    guid=normalized.guid,
+                    plate_no=local_match.plate_no if local_match else normalized.plate_no,
+                    device_id=normalized.device_id,
+                    raw_alarm_type=normalized.raw_alarm_type,
+                    raw_tp=normalized.raw_tp,
+                    raw_event_code=normalized.raw_event_code,
+                    observed_at=normalized.occurred_at,
+                    classification_status=normalized.classification_status,
+                    visibility_status=visibility_status,
+                    source=source_label,
+                    category=category,
+                    subtype=subtype,
+                    reason=reason,
+                    episode_guid=episode_guid,
+                    episode_title=episode_title,
+                ).model_dump(mode="json")
+            )
+
+        rows.sort(key=lambda item: item["observed_at"] or "", reverse=True)
+        return (
+            ReconciliationSummary(
+                company_slug=company.slug,
+                company_name=company.name,
+                window_type=window_type,
+                range_start=range_start,
+                range_end=range_end,
+                raw_portal_equivalent=raw_portal_equivalent,
+                ingested_live=ingested_live,
+                ingested_backfill=ingested_backfill,
+                classified_dms=classified_dms,
+                classified_non_dms=classified_non_dms,
+                visible_episodes=episode_analysis["metrics"]["visible_alerts"],
+                visible_raw_events=visible_raw_events,
+                suppressed_by_rule=suppressed_by_rule,
+                rejected_temporal=rejected_temporal,
+                unmapped=unmapped,
+                missing_local=missing_local,
+            ).model_dump(mode="json"),
+            rows,
+        )
+
+    def _sync_portal_rows(self, *, company: CompanyConfig, portal_rows: list[dict[str, Any]]) -> None:
+        now = utc_now()
+        with self.session_factory() as session:
+            snapshot_cache: dict[tuple[str, date], DailyMileageSnapshot | None] = {}
+            for portal_row in portal_rows:
+                normalized = self.howen.normalize_alarm(portal_row)
+                if not normalized or _is_future_event(
+                    normalized.occurred_at,
+                    tolerance_minutes=self.settings.anomaly_future_tolerance_minutes,
+                ):
+                    continue
+                occurred_at = ensure_utc(normalized.occurred_at) or normalized.occurred_at
+                existing = session.get(AlarmEvent, normalized.guid)
+                device = session.get(DeviceRecord, normalized.device_id) or DeviceRecord(device_id=normalized.device_id)
+                device.plate_no = normalized.plate_no or device.plate_no
+                device.company_slug = company.slug
+                device.fleet_id = normalized.fleet_id or device.fleet_id
+                device.driver_name = normalized.driver_name or device.driver_name
+                device.last_seen_at = _max_or_value(device.last_seen_at, occurred_at)
+                if normalized.total_mileage_km is not None:
+                    device.last_total_km = normalized.total_mileage_km
+                session.add(device)
+                effective_fleet_id = normalized.fleet_id or device.fleet_id
+                effective_plate = normalized.plate_no or device.plate_no
+
+                audit_reason = None
+                if not existing:
+                    existing = AlarmEvent(
+                        guid=normalized.guid,
+                        device_id=normalized.device_id,
+                        occurred_at=occurred_at,
+                        source="backfill",
+                    )
+                    audit_reason = "inserted_from_portal"
+                    session.add(existing)
+                elif (
+                    existing.category != normalized.category
+                    or existing.classification_status != normalized.classification_status
+                    or existing.subtype != normalized.subtype
+                ):
+                    audit_reason = "updated_from_portal"
+
+                existing.plate_no = effective_plate or existing.plate_no
+                existing.company_slug = company.slug
+                existing.fleet_id = effective_fleet_id or existing.fleet_id
+                existing.driver_name = normalized.driver_name or existing.driver_name
+                existing.category = normalized.category
+                existing.subtype = normalized.subtype
+                existing.mapping_source = normalized.mapping_source
+                existing.classification_status = normalized.classification_status
+                existing.visibility_status = normalized.visibility_status
+                existing.event_code = normalized.event_code
+                existing.raw_alarm_type = normalized.raw_alarm_type
+                existing.raw_tp = normalized.raw_tp
+                existing.raw_event_code = normalized.raw_event_code
+                existing.occurred_at = occurred_at
+                existing.received_at = now
+                existing.start_at = normalized.start_at
+                existing.end_at = normalized.end_at
+                existing.raw_event_time = normalized.raw_event_time
+                existing.latitude = normalized.latitude
+                existing.longitude = normalized.longitude
+                existing.total_mileage_km = normalized.total_mileage_km
+                existing.raw_payload = json.dumps(normalized.raw, ensure_ascii=True)
+
+                snapshot_date = occurred_at.astimezone(ZoneInfo(company.timezone or self.settings.default_timezone)).date()
+                if normalized.total_mileage_km is not None:
+                    snapshot_key = (normalized.device_id, snapshot_date)
+                    snapshot = snapshot_cache.get(snapshot_key)
+                    if snapshot_key not in snapshot_cache:
+                        snapshot = session.scalar(
+                            select(DailyMileageSnapshot).where(
+                                DailyMileageSnapshot.device_id == normalized.device_id,
+                                DailyMileageSnapshot.snapshot_date == snapshot_date,
+                            )
+                        )
+                        snapshot_cache[snapshot_key] = snapshot
+                    if not snapshot:
+                        snapshot = DailyMileageSnapshot(
+                            device_id=normalized.device_id,
+                            plate_no=effective_plate,
+                            company_slug=company.slug,
+                            fleet_id=effective_fleet_id,
+                            snapshot_date=snapshot_date,
+                            total_km=normalized.total_mileage_km,
+                            day_km=None,
+                            raw_total_value=_string_or_none(_nested_value(normalized.raw, "totalMileage") or _nested_value(normalized.raw, "total")),
+                            source="backfill",
+                            observed_at=occurred_at,
+                        )
+                        snapshot_cache[snapshot_key] = snapshot
+                    else:
+                        if occurred_at >= (ensure_utc(snapshot.observed_at) or occurred_at):
+                            snapshot.observed_at = occurred_at
+                            snapshot.total_km = normalized.total_mileage_km
+                        snapshot.plate_no = effective_plate or snapshot.plate_no
+                        snapshot.company_slug = company.slug
+                        snapshot.fleet_id = effective_fleet_id or snapshot.fleet_id
+                        snapshot.raw_total_value = _string_or_none(
+                            _nested_value(normalized.raw, "totalMileage") or _nested_value(normalized.raw, "total")
+                        )
+                    session.add(snapshot)
+
+                if audit_reason:
+                    _append_dashboard_audit(
+                        session,
+                        guid=normalized.guid,
+                        company_slug=company.slug,
+                        device_id=normalized.device_id,
+                        fleet_id=effective_fleet_id,
+                        plate_no=effective_plate,
+                        observed_at=occurred_at,
+                        received_at=now,
+                        raw_alarm_type=normalized.raw_alarm_type,
+                        raw_tp=normalized.raw_tp,
+                        raw_event_code=normalized.raw_event_code,
+                        stage="reconciliation",
+                        reason=audit_reason,
+                        payload=normalized.raw,
+                    )
+            session.commit()
 
     def list_vehicle_status(self, company_slug: str) -> list[dict[str, Any]]:
         company = self.registry.get(company_slug)
@@ -929,14 +1592,14 @@ def _build_daily_km(
         entries.sort(key=lambda item: item[0])
         previous_total: float | None = None
         for day_key, snapshot in entries:
-            if snapshot.day_km is not None:
-                km = round(max(snapshot.day_km, 0.0), 1)
-            elif previous_total is not None:
-                km = round(max((snapshot.total_km or 0.0) - previous_total, 0.0), 1)
-            else:
-                km = round(max(snapshot.total_km or 0.0, 0.0), 1)
+            total_km = round(max(snapshot.total_km or 0.0, 0.0), 1) if snapshot.total_km is not None else None
+            km = _sanitize_day_km_value(snapshot.day_km, total_km, previous_total)
+            if km is None and total_km is not None and previous_total is not None:
+                km = round(max(total_km - previous_total, 0.0), 1)
+            elif km is None:
+                km = 0.0
             _merge_daily_km_value(grouped, fleet_by_date, plate, day_key, km, replace=True)
-            previous_total = snapshot.total_km
+            previous_total = total_km if total_km is not None else previous_total
 
     raw_grouped: dict[str, dict[date, list[MileageReading]]] = defaultdict(lambda: defaultdict(list))
     for reading in legacy_mileages:
@@ -1013,6 +1676,8 @@ def _normalize_persisted_alarm_km(value: float | None) -> float | None:
     normalized = float(value)
     if normalized >= 100_000:
         normalized /= 1000
+    elif normalized >= 10_000:
+        normalized /= 1000
     return round(max(normalized, 0.0), 1)
 
 
@@ -1044,12 +1709,16 @@ def _merge_current_day_from_device_state(
         reference_time = device.last_received_at or device.last_seen_at
         if not reference_time or reference_time.astimezone(tz).date() != latest_day:
             continue
-        if device.last_day_km is None:
+        next_value = _sanitize_day_km_value(device.last_day_km, device.last_total_km, None)
+        if next_value is None:
             continue
         plate = device.plate_no or device.device_id
-        next_value = round(max(device.last_day_km, 0.0), 1)
-        current_value = daily_km_by_vehicle[plate].get(latest_day, 0.0)
-        if next_value <= current_value:
+        current_value = daily_km_by_vehicle[plate].get(latest_day)
+        if current_value is None:
+            daily_km_by_vehicle[plate][latest_day] = next_value
+            fleet_km_by_date[latest_day] += next_value
+            continue
+        if round(current_value, 1) == round(next_value, 1):
             continue
         daily_km_by_vehicle[plate][latest_day] = next_value
         fleet_km_by_date[latest_day] += next_value - current_value
@@ -1061,12 +1730,30 @@ def _build_recent_episode_metrics(
     tz: ZoneInfo,
     daily_km_by_vehicle: dict[str, dict[date, float]],
 ) -> dict[str, int]:
+    return dict(_build_recent_episode_analysis(events, company, tz, daily_km_by_vehicle)["metrics"])
+
+
+def _build_recent_episode_analysis(
+    events: list[AlarmEvent],
+    company: CompanyConfig,
+    tz: ZoneInfo,
+    daily_km_by_vehicle: dict[str, dict[date, float]],
+) -> dict[str, Any]:
     if not events:
         return {
-            "raw_events": 0,
-            "grouped_episodes": 0,
-            "visible_alerts": 0,
-            "dismissed_alerts": 0,
+            "metrics": {
+                "raw_events": 0,
+                "grouped_episodes": 0,
+                "visible_alerts": 0,
+                "dismissed_alerts": 0,
+                "suppressed_by_rule": 0,
+                "visible_raw_events": 0,
+                "non_dms_hidden": 0,
+                "unmapped_hidden": 0,
+                "future_rejected": 0,
+            },
+            "guid_status": {},
+            "episodes": [],
         }
 
     raw_events = sorted(events, key=lambda event: event.occurred_at.astimezone(tz))
@@ -1095,13 +1782,22 @@ def _build_recent_episode_metrics(
                 current["events"].append(event)
             continue
 
-        next_group = {"plate": event.plate_no or event.device_id, "category": event.category, "events": [event]}
+        next_group = {
+            "plate": event.plate_no or event.device_id,
+            "category": event.category,
+            "events": [event],
+            "group_id": (event.plate_no or event.device_id, event.category, event.guid),
+        }
         open_groups[key] = next_group
         grouped.append(next_group)
 
     visible = 0
     dismissed = 0
+    suppressed_raw = 0
+    visible_raw = 0
     consumed: set[tuple[str, str, str]] = set()
+    guid_status: dict[str, dict[str, Any]] = {}
+    episodes: list[dict[str, Any]] = []
     company_events_by_vehicle_day = defaultdict(Counter)
     for event in raw_events:
         plate = event.plate_no or event.device_id
@@ -1121,7 +1817,7 @@ def _build_recent_episode_metrics(
         first = group["events"][0]
         last = group["events"][-1]
         plate = group["plate"]
-        group_key = (plate, group["category"], first.guid)
+        group_key = group["group_id"]
         if group_key in consumed:
             continue
 
@@ -1134,6 +1830,10 @@ def _build_recent_episode_metrics(
         )
         baseline = baselines.get(plate, 0.0)
         deviation = round((today_counts.get(plate, 0) / baseline), 2) if baseline else float(today_counts.get(plate, 0) or 1.0)
+        current_category = group["category"]
+        reason = "visible"
+        merged_groups = [group]
+        episode_title = current_category
 
         if group["category"] == "Ojos cerrados":
             matching_yawn = next(
@@ -1152,25 +1852,88 @@ def _build_recent_episode_metrics(
                 None,
             )
             if matching_yawn:
-                consumed.add((plate, "Bostezo", matching_yawn["events"][0].guid))
-                visible += 1
+                consumed.add(matching_yawn["group_id"])
+                merged_groups.append(matching_yawn)
+                current_category = "Fatiga en progresion"
+                reason = "merged_yawn_into_fatigue"
+                episode_title = "Fatiga en progresion"
             elif len(group["events"]) >= company.rules.eyes_closed_critical_threshold or len(group["events"]) == 2:
-                visible += 1
+                episode_title = "Ojos cerrados"
             else:
                 dismissed += 1
+                suppressed_raw += len(group["events"])
+                for event in group["events"]:
+                    guid_status[event.guid] = {
+                        "visibility_status": "suppressed_by_rule",
+                        "reason": "single_eye_closed",
+                        "episode_guid": None,
+                        "episode_title": None,
+                    }
+                continue
         elif group["category"] == "Distraccion":
             if deviation < 3:
                 dismissed += 1
-            else:
-                visible += 1
-        else:
-            visible += 1
+                suppressed_raw += len(group["events"])
+                for event in group["events"]:
+                    guid_status[event.guid] = {
+                        "visibility_status": "suppressed_by_rule",
+                        "reason": "distraction_below_3x",
+                        "episode_guid": None,
+                        "episode_title": None,
+                    }
+                continue
+            episode_title = "Distraccion"
+        elif group["category"] == "Uso de celular":
+            episode_title = "Uso de celular"
+        elif group["category"] == "Riesgo de colision":
+            episode_title = "Riesgo de colision"
+        elif group["category"] == "Bostezo":
+            episode_title = "Bostezo"
+        elif group["category"] == "Camara cubierta":
+            episode_title = "Camara cubierta"
+
+        if same_day_count > company.rules.anti_noise_daily_cap:
+            reason = "anti_noise_daily_cap"
+            episode_title = f"{group['category']} fuera de patron"
+
+        merged_events = sorted(
+            [event for merged_group in merged_groups for event in merged_group["events"]],
+            key=lambda event: event.occurred_at.astimezone(tz),
+        )
+        visible += 1
+        visible_raw += len(merged_events)
+        episode_guid = merged_events[0].guid
+        episodes.append(
+            {
+                "episode_guid": episode_guid,
+                "episode_title": episode_title,
+                "category": current_category,
+                "guid_count": len(merged_events),
+                "raw_guids": [event.guid for event in merged_events],
+            }
+        )
+        for index, event in enumerate(merged_events):
+            guid_status[event.guid] = {
+                "visibility_status": "visible_episode" if index == 0 else "fused_in_episode",
+                "reason": reason if index == 0 else "fused_in_episode",
+                "episode_guid": episode_guid,
+                "episode_title": episode_title,
+            }
 
     return {
-        "raw_events": len(raw_events),
-        "grouped_episodes": len(grouped),
-        "visible_alerts": visible,
-        "dismissed_alerts": dismissed,
+        "metrics": {
+            "raw_events": len(raw_events),
+            "grouped_episodes": len(grouped),
+            "visible_alerts": visible,
+            "dismissed_alerts": dismissed,
+            "suppressed_by_rule": suppressed_raw,
+            "visible_raw_events": visible_raw,
+            "non_dms_hidden": 0,
+            "unmapped_hidden": 0,
+            "future_rejected": 0,
+        },
+        "guid_status": guid_status,
+        "episodes": episodes,
     }
 
 
@@ -1229,3 +1992,183 @@ def _is_mock_fleet_id(fleet_id: str | None) -> bool:
 
 def _is_mock_identity(device_id: str | None, fleet_id: str | None) -> bool:
     return _is_mock_device_id(device_id) or _is_mock_fleet_id(fleet_id)
+
+
+def _resolve_reconciliation_range(
+    *,
+    company: CompanyConfig,
+    start_at: datetime,
+    end_at: datetime,
+    window_type: str,
+    fallback_timezone: str,
+) -> tuple[datetime, datetime]:
+    tz = ZoneInfo(company.timezone or fallback_timezone)
+    start_utc = ensure_utc(start_at) or start_at.astimezone()
+    end_utc = ensure_utc(end_at) or end_at.astimezone()
+    if window_type == "rolling_24h":
+        end_utc = end_utc
+        start_utc = end_utc - timedelta(hours=24)
+        return start_utc, end_utc
+    start_local = start_utc.astimezone(tz)
+    end_local = end_utc.astimezone(tz)
+    return start_local.astimezone(ZoneInfo("UTC")), end_local.astimezone(ZoneInfo("UTC"))
+
+
+def _parse_json(raw_value: str | None) -> dict[str, Any]:
+    if not raw_value:
+        return {}
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _nested_value(payload: dict[str, Any], key: str) -> Any:
+    if key in payload:
+        return payload.get(key)
+    for nested_key in ("payload", "mileage", "location", "det", "ext"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            value = _nested_value(nested, key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value in (None, "", "-"):
+        return None
+    return str(value).strip()
+
+
+def _normalize_distance_payload_value(value: Any) -> float | None:
+    raw = _string_or_none(value)
+    if raw is None:
+        return None
+    if raw.lstrip("-").isdigit():
+        return round(float(raw) / 1000, 1)
+    try:
+        return round(float(raw.replace(",", "")), 1)
+    except ValueError:
+        return None
+
+
+def _is_valid_day_km(day_km: float | None, total_km: float | None) -> bool:
+    if day_km is None or day_km < 0:
+        return False
+    if day_km > 1000:
+        return False
+    if total_km is not None and day_km > total_km + 0.1:
+        return False
+    return True
+
+
+def _sanitize_day_km_value(day_km: float | None, total_km: float | None, previous_total: float | None) -> float | None:
+    if _is_valid_day_km(day_km, total_km):
+        return round(day_km or 0.0, 1)
+    if total_km is not None and previous_total is not None and total_km >= previous_total:
+        derived = total_km - previous_total
+        if _is_valid_day_km(derived, total_km):
+            return round(derived, 1)
+    return None
+
+
+def _payload_guid(payload: dict[str, Any]) -> str | None:
+    return _string_or_none(_nested_value(payload, "alarmID") or _nested_value(payload, "guid") or _nested_value(payload, "uuid"))
+
+
+def _payload_plate(payload: dict[str, Any]) -> str | None:
+    return _string_or_none(_nested_value(payload, "plateNo") or _nested_value(payload, "plateno") or _nested_value(payload, "plate"))
+
+
+def _payload_device(payload: dict[str, Any]) -> str | None:
+    return _string_or_none(_nested_value(payload, "deviceID") or _nested_value(payload, "deviceno") or _nested_value(payload, "deviceid"))
+
+
+def _payload_alarm_type(payload: dict[str, Any]) -> str | None:
+    return _string_or_none(_nested_value(payload, "alarmTypeValue") or _nested_value(payload, "alarmType"))
+
+
+def _payload_alarm_tp(payload: dict[str, Any]) -> str | None:
+    direct = _string_or_none(_nested_value(payload, "tp"))
+    if direct:
+        return direct
+    detail = _string_or_none(_nested_value(payload, "alarmDetail") or _nested_value(payload, "alarmvalue"))
+    if not detail or "tp:" not in detail:
+        return None
+    digits = detail.split("tp:", 1)[1]
+    result = ""
+    for char in digits:
+        if char.isdigit():
+            result += char
+            continue
+        break
+    return result or None
+
+
+def _payload_alarm_event_code(payload: dict[str, Any]) -> str | None:
+    return _string_or_none(_nested_value(payload, "ec") or _nested_value(payload, "alarmtype") or _nested_value(payload, "alarmType"))
+
+
+def _is_future_event(observed_at: datetime | None, *, tolerance_minutes: int) -> bool:
+    observed_utc = ensure_utc(observed_at)
+    if observed_utc is None:
+        return False
+    return observed_utc > utc_now() + timedelta(minutes=tolerance_minutes)
+
+
+def _append_dashboard_audit(
+    session,
+    *,
+    guid: str | None,
+    company_slug: str | None,
+    device_id: str | None,
+    fleet_id: str | None,
+    plate_no: str | None,
+    observed_at: datetime | None,
+    received_at: datetime,
+    raw_alarm_type: str | None,
+    raw_tp: str | None,
+    raw_event_code: str | None,
+    stage: str,
+    reason: str,
+    payload: dict[str, Any],
+) -> None:
+    if guid:
+        existing = session.scalar(
+            select(AlarmEventAudit.id).where(
+                AlarmEventAudit.guid == guid,
+                AlarmEventAudit.stage == stage,
+                AlarmEventAudit.reason == reason,
+            )
+        )
+        if existing:
+            return
+    session.add(
+        AlarmEventAudit(
+            guid=guid,
+            company_slug=company_slug,
+            device_id=device_id,
+            fleet_id=fleet_id,
+            plate_no=plate_no,
+            observed_at=ensure_utc(observed_at),
+            received_at=ensure_utc(received_at) or utc_now(),
+            raw_alarm_type=raw_alarm_type,
+            raw_tp=raw_tp,
+            raw_event_code=raw_event_code,
+            stage=stage,
+            reason=reason,
+            payload_json=json.dumps(payload, ensure_ascii=True),
+        )
+    )
+
+
+def _max_or_value(current: datetime | None, candidate: datetime | None) -> datetime | None:
+    current = ensure_utc(current)
+    candidate = ensure_utc(candidate)
+    if current is None:
+        return candidate
+    if candidate is None:
+        return current
+    return max(current, candidate)
