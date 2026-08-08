@@ -1,4 +1,4 @@
-const rawBase = import.meta.env.VITE_API_BASE_URL?.trim() || "http://127.0.0.1:8000/api";
+const rawBase = import.meta.env.VITE_API_BASE_URL?.trim() || "/api";
 
 export const API_BASE = rawBase.replace(/\/$/, "");
 export const DASHBOARD_REFRESH_MS = Number(import.meta.env.VITE_DASHBOARD_REFRESH_MS?.trim() || "900000");
