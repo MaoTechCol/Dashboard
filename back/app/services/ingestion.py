@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import suppress
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
 
@@ -38,6 +39,7 @@ class IngestionService:
         self._dirty = asyncio.Event()
         self._last_purge_at = None
         self._last_device_sync_at = None
+        self._last_operational_catchup_at: dict[str, Any] = {}
 
     async def start(self) -> None:
         self._ensure_state_row()
@@ -82,13 +84,39 @@ class IngestionService:
                 await self._set_state(connection_state="connecting", last_error=None)
                 session = await self.howen.resolve_session(force_login=force_login)
                 await self.sync_devices(session.token, force=True)
+                await self._run_operational_catchup()
                 await self._set_state(connection_state="connected", last_error=None)
                 force_login = False
 
                 async for message in self.howen.listen(session):
+                    if not isinstance(message, dict):
+                        await self._record_ws_message_anomaly(
+                            action="__invalid_message__",
+                            payload=message,
+                            received_at=utc_now(),
+                        )
+                        continue
                     action = str(message.get("action") or "")
-                    payload = message.get("payload") or {}
                     received_at = utc_now()
+                    raw_payload = message.get("payload")
+                    if action in {"__raw_text__", "__non_dict__"}:
+                        await self._record_ws_message_anomaly(
+                            action=action,
+                            payload=raw_payload,
+                            received_at=received_at,
+                        )
+                        continue
+
+                    if action in {"80003", "80004"} and not isinstance(raw_payload, dict):
+                        await self._record_ws_message_anomaly(
+                            action=action,
+                            payload=raw_payload,
+                            received_at=received_at,
+                        )
+                        continue
+
+                    payload = raw_payload if isinstance(raw_payload, dict) else {}
+                    payload_text = None if isinstance(raw_payload, dict) or raw_payload in (None, "") else str(raw_payload)
 
                     if action == "80003":
                         status = self.howen.normalize_status(payload)
@@ -126,10 +154,10 @@ class IngestionService:
                             payload=alarm.raw,
                         ):
                             await self.ingest_alarm(alarm, received_at=received_at, source="live")
-                    elif action == "80000" and payload.get("result") == "fail":
-                        raise RuntimeError(payload.get("msg") or "Howen websocket login failed")
-                    elif action == "80009" and self.howen.is_auth_error(payload.get("msg") or payload.get("result") or ""):
-                        raise RuntimeError(payload.get("msg") or "Howen heartbeat rejected the current session")
+                    elif action == "80000" and ((payload.get("result") or "").lower() == "fail" or (payload_text or "").lower() == "fail"):
+                        raise RuntimeError(payload.get("msg") or payload_text or "Howen websocket login failed")
+                    elif action == "80009" and self.howen.is_auth_error(payload.get("msg") or payload.get("result") or payload_text or ""):
+                        raise RuntimeError(payload.get("msg") or payload_text or "Howen heartbeat rejected the current session")
 
                     if self._should_sync_devices():
                         await self.sync_devices(session.token, force=False)
@@ -213,6 +241,44 @@ class IngestionService:
                 if created:
                     inserted += 1
         return {"inserted": inserted, "anomalies": anomalies, "devices": len(device_ids)}
+
+    async def _run_operational_catchup(self) -> None:
+        now_utc = utc_now()
+        for company in self.registry.all():
+            if not self.registry.is_operational(company):
+                continue
+            last_run = ensure_utc(self._last_operational_catchup_at.get(company.slug))
+            if last_run and now_utc - last_run < timedelta(minutes=30):
+                continue
+            tz = ZoneInfo(company.timezone or self.settings.default_timezone)
+            start_at = datetime.combine(now_utc.astimezone(tz).date(), datetime.min.time(), tzinfo=tz).astimezone(ZoneInfo("UTC"))
+            try:
+                result = await self.backfill_historical(
+                    BackfillRequest(
+                        company_slug=company.slug,
+                        start_at=start_at,
+                        end_at=now_utc,
+                    )
+                )
+            except Exception as exc:
+                await self._record_anomaly(
+                    source_type="catchup",
+                    device_id=None,
+                    company_slug=company.slug,
+                    received_at=utc_now(),
+                    raw_event_time=None,
+                    reason=f"catchup_failed:{type(exc).__name__}",
+                    payload={
+                        "company_slug": company.slug,
+                        "error": str(exc),
+                        "range_start": start_at.isoformat(),
+                        "range_end": now_utc.isoformat(),
+                    },
+                )
+                continue
+            self._last_operational_catchup_at[company.slug] = now_utc
+            if result["inserted"] or result["anomalies"]:
+                self.mark_dirty()
 
     async def replay_status_anomalies(self, *, limit: int = 2000) -> dict[str, int]:
         with self.session_factory() as session:
@@ -607,6 +673,24 @@ class IngestionService:
             raw_event_time=raw_event_time,
             reason="normalization_failed",
             payload=payload,
+        )
+
+    async def _record_ws_message_anomaly(
+        self,
+        *,
+        action: str,
+        payload: Any,
+        received_at,
+    ) -> None:
+        normalized_payload = payload if isinstance(payload, dict) else {"action": action, "raw_payload": payload, "raw_type": type(payload).__name__}
+        await self._record_anomaly(
+            source_type="ws_message",
+            device_id=None,
+            company_slug=None,
+            received_at=received_at,
+            raw_event_time=None,
+            reason="unexpected_message_shape",
+            payload=normalized_payload,
         )
 
     async def _record_anomaly(

@@ -250,13 +250,13 @@ class HowenClient:
                     }
                 )
             )
-            login_reply = json.loads(await websocket.recv())
-            if (login_reply.get("payload") or {}).get("result") == "fail":
-                raise RuntimeError((login_reply.get("payload") or {}).get("msg") or "Howen websocket login failed")
+            login_reply = _decode_ws_message(await websocket.recv())
+            if _message_payload_value(login_reply, "result") == "fail":
+                raise RuntimeError(_message_payload_value(login_reply, "msg") or "Howen websocket login failed")
 
             await websocket.send(json.dumps({"action": "80001", "payload": ""}))
             try:
-                subscribe_reply = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+                subscribe_reply = _decode_ws_message(await asyncio.wait_for(websocket.recv(), timeout=5))
                 yield subscribe_reply
             except Exception:
                 pass
@@ -281,7 +281,7 @@ class HowenClient:
 
             heartbeat_task = asyncio.create_task(heartbeat())
             async for raw in websocket:
-                yield json.loads(raw)
+                yield _decode_ws_message(raw)
         if heartbeat_task:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -567,3 +567,35 @@ def _normalize_distance_field_km(value: object) -> float | None:
     if parsed is None:
         return None
     return round(parsed, 1)
+
+
+def _decode_ws_message(raw: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {
+            "action": "__raw_text__",
+            "payload": {
+                "raw_message": raw,
+                "raw_type": "text",
+            },
+        }
+    if isinstance(payload, dict):
+        return payload
+    return {
+        "action": "__non_dict__",
+        "payload": {
+            "raw_message": payload,
+            "raw_type": type(payload).__name__,
+        },
+    }
+
+
+def _message_payload_value(message: dict[str, Any], key: str) -> str | None:
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get(key)
+    if value in (None, ""):
+        return None
+    return str(value)
