@@ -1504,6 +1504,15 @@ interface AdminOperationsModuleProps {
   visibleCompanySlugs: string[];
 }
 
+type ActivationNoticeStatus = "submitting" | "running" | "ready" | "failed";
+
+interface ActivationNotice {
+  slug: string;
+  name: string;
+  status: ActivationNoticeStatus;
+  message?: string;
+}
+
 function slugifyCompanyValue(value: string) {
   return value
     .normalize("NFD")
@@ -1555,6 +1564,7 @@ function AdminOperationsModule({
   const [success, setSuccess] = useState<string | null>(null);
   const [selectedFleetIds, setSelectedFleetIds] = useState<string[]>([]);
   const [candidatePasswords, setCandidatePasswords] = useState<Record<string, string>>({});
+  const [activationNotices, setActivationNotices] = useState<ActivationNotice[]>([]);
   const [companyPasswordDrafts, setCompanyPasswordDrafts] = useState<Record<string, string>>({});
   const [adminPasswordDraft, setAdminPasswordDraft] = useState("");
   const [passwordSavingTarget, setPasswordSavingTarget] = useState<string | null>(null);
@@ -1630,6 +1640,9 @@ function AdminOperationsModule({
     [activationPlans],
   );
   const activationReady = activationPlans.length > 0 && activationPlans.every((plan) => plan.password.trim().length > 0);
+  const hasActivationWork =
+    activationNotices.some((item) => item.status === "submitting" || item.status === "running") ||
+    activationJobs.some((item) => item.rebuild_status === "queued" || item.rebuild_status === "running");
   const formatRebuildStatus = useCallback((item: AdminCompanyCatalogItem) => {
     if (item.ready_in_selector) {
       return "Lista para selector";
@@ -1735,6 +1748,62 @@ function AdminOperationsModule({
     );
   }, [activeCompanies]);
 
+  useEffect(() => {
+    if (!enabled || !hasActivationWork) return;
+    let cancelled = false;
+    let timerId: number | null = null;
+
+    const pollActivation = async () => {
+      try {
+        const nextCatalog = await apiJson<AdminCompanyCatalog>("/admin/companies");
+        if (cancelled) return;
+        setCompanyCatalog(nextCatalog);
+        setActivationNotices((current) =>
+          current.map((notice) => {
+            const companyItem = nextCatalog.companies.find((item) => item.slug === notice.slug);
+            const jobItem = nextCatalog.activation_jobs.find((item) => item.slug === notice.slug);
+            const item = companyItem ?? jobItem;
+            if (companyItem?.ready_in_selector) {
+              return { ...notice, status: "ready", message: "Empresa lista y disponible en el selector." };
+            }
+            if (item?.rebuild_status === "failed") {
+              return {
+                ...notice,
+                status: "failed",
+                message: item.rebuild_error_message ?? "La reconstruccion historica termino con error.",
+              };
+            }
+            return {
+              ...notice,
+              status: "running",
+              message: "Reconstruyendo y validando el historico inicial.",
+            };
+          }),
+        );
+      } catch {
+        // El seguimiento es auxiliar; el job continua aunque falle una consulta de progreso.
+      } finally {
+        if (!cancelled) {
+          timerId = window.setTimeout(pollActivation, 1_000);
+        }
+      }
+    };
+
+    timerId = window.setTimeout(pollActivation, 350);
+    return () => {
+      cancelled = true;
+      if (timerId !== null) window.clearTimeout(timerId);
+    };
+  }, [enabled, hasActivationWork]);
+
+  useEffect(() => {
+    if (!activationNotices.some((item) => item.status === "ready")) return;
+    const timerId = window.setTimeout(() => {
+      setActivationNotices((current) => current.filter((item) => item.status !== "ready"));
+    }, 15_000);
+    return () => window.clearTimeout(timerId);
+  }, [activationNotices]);
+
   const toggleFleetSelection = (fleet: FleetCandidate) => {
     if (fleet.assigned_company_slug) {
       return;
@@ -1763,12 +1832,21 @@ function AdminOperationsModule({
       setError(`Debes asignar una contrasena al usuario ${missingPassword.username} antes de activarlo.`);
       return;
     }
+    const plansToActivate = [...activationPlans];
+    setActivationNotices(
+      plansToActivate.map((plan) => ({
+        slug: plan.slug,
+        name: plan.displayName,
+        status: "submitting",
+        message: "Registrando empresa y preparando la reconstruccion.",
+      })),
+    );
     try {
       setCompanySaving(true);
       setError(null);
       setSuccess(null);
       let nextCatalog = companyCatalog;
-      for (const plan of activationPlans) {
+      for (const plan of plansToActivate) {
         nextCatalog = await apiJson<AdminCompanyCatalog>("/admin/companies", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1784,18 +1862,35 @@ function AdminOperationsModule({
             client_password: plan.password.trim(),
           }),
         });
+        setCompanyCatalog(nextCatalog);
+        const createdCompany = nextCatalog.companies.find((item) => item.slug === plan.slug);
+        setActivationNotices((current) =>
+          current.map((notice) =>
+            notice.slug === plan.slug
+              ? {
+                  ...notice,
+                  status: createdCompany?.ready_in_selector ? "ready" : "running",
+                  message: createdCompany?.ready_in_selector
+                    ? "Empresa lista y disponible en el selector."
+                    : "Reconstruyendo y validando el historico inicial.",
+                }
+              : notice,
+          ),
+        );
       }
       if (nextCatalog) {
         setCompanyCatalog(nextCatalog);
       }
-      setSuccess(
-        `${activationPlans.length} ${activationPlans.length === 1 ? "empresa quedo activada" : "empresas quedaron activadas"} con su usuario cliente. Ya inicio la reconstruccion historica y solo aparecera en el selector superior cuando termine correctamente.`,
-      );
       setSelectedFleetIds([]);
       setCandidatePasswords({});
-      void loadAdmin(true);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "No se pudo activar la empresa");
+      const message = nextError instanceof Error ? nextError.message : "No se pudo activar la empresa";
+      setError(message);
+      setActivationNotices((current) =>
+        current.map((notice) =>
+          notice.status === "ready" ? notice : { ...notice, status: "failed", message },
+        ),
+      );
     } finally {
       setCompanySaving(false);
     }
@@ -2153,6 +2248,20 @@ function AdminOperationsModule({
           </div>
         ) : null}
 
+        {activationNotices.length ? (
+          <div className="stack" style={{ marginTop: "1rem" }}>
+            {activationNotices.map((notice) => (
+              <div
+                key={notice.slug}
+                className={`banner ${notice.status === "failed" ? "error" : notice.status === "ready" ? "success" : ""}`}
+              >
+                <strong>{notice.name}</strong>
+                {` · ${notice.message ?? "Preparando activacion."}`}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
         {activationJobs.length ? (
           <section className="panel compact" style={{ marginTop: "1rem" }}>
             <div className="panel-head">
@@ -2161,8 +2270,10 @@ function AdminOperationsModule({
             </div>
             <div className="stack" style={{ marginTop: "0.85rem" }}>
               {activationJobs.map((item) => {
-                const progressLabel =
-                  item.rebuild_days_total > 0
+                const hasRowProgress = (item.rebuild_rows_total ?? 0) > 0;
+                const progressLabel = hasRowProgress
+                  ? `${item.rebuild_rows_processed ?? 0}/${item.rebuild_rows_total ?? 0} eventos`
+                  : item.rebuild_days_total > 0
                     ? `${item.rebuild_days_done}/${item.rebuild_days_total} dias`
                     : "preparando reconstruccion";
                 return (
