@@ -64,6 +64,8 @@ Notas:
 - El backend ya trae `uv.lock`, asi que `uv sync` recrea el entorno con las versiones bloqueadas.
 - El `subtype_map` del cliente en `back/app/data/companies.json` queda preparado para completar los codigos `tp` reales que aun no venian completos en la documentacion.
 - Si faltan `HOWEN_USERNAME` y `HOWEN_PASSWORD` o `HOWEN_PASSWORD_MD5`, la API puede arrancar pero la ingesta quedara reconectando hasta que completes esas credenciales reales.
+- Para Supabase en produccion, usa `DATABASE_URL=postgresql+psycopg://...?...sslmode=require`.
+- Para cookies de sesion sobre HTTPS, activa `SESSION_COOKIE_SECURE=true`.
 
 ## Estructura util
 
@@ -72,3 +74,12 @@ Notas:
 - `back/app/services/dashboard.py`
 - `front/src/App.tsx`
 - `front/src/hooks/useDashboardStream.ts`
+
+## Redeploy limpio
+
+- Variables de produccion backend: [back/.env.production.example](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/back/.env.production.example)
+- Variables de produccion frontend: [front/.env.production.example](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/front/.env.production.example)
+- Guia Ubuntu: [docs/redeploy-ubuntu.md](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/docs/redeploy-ubuntu.md)
+- Servicio `systemd`: [deploy/dashboard-api.service.example](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/deploy/dashboard-api.service.example)
+- Reverse proxy `nginx`: [deploy/nginx.dashboard.monitoreocotaba.conf.example](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/deploy/nginx.dashboard.monitoreocotaba.conf.example)
+- Smoke test: [scripts/smoke_test.py](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/scripts/smoke_test.py)

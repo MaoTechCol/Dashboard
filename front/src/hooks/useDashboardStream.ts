@@ -15,15 +15,18 @@ export function useDashboardStream(companySlug: string | null) {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
   const inflightRef = useRef<Promise<void> | null>(null);
   const companyRef = useRef<string | null>(companySlug);
 
   useEffect(() => {
+    const previousCompany = companyRef.current;
     companyRef.current = companySlug;
-    if (!companySlug) {
+    if (!companySlug || previousCompany !== companySlug) {
       setSnapshot(null);
-      setLoading(false);
+      setLoading(Boolean(companySlug));
       setError(null);
+      setNextRefreshAt(companySlug ? Date.now() : null);
     }
   }, [companySlug]);
 
@@ -40,6 +43,7 @@ export function useDashboardStream(companySlug: string | null) {
     const request = (async () => {
       const params = new URLSearchParams({ company: nextCompany });
       if (force) {
+        params.set("refresh", "1");
         params.set("_ts", String(Date.now()));
       }
       const payload = await apiJson<DashboardSnapshot>(`/dashboard?${params.toString()}`);
@@ -79,6 +83,7 @@ export function useDashboardStream(companySlug: string | null) {
         return;
       }
       const delay = nextAlignedRefreshDelay(DASHBOARD_REFRESH_MS);
+      setNextRefreshAt(Date.now() + delay);
       refreshTimer = window.setTimeout(async () => {
         await runLoad(false, true);
         scheduleNextRefresh();
@@ -100,6 +105,7 @@ export function useDashboardStream(companySlug: string | null) {
     snapshot,
     loading,
     error,
+    nextRefreshAt,
     refresh: useCallback(async () => {
       if (!companyRef.current) return;
       setLoading(true);

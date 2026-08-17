@@ -4,6 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
+from pydantic import Field
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -28,12 +29,15 @@ class Settings(BaseSettings):
     howen_password_md5: str | None = None
     howen_token: str | None = None
     howen_pid: str | None = None
+    public_dashboard_url: str | None = None
+    public_api_url: str | None = None
 
     late_threshold_minutes: int = 20
     stopped_threshold_minutes: int = 45
     admin_token: str | None = None
     jwt_secret: str = "change-me-local-dms"
     session_cookie_name: str = "dms_session"
+    session_cookie_secure: bool = False
     session_ttl_minutes: int = 720
     seed_admin_username: str = "admin"
     seed_admin_password: str = "Admin123!"
@@ -41,11 +45,39 @@ class Settings(BaseSettings):
     anomaly_future_tolerance_minutes: int = 5
     live_retention_days: int = 40
     anomaly_retention_days: int = 90
+    howen_login_min_interval_seconds: int = 20
+    howen_login_rate_limit_cooldown_seconds: int = 75
+    howen_request_spacing_seconds: float = 5.0
+    harvest_cut_interval_minutes: int = 15
+    harvest_overlap_minutes: int = 30
+    harvest_check_interval_seconds: int = 20
+    harvest_window_lag_seconds: int = 45
+    harvest_max_cuts_per_cycle: int = 4
+    catchup_overlap_minutes: int = 10
+    catchup_bootstrap_hours: int = 6
+    catchup_stale_after_minutes: int = 90
+    catchup_max_window_minutes: int = 20
+    catchup_device_batch_size: int = 1
+    catchup_check_interval_minutes: int = 5
+    catchup_run_time_budget_seconds: int = 300
+    catchup_batch_pause_seconds: float = 0.0
+    catchup_rate_limit_base_seconds: int = 300
+    catchup_rate_limit_max_seconds: int = 3600
+    catchup_error_retry_seconds: int = 300
+    backfill_rate_limit_max_retries: int = 4
+    backfill_rate_limit_cooldown_seconds: int = 20
+    backfill_rate_limit_max_cooldown_seconds: int = 180
+    historical_rebuild_chunk_days: int = 30
+    historical_rebuild_max_concurrency: int = 1
+    historical_batch_mode: str = "activation_only"
+    historical_batch_size: int = 500
+    reconciliation_cache_ttl_minutes: int = 120
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        env_parse_none_str="",
     )
 
     @field_validator("frontend_origins", mode="before")
@@ -61,12 +93,24 @@ class Settings(BaseSettings):
         mode = str(value or "").strip().lower()
         return "live" if mode != "live" else mode
 
+    @field_validator("historical_batch_mode", mode="before")
+    @classmethod
+    def _validate_historical_batch_mode(cls, value: object) -> str:
+        mode = str(value or "activation_only").strip().lower()
+        if mode not in {"off", "activation_only", "all_historical"}:
+            raise ValueError("HISTORICAL_BATCH_MODE must be off, activation_only, or all_historical")
+        return mode
+
     @property
     def root_dir(self) -> Path:
         return Path(__file__).resolve().parents[2]
 
     @property
     def company_config_path(self) -> Path:
+        return self.root_dir / "storage" / "companies.json"
+
+    @property
+    def company_seed_config_path(self) -> Path:
         return self.root_dir / "app" / "data" / "companies.json"
 
     @property

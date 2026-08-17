@@ -1,23 +1,36 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import get_context, get_current_user, require_admin, resolve_company_slug
 from app.models import ReportAsset
 from app.schemas import (
+    AdminCompanyCatalogItemView,
+    AdminCompanyCatalogView,
+    AdminPasswordChangeRequest,
     AuthMeResponse,
     BackfillRequest,
+    CompanyActivationRequest,
     CompanyAssignmentRequest,
+    CompanyPasswordChangeRequest,
+    HarvestRerunRequest,
+    HistoricalRebuildRequest,
     KmRepairRequest,
     LoginRequest,
     LoginResponse,
+    MaintenanceModeRequest,
+    ReconciliationReviewBulkDecisionRequest,
+    ReconciliationReviewDecisionRequest,
     ReconciliationRunRequest,
 )
+from app.services.howen import HowenRateLimitError
 
 router = APIRouter()
 
@@ -29,6 +42,56 @@ def healthcheck(request: Request) -> dict[str, str]:
         "status": "ok",
         "mode": context.settings.ingest_mode,
         "app": context.settings.app_name,
+    }
+
+
+@router.get("/healthz")
+def healthz(request: Request) -> dict[str, str]:
+    context = get_context(request)
+    return {
+        "status": "ok",
+        "mode": context.settings.ingest_mode,
+        "app": context.settings.app_name,
+    }
+
+
+@router.get("/readyz")
+def readyz(request: Request, response: Response) -> dict[str, object]:
+    context = get_context(request)
+    checks: dict[str, bool] = {
+        "database": False,
+        "company_registry": False,
+        "upload_dir": context.settings.upload_dir.exists(),
+        "live_credentials": context.settings.ingest_mode != "live" or context.ingestion.howen.has_durable_credentials(),
+    }
+    diagnostics: dict[str, object] = {
+        "connection_state": "unknown",
+        "mode": context.settings.ingest_mode,
+    }
+
+    try:
+        with context.session_factory() as session:
+            session.execute(select(1))
+        checks["database"] = True
+    except SQLAlchemyError as exc:
+        diagnostics["database_error"] = str(exc)
+
+    try:
+        checks["company_registry"] = len(context.registry.all()) > 0
+    except Exception as exc:  # pragma: no cover - defensive readiness guard
+        diagnostics["registry_error"] = str(exc)
+
+    state = context.dashboard.build_admin_ingestion_status()
+    diagnostics["connection_state"] = state.get("connection_state", "idle")
+    diagnostics["last_error"] = state.get("last_error")
+    diagnostics["last_cycle_received_at"] = state.get("last_cycle_received_at")
+
+    ready = all(checks.values())
+    response.status_code = status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
+    return {
+        "status": "ready" if ready else "not_ready",
+        "checks": checks,
+        "diagnostics": diagnostics,
     }
 
 
@@ -44,7 +107,7 @@ def login(payload: LoginRequest, response: Response, request: Request) -> LoginR
         token,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=context.settings.session_cookie_secure,
         max_age=context.settings.session_ttl_minutes * 60,
     )
     companies = context.auth.serialize_companies(context.auth.visible_companies(user))
@@ -58,7 +121,12 @@ def login(payload: LoginRequest, response: Response, request: Request) -> LoginR
 @router.post("/auth/logout")
 def logout(response: Response, request: Request) -> dict[str, bool]:
     context = get_context(request)
-    response.delete_cookie(context.settings.session_cookie_name, httponly=True, samesite="lax", secure=False)
+    response.delete_cookie(
+        context.settings.session_cookie_name,
+        httponly=True,
+        samesite="lax",
+        secure=context.settings.session_cookie_secure,
+    )
     return {"ok": True}
 
 
@@ -94,21 +162,30 @@ def feed_status(
 
 
 @router.get("/dashboard")
-def dashboard_snapshot(
+async def dashboard_snapshot(
     request: Request,
     company: str | None = Query(default=None),
+    refresh: bool = Query(default=False),
 ) -> dict[str, object]:
     user = get_current_user(request)
     company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
     context = get_context(request)
+    if refresh:
+        await context.ingestion.refresh_snapshot(company_slug)
     return context.dashboard.build_snapshot(company_slug)
 
 
 @router.get("/dashboard/{company_slug}")
-def dashboard_snapshot_by_slug(company_slug: str, request: Request) -> dict[str, object]:
+async def dashboard_snapshot_by_slug(
+    company_slug: str,
+    request: Request,
+    refresh: bool = Query(default=False),
+) -> dict[str, object]:
     user = get_current_user(request)
     resolved_slug = resolve_company_slug(request=request, user=user, requested_slug=company_slug)
     context = get_context(request)
+    if refresh:
+        await context.ingestion.refresh_snapshot(resolved_slug)
     return context.dashboard.build_snapshot(resolved_slug)
 
 
@@ -117,7 +194,10 @@ def list_reports(
     request: Request,
     company: str | None = Query(default=None),
 ) -> list[dict[str, object]]:
-    payload = dashboard_snapshot(request, company)
+    user = get_current_user(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
+    context = get_context(request)
+    payload = context.dashboard.build_snapshot(company_slug)
     return payload["reports"]
 
 
@@ -220,26 +300,151 @@ def admin_ingestion_status(
     return context.dashboard.build_admin_ingestion_status(company_slug=company_slug)
 
 
+@router.post("/admin/ingestion/maintenance")
+async def admin_ingestion_maintenance(
+    request: Request,
+    payload: MaintenanceModeRequest,
+) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    return await context.ingestion.set_maintenance_mode(
+        enabled=payload.enabled,
+        reason=payload.reason,
+    )
+
+
 @router.get("/admin/overview")
 def admin_overview(
     request: Request,
     company: str | None = Query(default=None),
 ) -> dict[str, object]:
-    user = require_admin(request)
-    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
     context = get_context(request)
+    require_admin(request)
+    company_slug = company.strip() if company else None
     return context.dashboard.build_admin_overview(company_slug)
+
+
+@router.get("/admin/companies")
+def admin_companies(request: Request) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    payload = AdminCompanyCatalogView.model_validate(context.dashboard.build_admin_company_catalog())
+    return payload.model_dump(mode="json")
+
+
+@router.post("/admin/companies")
+async def admin_activate_company(request: Request, payload: CompanyActivationRequest) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    try:
+        company = context.registry.upsert_company(
+            slug=payload.slug,
+            name=payload.name,
+            customer=payload.customer,
+            timezone=payload.timezone,
+            subdomain=payload.subdomain,
+            fleet_ids=payload.fleet_ids,
+            device_ids=payload.device_ids,
+            notes=payload.notes,
+        )
+        context.auth.upsert_company_user(
+            company_slug=company.slug,
+            username=company.slug,
+            password=payload.client_password,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    context.ingestion.queue_historical_rebuild(
+        HistoricalRebuildRequest(
+            company_slug=company.slug,
+            days=30,
+            publish_snapshot=True,
+            maintenance=False,
+        )
+    )
+    context.ingestion.mark_dirty()
+    return admin_companies(request)
+
+
+@router.post("/admin/companies/{company_slug}/deactivate")
+async def admin_deactivate_company(company_slug: str, request: Request) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    try:
+        context.registry.get(company_slug)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    await context.ingestion.purge_company_operational_data(company_slug=company_slug)
+    context.auth.delete_company_users(company_slug=company_slug)
+    context.registry.delete_company(slug=company_slug)
+    context.ingestion.mark_dirty()
+    return admin_companies(request)
+
+
+@router.post("/admin/users/admin/password")
+def admin_change_own_password(
+    request: Request,
+    payload: AdminPasswordChangeRequest,
+) -> dict[str, object]:
+    user = require_admin(request)
+    context = get_context(request)
+    try:
+        result = context.auth.change_password(
+            username=user.username,
+            new_password=payload.new_password,
+            expected_role="admin",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "username": result.username,
+        "role": result.role,
+    }
+
+
+@router.post("/admin/users/company/password")
+def admin_change_company_password(
+    request: Request,
+    payload: CompanyPasswordChangeRequest,
+) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    try:
+        company = context.registry.get(payload.company_slug)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    if not context.registry.is_operational(company):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La empresa no esta activa")
+    try:
+        result = context.auth.upsert_company_user(
+            company_slug=company.slug,
+            username=company.slug,
+            password=payload.new_password,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "username": result.username,
+        "role": result.role,
+        "company_slug": result.company_slug,
+    }
 
 
 @router.get("/admin/live-setup")
 def admin_live_setup(
     request: Request,
     company: str | None = Query(default=None),
+    from_at: datetime | None = Query(default=None, alias="from"),
+    to_at: datetime | None = Query(default=None, alias="to"),
 ) -> dict[str, object]:
     user = require_admin(request)
     company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
     context = get_context(request)
-    return context.dashboard.build_admin_live_setup(company_slug)
+    return context.dashboard.build_admin_live_setup(company_slug, start_at=from_at, end_at=to_at)
 
 
 @router.post("/admin/company-assignment")
@@ -299,6 +504,42 @@ async def admin_reconciliation_run(request: Request, payload: ReconciliationRunR
     return await context.dashboard.run_reconciliation(payload)
 
 
+@router.get("/admin/reconciliation/jobs/{job_id}")
+def admin_reconciliation_job(request: Request, job_id: str) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    payload = context.dashboard.get_reconciliation_job(job_id)
+    if not payload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job de conciliacion no encontrado")
+    return payload
+
+
+@router.get("/admin/reconciliation/latest")
+def admin_reconciliation_latest(
+    request: Request,
+    company: str | None = Query(default=None),
+    from_at: datetime | None = Query(default=None, alias="from"),
+    to_at: datetime | None = Query(default=None, alias="to"),
+    window_type: str = Query(default="calendar_day_local"),
+) -> dict[str, object]:
+    user = require_admin(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
+    context = get_context(request)
+    end_at = to_at or datetime.now().astimezone()
+    start_at = from_at or (end_at - timedelta(days=1))
+    if start_at >= end_at:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from debe ser menor que to")
+    payload = context.dashboard.get_latest_reconciliation(
+        company_slug=company_slug,
+        start_at=start_at,
+        end_at=end_at,
+        window_type=window_type,
+    )
+    if not payload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No existe una conciliacion cacheada para ese rango")
+    return payload
+
+
 @router.get("/admin/reconciliation/summary")
 async def admin_reconciliation_summary(
     request: Request,
@@ -345,6 +586,108 @@ async def admin_reconciliation_drilldown(
     )
 
 
+@router.get("/admin/reconciliation/reviews")
+def admin_reconciliation_reviews(
+    request: Request,
+    company: str | None = Query(default=None),
+    from_at: datetime | None = Query(default=None, alias="from"),
+    to_at: datetime | None = Query(default=None, alias="to"),
+    status_filter: str = Query(default="pending", alias="status"),
+    limit: int = Query(default=60, ge=1, le=200),
+    sync_queue: bool = Query(default=False, alias="sync"),
+    suggested_filter: str | None = Query(default=None, alias="suggested"),
+) -> dict[str, object]:
+    user = require_admin(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
+    context = get_context(request)
+    end_at = to_at or datetime.now().astimezone()
+    start_at = from_at or (end_at - timedelta(days=30))
+    if start_at >= end_at:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from debe ser menor que to")
+    return context.dashboard.list_reconciliation_reviews(
+        company_slug=company_slug,
+        start_at=start_at,
+        end_at=end_at,
+        review_status=status_filter,
+        limit=limit,
+        sync_queue=sync_queue,
+        suggested_actions=[
+            item.strip()
+            for item in (suggested_filter or "").split(",")
+            if item.strip()
+        ]
+        or None,
+    )
+
+
+@router.post("/admin/reconciliation/reviews/{review_id}/approve")
+def admin_reconciliation_review_approve(
+    request: Request,
+    review_id: int,
+    payload: ReconciliationReviewDecisionRequest | None = None,
+) -> dict[str, object]:
+    user = require_admin(request)
+    context = get_context(request)
+    result = context.dashboard.decide_reconciliation_review(
+        review_id=review_id,
+        action="approve",
+        decided_by=user.username,
+        note=payload.note if payload else None,
+    )
+    if not result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision no encontrada")
+    return result
+
+
+@router.post("/admin/reconciliation/reviews/{review_id}/discard")
+def admin_reconciliation_review_discard(
+    request: Request,
+    review_id: int,
+    payload: ReconciliationReviewDecisionRequest | None = None,
+) -> dict[str, object]:
+    user = require_admin(request)
+    context = get_context(request)
+    result = context.dashboard.decide_reconciliation_review(
+        review_id=review_id,
+        action="discard",
+        decided_by=user.username,
+        note=payload.note if payload else None,
+    )
+    if not result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision no encontrada")
+    return result
+
+
+@router.post("/admin/reconciliation/reviews/bulk/approve")
+def admin_reconciliation_review_bulk_approve(
+    request: Request,
+    payload: ReconciliationReviewBulkDecisionRequest,
+) -> dict[str, object]:
+    user = require_admin(request)
+    context = get_context(request)
+    return context.dashboard.decide_reconciliation_reviews_bulk(
+        review_ids=payload.ids,
+        action="approve",
+        decided_by=user.username,
+        note=payload.note,
+    )
+
+
+@router.post("/admin/reconciliation/reviews/bulk/discard")
+def admin_reconciliation_review_bulk_discard(
+    request: Request,
+    payload: ReconciliationReviewBulkDecisionRequest,
+) -> dict[str, object]:
+    user = require_admin(request)
+    context = get_context(request)
+    return context.dashboard.decide_reconciliation_reviews_bulk(
+        review_ids=payload.ids,
+        action="discard",
+        decided_by=user.username,
+        note=payload.note,
+    )
+
+
 @router.get("/admin/km/quality")
 def admin_km_quality(
     request: Request,
@@ -378,15 +721,38 @@ def admin_vehicles(
 def admin_anomalies(
     request: Request,
     company: str | None = Query(default=None),
+    from_at: datetime | None = Query(default=None, alias="from"),
+    to_at: datetime | None = Query(default=None, alias="to"),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, object]]:
     require_admin(request)
     context = get_context(request)
-    return context.dashboard.list_anomalies(company_slug=company, limit=limit)
+    return context.dashboard.list_anomalies(company_slug=company, start_at=from_at, end_at=to_at, limit=limit)
+
+
+@router.get("/admin/raw-alarms")
+def admin_raw_alarms(
+    request: Request,
+    company: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    source: str | None = Query(default=None),
+    classification_status: str | None = Query(default=None),
+    only_problematic: bool = Query(default=True),
+) -> list[dict[str, object]]:
+    user = require_admin(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
+    context = get_context(request)
+    return context.dashboard.list_raw_alarm_diagnostics(
+        company_slug=company_slug,
+        limit=limit,
+        source=source,
+        classification_status=classification_status,
+        only_problematic=only_problematic,
+    )
 
 
 @router.post("/admin/backfill")
-async def admin_backfill(request: Request, payload: BackfillRequest) -> dict[str, int]:
+async def admin_backfill(request: Request, payload: BackfillRequest) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
     if not payload.device_id and not payload.company_slug:
@@ -397,4 +763,42 @@ async def admin_backfill(request: Request, payload: BackfillRequest) -> dict[str
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La empresa no esta operativa")
     if payload.start_at >= payload.end_at:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start_at debe ser menor que end_at")
-    return await context.ingestion.backfill_historical(payload)
+    try:
+        return await context.ingestion.backfill_historical(payload)
+    except HowenRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc) or "Howen esta limitando solicitudes de backfill",
+        ) from exc
+
+
+@router.post("/admin/harvest/rerun-cut")
+async def admin_rerun_harvest_cut(request: Request, payload: HarvestRerunRequest) -> dict[str, object]:
+    user = require_admin(request)
+    context = get_context(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=payload.company_slug)
+    try:
+        return await context.ingestion.rerun_harvest_cut(company_slug=company_slug, cut_at=payload.cut_at)
+    except HowenRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc) or "Howen esta limitando solicitudes del corte historico",
+        ) from exc
+
+
+@router.post("/admin/harvest/rebuild-history")
+async def admin_rebuild_historical_window(request: Request, payload: HistoricalRebuildRequest) -> dict[str, object]:
+    require_admin(request)
+    context = get_context(request)
+    company = context.registry.get(payload.company_slug)
+    if not context.registry.is_operational(company):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La empresa no esta operativa")
+    try:
+        return await context.ingestion.rebuild_historical_window(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except HowenRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc) or "Howen esta limitando solicitudes de reconstruccion historica",
+        ) from exc

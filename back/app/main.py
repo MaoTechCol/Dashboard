@@ -33,7 +33,11 @@ def create_app() -> FastAPI:
     settings.session_cache_path.parent.mkdir(parents=True, exist_ok=True)
     init_db()
 
-    registry = CompanyRegistry(settings.company_config_path)
+    registry = CompanyRegistry(
+        settings.company_config_path,
+        seed_path=settings.company_seed_config_path,
+        session_factory=SessionLocal,
+    )
     hub = RealtimeHub()
     auth = AuthService(session_factory=SessionLocal, settings=settings, registry=registry)
     dashboard = DashboardService(session_factory=SessionLocal, registry=registry, settings=settings)

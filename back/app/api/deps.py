@@ -46,7 +46,10 @@ def resolve_company_slug(*, request: Request, user, requested_slug: str | None =
     if not company_slug:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No company available for this user")
 
-    company = context.registry.get(company_slug)
+    try:
+        company = context.registry.get(company_slug)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     if not context.registry.is_operational(company):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Company is not operationally configured")
     return company.slug

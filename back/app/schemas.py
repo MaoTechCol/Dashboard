@@ -55,6 +55,7 @@ class CompanyConfig(BaseModel):
     device_ids: list[str] = Field(default_factory=list)
     allowed_categories: list[str] = Field(default_factory=list)
     subtype_map: dict[str, str] = Field(default_factory=dict)
+    plate_aliases: dict[str, str] = Field(default_factory=dict)
     notes: str | None = None
     quality_notes: list[DataQualityNote] = Field(default_factory=list)
     brand: CompanyBrand
@@ -84,6 +85,9 @@ class FeedState(BaseModel):
     last_event_observed_at: datetime | None = None
     last_alarm_at: datetime | None = None
     last_status_at: datetime | None = None
+    last_live_alarm_message_at: datetime | None = None
+    last_live_dms_at: datetime | None = None
+    last_live_unmapped_at: datetime | None = None
     connection_state: str
     last_error: str | None = None
 
@@ -112,6 +116,36 @@ class CompanySummaryView(BaseModel):
     brand: CompanyBrand
 
 
+class AdminCompanyCatalogItemView(BaseModel):
+    slug: str
+    name: str
+    customer: str
+    timezone: str
+    subdomain: str | None = None
+    fleet_ids: list[str] = Field(default_factory=list)
+    device_ids: list[str] = Field(default_factory=list)
+    operational: bool = False
+    ready_in_selector: bool = False
+    rebuild_status: str = "idle"
+    rebuild_progress_pct: float | None = None
+    rebuild_days_done: int = 0
+    rebuild_days_total: int = 0
+    rebuild_started_at: datetime | None = None
+    rebuild_finished_at: datetime | None = None
+    rebuild_next_retry_at: datetime | None = None
+    rebuild_published_cut_at: datetime | None = None
+    rebuild_error_message: str | None = None
+    can_deactivate: bool = True
+
+
+class AdminCompanyCatalogView(BaseModel):
+    total_companies: int = 0
+    operational_companies: int = 0
+    companies: list[AdminCompanyCatalogItemView] = Field(default_factory=list)
+    activation_jobs: list[AdminCompanyCatalogItemView] = Field(default_factory=list)
+    fleet_candidates: list["FleetCandidateView"] = Field(default_factory=list)
+
+
 class AuthMeResponse(BaseModel):
     user: UserSessionView
     companies: list[CompanySummaryView] = Field(default_factory=list)
@@ -135,6 +169,27 @@ class BackfillRequest(BaseModel):
     device_id: str | None = None
     start_at: datetime
     end_at: datetime
+    publish_snapshot: bool = False
+
+
+class HarvestRerunRequest(BaseModel):
+    company_slug: str
+    cut_at: datetime
+
+
+class HistoricalRebuildRequest(BaseModel):
+    company_slug: str
+    start_date: date | None = None
+    end_date: date | None = None
+    days: int = 30
+    publish_snapshot: bool = True
+    maintenance: bool = True
+    maintenance_drain_timeout: float = 90.0
+
+
+class MaintenanceModeRequest(BaseModel):
+    enabled: bool
+    reason: str | None = None
 
 
 class StatusReplayResult(BaseModel):
@@ -147,21 +202,52 @@ class StatusReplayResult(BaseModel):
 class AdminIngestionStatusView(BaseModel):
     mode: str
     connection_state: str
+    maintenance_mode: bool = False
+    maintenance_reason: str | None = None
+    maintenance_started_at: datetime | None = None
     last_cycle_received_at: datetime | None = None
     last_event_observed_at: datetime | None = None
     last_alarm_at: datetime | None = None
     last_status_at: datetime | None = None
+    last_live_alarm_message_at: datetime | None = None
+    last_live_dms_at: datetime | None = None
+    last_live_unmapped_at: datetime | None = None
     last_device_sync_at: datetime | None = None
     last_error: str | None = None
     anomaly_count_24h: int = 0
+    live_alarm_count_24h: int = 0
+    live_dms_count_24h: int = 0
+    raw_dms_count_24h: int = 0
+    backfill_dms_count_24h: int = 0
+    catchup_dms_count_24h: int = 0
+    live_unmapped_count_24h: int = 0
+    non_dms_count_24h: int = 0
+    live_non_dms_count_24h: int = 0
+    future_rejected_count_24h: int = 0
+    live_future_rejected_count_24h: int = 0
+    catchup_failures_24h: int = 0
+    last_successful_catchup_cursor_at: datetime | None = None
+    last_successful_catchup_observed_at: datetime | None = None
+    pending_range_start_at: datetime | None = None
+    pending_range_end_at: datetime | None = None
+    next_catchup_retry_at: datetime | None = None
+    catchup_rate_limit_streak: int = 0
+    last_catchup_attempt_at: datetime | None = None
+    last_catchup_error: str | None = None
+    operational_recency: "OperationalRecencyView" = Field(default_factory=lambda: OperationalRecencyView())
 
 
 class CoverageSummaryView(BaseModel):
     total_vehicles: int = 0
-    reporting_vehicles_24h: int = 0
+    vehicles_reporting_status_24h: int = 0
+    vehicles_with_any_alarm_24h: int = 0
+    vehicles_with_dms_alarm_24h: int = 0
+    vehicles_with_live_dms_24h: int = 0
+    vehicles_with_valid_day_km_today: int = 0
+    vehicles_missing_day_km_today: int = 0
+    vehicles_with_status_today: int = 0
     stale_vehicles: int = 0
     vehicles_with_snapshot_today: int = 0
-    vehicles_with_alarm_24h: int = 0
 
 
 class KmSummaryView(BaseModel):
@@ -177,6 +263,29 @@ class ReportsSummaryView(BaseModel):
     latest_report_month: int | None = None
 
 
+class PublicationStateView(BaseModel):
+    dashboard_host: str | None = None
+    dashboard_url: str | None = None
+    api_url: str | None = None
+    dns_status: Literal["unconfigured", "resolved", "unresolved"] = "unconfigured"
+    resolved_targets: list[str] = Field(default_factory=list)
+    local_validation_only: bool = True
+    message: str
+
+
+class OperationalRecencyView(BaseModel):
+    last_raw_dms_at: datetime | None = None
+    last_accepted_dms_at: datetime | None = None
+    last_visible_dms_at: datetime | None = None
+    last_pending_review_at: datetime | None = None
+    last_pending_visibility_at: datetime | None = None
+    pending_review_count: int = 0
+    pending_actionable_count: int = 0
+    pending_visibility_count: int = 0
+    latest_pending_reason: str | None = None
+    latest_pending_plate: str | None = None
+
+
 class AdminOverviewView(BaseModel):
     company_slug: str
     company_name: str
@@ -185,14 +294,17 @@ class AdminOverviewView(BaseModel):
     coverage: CoverageSummaryView
     km: KmSummaryView
     reports: ReportsSummaryView
+    publication: PublicationStateView
     anomaly_count_24h: int = 0
     active_notes: list[QualityNoteView] = Field(default_factory=list)
+    operational_recency: OperationalRecencyView = Field(default_factory=OperationalRecencyView)
 
 
 class RecentAuditView(BaseModel):
     raw_events: int = 0
     grouped_episodes: int = 0
     visible_alerts: int = 0
+    fused_in_episode: int = 0
     dismissed_alerts: int = 0
     suppressed_by_rule: int = 0
     visible_raw_events: int = 0
@@ -207,6 +319,8 @@ class AlarmAuditView(BaseModel):
     unclassified_total: int = 0
     mapping_sources: dict[str, int] = Field(default_factory=dict)
     by_category: dict[str, int] = Field(default_factory=dict)
+    audit_stages: dict[str, int] = Field(default_factory=dict)
+    audit_reasons: dict[str, int] = Field(default_factory=dict)
     by_subtype: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -222,6 +336,8 @@ class AdminAuditView(BaseModel):
     range_end: datetime
     alarms: AlarmAuditView
     anomalies: AnomalyAuditView
+    requested_window: RecentAuditView
+    recent_7d: RecentAuditView
     recent_24h: RecentAuditView
 
 
@@ -229,7 +345,7 @@ class ReconciliationRunRequest(BaseModel):
     company_slug: str
     from_at: datetime = Field(alias="from")
     to_at: datetime = Field(alias="to")
-    window_type: Literal["calendar_day_local", "rolling_24h"] = "calendar_day_local"
+    window_type: Literal["calendar_day_local", "rolling_24h", "calendar_month_local"] = "calendar_day_local"
 
     model_config = {"populate_by_name": True}
 
@@ -237,7 +353,7 @@ class ReconciliationRunRequest(BaseModel):
 class ReconciliationSummary(BaseModel):
     company_slug: str
     company_name: str
-    window_type: Literal["calendar_day_local", "rolling_24h"]
+    window_type: Literal["calendar_day_local", "rolling_24h", "calendar_month_local"]
     range_start: datetime
     range_end: datetime
     raw_portal_equivalent: int = 0
@@ -253,14 +369,57 @@ class ReconciliationSummary(BaseModel):
     missing_local: int = 0
 
 
+class ReconciliationRunResponse(BaseModel):
+    job_id: str
+    status: str
+    cached_result_available: bool = False
+    total_devices: int = 0
+    processed_devices: int = 0
+    succeeded_devices: int = 0
+    failed_devices: int = 0
+    rate_limited_devices: int = 0
+    current_device_id: str | None = None
+    range_start: datetime
+    range_end: datetime
+    window_type: Literal["calendar_day_local", "rolling_24h", "calendar_month_local"]
+    summary: ReconciliationSummary | None = None
+    drilldown: list["ReconciliationDrilldownRow"] = Field(default_factory=list)
+
+
+class ReconciliationJobView(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "succeeded", "failed", "rate_limited"]
+    company_slug: str
+    range_start: datetime
+    range_end: datetime
+    window_type: Literal["calendar_day_local", "rolling_24h", "calendar_month_local"]
+    cached_result_available: bool = False
+    total_devices: int = 0
+    processed_devices: int = 0
+    succeeded_devices: int = 0
+    failed_devices: int = 0
+    rate_limited_devices: int = 0
+    current_device_id: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error_message: str | None = None
+    summary: ReconciliationSummary | None = None
+    drilldown: list["ReconciliationDrilldownRow"] = Field(default_factory=list)
+
+
 class ReconciliationDrilldownRow(BaseModel):
     guid: str
     plate_no: str | None = None
     device_id: str | None = None
+    observed_hour_local: str | None = None
+    portal_begin_time: str | None = None
+    portal_reporting_time: str | None = None
     raw_alarm_type: str | None = None
     raw_tp: str | None = None
     raw_event_code: str | None = None
     observed_at: datetime | None = None
+    stored_observed_at: datetime | None = None
+    stored_raw_event_time: str | None = None
     classification_status: str
     visibility_status: str
     source: str
@@ -269,6 +428,57 @@ class ReconciliationDrilldownRow(BaseModel):
     reason: str
     episode_guid: str | None = None
     episode_title: str | None = None
+    portal_duplicate_count: int = 1
+    diagnostic_note: str | None = None
+
+
+class ReconciliationReviewDecisionRequest(BaseModel):
+    note: str | None = None
+
+
+class ReconciliationReviewBulkDecisionRequest(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    note: str | None = None
+
+
+class ReconciliationReviewItemView(BaseModel):
+    id: int
+    company_slug: str
+    guid: str | None = None
+    device_id: str | None = None
+    plate_no: str | None = None
+    observed_at: datetime | None = None
+    portal_begin_time: str | None = None
+    portal_reporting_time: str | None = None
+    raw_alarm_type: str | None = None
+    raw_tp: str | None = None
+    raw_event_code: str | None = None
+    classification_status: str | None = None
+    visibility_status: str | None = None
+    category: str | None = None
+    subtype: str | None = None
+    reason: str
+    diagnostic_note: str | None = None
+    suggested_action: str = "reconcile"
+    review_status: str = "pending"
+    source_job_id: str | None = None
+    source_window_type: str | None = None
+    decision_note: str | None = None
+    decided_by: str | None = None
+    decided_at: datetime | None = None
+    applied_at: datetime | None = None
+
+
+class ReconciliationReviewListView(BaseModel):
+    total_items: int = 0
+    counts_by_action: dict[str, int] = Field(default_factory=dict)
+    counts_by_reason: dict[str, int] = Field(default_factory=dict)
+    items: list[ReconciliationReviewItemView] = Field(default_factory=list)
+
+
+class ReconciliationReviewBulkDecisionResponse(BaseModel):
+    updated: int = 0
+    items: list[ReconciliationReviewItemView] = Field(default_factory=list)
 
 
 class KmRepairRequest(BaseModel):
@@ -280,12 +490,17 @@ class KmRepairRequest(BaseModel):
 class KmQualitySummary(BaseModel):
     company_slug: str
     company_name: str
+    total_vehicles: int = 0
     vehicles_with_valid_day_km: int = 0
     vehicles_with_invalid_day_km: int = 0
     vehicles_with_total_regression: int = 0
+    vehicles_with_snapshot_today: int = 0
+    vehicles_with_status_today: int = 0
     current_day_km_source: str = "device_state_validated"
     repaired_rows: int = 0
     sample_invalid_vehicles: list[str] = Field(default_factory=list)
+    sample_total_regression_vehicles: list[str] = Field(default_factory=list)
+    sample_missing_day_km_vehicles: list[str] = Field(default_factory=list)
 
 
 class AdminVehicleView(BaseModel):
@@ -324,6 +539,27 @@ class CompanyAssignmentRequest(BaseModel):
     device_ids: list[str] = Field(default_factory=list)
 
 
+class CompanyActivationRequest(BaseModel):
+    slug: str
+    name: str
+    customer: str | None = None
+    timezone: str = "America/Bogota"
+    subdomain: str | None = None
+    fleet_ids: list[str] = Field(default_factory=list)
+    device_ids: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    client_password: str = Field(min_length=1)
+
+
+class AdminPasswordChangeRequest(BaseModel):
+    new_password: str = Field(min_length=1)
+
+
+class CompanyPasswordChangeRequest(BaseModel):
+    company_slug: str
+    new_password: str = Field(min_length=1)
+
+
 class CompanyAssignmentView(BaseModel):
     company_slug: str
     fleet_ids: list[str] = Field(default_factory=list)
@@ -351,6 +587,8 @@ class FleetCandidateView(BaseModel):
     latest_alarm_at: datetime | None = None
     sample_plates: list[str] = Field(default_factory=list)
     selected: bool = False
+    assigned_company_slug: str | None = None
+    assigned_company_name: str | None = None
 
 
 class MockDataSummaryView(BaseModel):
@@ -373,6 +611,23 @@ class UnclassifiedCodeView(BaseModel):
     sample_plate: str | None = None
 
 
+class RawAlarmDiagnosticView(BaseModel):
+    guid: str
+    source: str
+    occurred_at: datetime | None = None
+    received_at: datetime
+    device_id: str | None = None
+    plate_no: str | None = None
+    raw_alarm_type: str | None = None
+    raw_tp: str | None = None
+    raw_event_code: str | None = None
+    classification_status: str | None = None
+    mapped_category: str | None = None
+    mapping_source: str | None = None
+    temporal_status: str | None = None
+    ingest_result: str | None = None
+
+
 class AdminLiveSetupView(BaseModel):
     company_slug: str
     company_name: str
@@ -380,6 +635,7 @@ class AdminLiveSetupView(BaseModel):
     mock_data: MockDataSummaryView
     fleet_candidates: list[FleetCandidateView] = Field(default_factory=list)
     unclassified_codes: list[UnclassifiedCodeView] = Field(default_factory=list)
+    recent_raw_diagnostics: list[RawAlarmDiagnosticView] = Field(default_factory=list)
 
 
 class MockDataPurgeResult(BaseModel):

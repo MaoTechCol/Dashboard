@@ -7,7 +7,8 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncIterator
+from time import monotonic
+from typing import Any, AsyncIterator, ClassVar
 from uuid import uuid4
 
 import httpx
@@ -32,6 +33,7 @@ AUTH_ERROR_HINTS = (
 LOGIN_RATE_LIMIT_HINTS = (
     "login too frequently",
     "too frequent",
+    "requests too frequent",
 )
 
 NO_DATA_HINTS = (
@@ -42,14 +44,20 @@ NO_DATA_HINTS = (
 
 HISTORICAL_ALARM_TYPE_MAP = {
     "eye closed": "Ojos cerrados",
+    "eyes closed": "Ojos cerrados",
     "yawning": "Bostezo",
+    "yawn": "Bostezo",
     "fcw (forward collision warning)": "Riesgo de colision",
     "forward collision warning": "Riesgo de colision",
     "phone call alarm": "Uso de celular",
     "using phone while driving": "Uso de celular",
     "distracted driving": "Distraccion",
+    "distraction alarm": "Distraccion",
+    "distractions alarm": "Distraccion",
     "dms camera covered": "Camara cubierta",
+    "camera covered": "Camara cubierta",
     "camera undetected": "Camara cubierta",
+    "occlusion": "Camara cubierta",
     "ir-blocking sunglasses": "Camara cubierta",
     "smoking": "Fumando",
     "driver smoking": "Fumando",
@@ -57,18 +65,23 @@ HISTORICAL_ALARM_TYPE_MAP = {
 }
 
 LIVE_TP_MAP = {
+    "17": "Riesgo de colision",
+    "34": "Uso de celular",
+    "35": "Fumando",
     "65": "Ojos cerrados",
     "66": "Bostezo",
-    "67": "Distraccion",
-    "68": "Uso de celular",
+    "68": "Distraccion",
 }
 
 LIVE_EVENT_CODE_MAP = {
+    "110": "Riesgo de colision",
+    "116": "Uso de celular",
+    "117": "Fumando",
     "121": "Ojos cerrados",
     "122": "Bostezo",
-    "123": "Distraccion",
-    "124": "Uso de celular",
+    "124": "Distraccion",
 }
+PLATE_LIKE_RE = re.compile(r"^[A-Z]{3}\d{3}$")
 
 
 @dataclass
@@ -77,7 +90,18 @@ class HowenSession:
     pid: str
 
 
+class HowenRateLimitError(RuntimeError):
+    pass
+
+
 class HowenClient:
+    _shared_sessions: ClassVar[dict[str, HowenSession]] = {}
+    _login_locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    _request_locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    _last_login_at: ClassVar[dict[str, float]] = {}
+    _login_cooldown_until: ClassVar[dict[str, float]] = {}
+    _next_request_at: ClassVar[dict[str, float]] = {}
+
     def __init__(
         self,
         *,
@@ -97,6 +121,24 @@ class HowenClient:
     def has_durable_credentials(self) -> bool:
         return bool(self.settings.howen_username and self._password_md5())
 
+    @property
+    def _account_key(self) -> str:
+        return f"{self.settings.howen_http_base.rstrip('/')}|{self.settings.howen_username or ''}"
+
+    def _get_login_lock(self) -> asyncio.Lock:
+        lock = self._login_locks.get(self._account_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._login_locks[self._account_key] = lock
+        return lock
+
+    def _get_request_lock(self) -> asyncio.Lock:
+        lock = self._request_locks.get(self._account_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._request_locks[self._account_key] = lock
+        return lock
+
     def is_auth_error(self, error: object) -> bool:
         message = str(error).lower()
         return any(hint in message for hint in AUTH_ERROR_HINTS)
@@ -104,6 +146,9 @@ class HowenClient:
     def is_login_rate_limited(self, error: object) -> bool:
         message = str(error).lower()
         return any(hint in message for hint in LOGIN_RATE_LIMIT_HINTS)
+
+    def is_rate_limited(self, error: object) -> bool:
+        return self.is_login_rate_limited(error)
 
     def is_no_data_error(self, error: object) -> bool:
         message = str(error).lower()
@@ -117,7 +162,7 @@ class HowenClient:
             return HowenSession(token=self.settings.howen_token, pid=self.settings.howen_pid)
         return None
 
-    def _load_cached_session(self) -> HowenSession | None:
+    def _load_disk_cached_session(self) -> HowenSession | None:
         if not self.settings.session_cache_path.exists():
             return None
         payload = json.loads(self.settings.session_cache_path.read_text(encoding="utf-8"))
@@ -127,15 +172,60 @@ class HowenClient:
             return HowenSession(token=token, pid=pid)
         return None
 
+    def _load_cached_session(self) -> HowenSession | None:
+        in_memory = self._shared_sessions.get(self._account_key)
+        if in_memory:
+            return in_memory
+        disk_cached = self._load_disk_cached_session()
+        if disk_cached:
+            self._shared_sessions[self._account_key] = disk_cached
+            return disk_cached
+        bootstrap = self._bootstrap_session()
+        if bootstrap:
+            self._shared_sessions[self._account_key] = bootstrap
+        return bootstrap
+
     def cache_session(self, session: HowenSession) -> None:
+        self._shared_sessions[self._account_key] = session
         self.settings.session_cache_path.write_text(
             json.dumps({"token": session.token, "pid": session.pid}, indent=2),
             encoding="utf-8",
         )
 
     def clear_cached_session(self) -> None:
+        self._shared_sessions.pop(self._account_key, None)
         if self.settings.session_cache_path.exists():
             self.settings.session_cache_path.unlink()
+
+    async def invalidate_session(self) -> None:
+        self.clear_cached_session()
+
+    async def _wait_for_login_window(self) -> None:
+        now = monotonic()
+        cooldown_until = self._login_cooldown_until.get(self._account_key, 0.0)
+        if cooldown_until > now:
+            await asyncio.sleep(cooldown_until - now)
+            now = monotonic()
+        last_login_at = self._last_login_at.get(self._account_key)
+        min_interval = float(self.settings.howen_login_min_interval_seconds)
+        if last_login_at is not None:
+            remaining = (last_login_at + min_interval) - now
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+
+    async def _post_json(self, url: str, body: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+        async with self._get_request_lock():
+            now = monotonic()
+            next_request_at = self._next_request_at.get(self._account_key, 0.0)
+            if next_request_at > now:
+                await asyncio.sleep(next_request_at - now)
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(url, json=body)
+                    response.raise_for_status()
+                    return response.json()
+            finally:
+                self._next_request_at[self._account_key] = monotonic() + float(self.settings.howen_request_spacing_seconds)
 
     async def login(self) -> HowenSession:
         if not self.settings.howen_username:
@@ -144,16 +234,14 @@ class HowenClient:
         if not password_md5:
             raise RuntimeError("HOWEN_PASSWORD or HOWEN_PASSWORD_MD5 is required for live ingestion")
         url = f"{self.settings.howen_http_base.rstrip('/')}/user/apiLogin.action"
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                url,
-                json={
-                    "username": self.settings.howen_username,
-                    "password": password_md5,
-                },
-            )
-            response.raise_for_status()
-            payload = response.json()
+        payload = await self._post_json(
+            url,
+            {
+                "username": self.settings.howen_username,
+                "password": password_md5,
+            },
+            timeout=20.0,
+        )
         if payload.get("status") != 10000:
             raise RuntimeError(payload.get("msg") or "Unable to authenticate against Howen VSS")
         data = payload.get("data") or {}
@@ -162,46 +250,66 @@ class HowenClient:
         return session
 
     async def resolve_session(self, *, force_login: bool = False) -> HowenSession:
-        cached = self._load_cached_session()
-        bootstrap = self._bootstrap_session()
+        fallback = self._load_cached_session()
+        if fallback and not force_login:
+            return fallback
 
-        if not force_login:
-            if cached:
-                return cached
-            if bootstrap:
-                return bootstrap
+        if not self.has_durable_credentials():
+            if fallback:
+                return fallback
+            raise RuntimeError("Howen durable credentials are not configured")
 
-        if self.has_durable_credentials():
+        async with self._get_login_lock():
+            fallback = self._load_cached_session()
+            if fallback and not force_login:
+                return fallback
+
+            await self._wait_for_login_window()
             try:
-                return await self.login()
+                session = await self.login()
             except Exception as exc:
-                if not force_login and self.is_login_rate_limited(exc):
-                    fallback = cached or bootstrap
-                    if fallback:
+                if self.is_login_rate_limited(exc):
+                    self._login_cooldown_until[self._account_key] = monotonic() + float(
+                        self.settings.howen_login_rate_limit_cooldown_seconds
+                    )
+                    if fallback and not force_login:
                         return fallback
                 raise
+            self._last_login_at[self._account_key] = monotonic()
+            self._login_cooldown_until.pop(self._account_key, None)
+            return session
 
-        fallback = cached or bootstrap
-        if fallback:
-            return fallback
-        return await self.login()
+    def extract_plate_candidate(self, payload: dict[str, Any]) -> str | None:
+        detail = _as_dict(payload.get("payload")) or payload
+        ext = _as_dict(payload.get("ext"))
+        detail_ext = _as_dict(detail.get("ext"))
+        return _pick_plate_value(payload, detail=detail, ext=ext or detail_ext)
 
     async def fetch_devices(self, token: str) -> list[dict[str, Any]]:
         url = f"{self.settings.howen_http_base.rstrip('/')}/vehicle/findAll.action"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                json={
-                    "token": token,
-                    "pageNum": "-1",
-                    "pageCount": "-1",
-                },
-            )
-            response.raise_for_status()
-            payload = response.json()
+        payload = await self._post_json(
+            url,
+            {
+                "token": token,
+                "pageNum": "-1",
+                "pageCount": "-1",
+            },
+            timeout=30.0,
+        )
         if payload.get("status") != 10000:
             raise RuntimeError(payload.get("msg") or "Unable to fetch device catalog")
         return _extract_rows(payload)
+
+    async def fetch_devices_authorized(self, *, force_login: bool = False) -> list[dict[str, Any]]:
+        session = await self.resolve_session(force_login=force_login)
+        try:
+            return await self.fetch_devices(session.token)
+        except Exception as exc:
+            if not self.is_auth_error(exc):
+                raise
+            await self.invalidate_session()
+            session = await self.resolve_session(force_login=True)
+            return await self.fetch_devices(session.token)
 
     async def fetch_historical_alarms(
         self,
@@ -222,15 +330,42 @@ class HowenClient:
             "pageNum": "-1",
             "pageCount": "-1",
         }
-        async with httpx.AsyncClient(timeout=40.0) as client:
-            response = await client.post(url, json=body)
-            response.raise_for_status()
-            payload = response.json()
+        payload = await self._post_json(url, body, timeout=40.0)
         if payload.get("status") != 10000:
             if self.is_no_data_error(payload.get("msg") or ""):
                 return []
+            if self.is_rate_limited(payload.get("msg") or ""):
+                raise HowenRateLimitError(payload.get("msg") or "Requests too frequent, please try again later")
             raise RuntimeError(payload.get("msg") or "Unable to fetch historical alarms")
         return _extract_rows(payload)
+
+    async def fetch_historical_alarms_authorized(
+        self,
+        *,
+        device_id: str,
+        start_at: datetime,
+        end_at: datetime,
+        force_login: bool = False,
+    ) -> list[dict[str, Any]]:
+        session = await self.resolve_session(force_login=force_login)
+        try:
+            return await self.fetch_historical_alarms(
+                session.token,
+                device_id=device_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
+        except Exception as exc:
+            if not self.is_auth_error(exc):
+                raise
+            await self.invalidate_session()
+            session = await self.resolve_session(force_login=True)
+            return await self.fetch_historical_alarms(
+                session.token,
+                device_id=device_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
 
     async def listen(self, session: HowenSession) -> AsyncIterator[dict[str, Any]]:
         if not self.settings.howen_username:
@@ -292,12 +427,16 @@ class HowenClient:
         if not device_id:
             return None
         fleet_id = _pick_value(payload, "fleetID", "fleetId", "fleetid")
-        plate_no = _pick_value(payload, "plateNo", "plateno", "plate")
-        driver = payload.get("driver") or {}
+        company = self.registry.resolve_company(device_id=device_id, fleet_id=fleet_id)
+        raw_plate_no = self.extract_plate_candidate(payload)
+        plate_no = self.registry.normalize_plate(company, raw_plate_no) if company else self.registry.normalize_plate_any(raw_plate_no)
+        driver = _as_dict(payload.get("driver"))
+        location = _as_dict(payload.get("location"))
+        ext = _as_dict(payload.get("ext"))
         event_time = (
             _pick_value(payload, "dtu")
-            or _pick_value(payload.get("location") or {}, "dtu")
-            or _pick_value(payload.get("ext") or {}, "reportTime")
+            or _pick_value(location, "dtu")
+            or _pick_value(ext, "reportTime")
         )
         timezone_name = self.registry.timezone_for(
             device_id=device_id,
@@ -307,7 +446,7 @@ class HowenClient:
         observed_at = parse_timestamp(event_time, timezone_name)
         if not observed_at:
             return None
-        mileage = payload.get("mileage") or {}
+        mileage = _as_dict(payload.get("mileage"))
         return NormalizedStatus(
             device_id=device_id,
             observed_at=observed_at,
@@ -316,7 +455,7 @@ class HowenClient:
             plate_no=plate_no,
             fleet_id=fleet_id,
             driver_name=_pick_value(driver, "name", "drivername"),
-            device_name=_pick_value(payload.get("ext") or {}, "deviceName", "devicename") or plate_no,
+            device_name=_pick_value(ext, "deviceName", "devicename") or plate_no,
             raw_event_time=str(event_time) if event_time else None,
             raw_total_value=_raw_string(mileage.get("total")),
             raw_day_value=_raw_string(mileage.get("todayDay")),
@@ -327,10 +466,14 @@ class HowenClient:
         device_id = str(payload.get("deviceID") or payload.get("deviceno") or payload.get("deviceid") or "").strip()
         if not device_id:
             return None
-        detail = payload.get("payload") or payload
-        det = detail.get("det") or {}
+        nested_payload = _as_dict(payload.get("payload"))
+        detail = nested_payload or payload
+        det = _as_dict(detail.get("det"))
+        detail_meta = _as_dict(detail.get("detail"))
         fleet_id = _pick_value(payload, "fleetID", "fleetId", "fleetid") or _pick_value(detail, "fleetID", "fleetId", "fleetid")
-        plate_no = _pick_value(payload, "plateNo", "plateno", "plate") or _pick_value(detail, "plateNo", "plateno", "plate")
+        company = self.registry.resolve_company(device_id=device_id, fleet_id=fleet_id)
+        raw_plate_no = self.extract_plate_candidate(payload)
+        plate_no = self.registry.normalize_plate(company, raw_plate_no) if company else self.registry.normalize_plate_any(raw_plate_no)
         guid = str(
             payload.get("alarmID")
             or payload.get("guid")
@@ -350,13 +493,13 @@ class HowenClient:
             raw_tp=raw_tp,
             raw_event_code=raw_event_code,
             payload_category=payload.get("category") or detail.get("category"),
-            detail_category=detail.get("detail", {}).get("category") if isinstance(detail.get("detail"), dict) else None,
+            detail_category=detail_meta.get("category"),
             registry_subtype_map=self.registry.subtype_map(),
         )
         visibility_status = _visibility_for_classification(classification_status)
 
         if det:
-            location = payload.get("location") or {}
+            location = _as_dict(payload.get("location"))
             event_time = detail.get("dtu") or detail.get("st") or location.get("dtu") or payload.get("dtu")
             occurred_at = parse_timestamp(event_time, timezone_name)
             if not occurred_at:
@@ -384,7 +527,7 @@ class HowenClient:
                 total_mileage_km=_normalize_distance_field_km(
                     payload.get("totalMileage")
                     or detail.get("totalMileage")
-                    or (payload.get("mileage") or {}).get("total")
+                    or _as_dict(payload.get("mileage")).get("total")
                 ),
                 raw_event_time=str(event_time) if event_time else None,
                 raw=payload,
@@ -424,10 +567,11 @@ class HowenClient:
 
 
 def _extract_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    data = payload.get("data") or {}
+    data = _as_dict(payload.get("data"))
     rows = data.get("list") or data.get("rows") or data.get("result") or data.get("items") or data.get("dataList") or []
     if isinstance(rows, dict):
-        rows = rows.get("list") or rows.get("rows") or rows.get("items") or rows.get("dataList") or []
+        row_dict = _as_dict(rows)
+        rows = row_dict.get("list") or row_dict.get("rows") or row_dict.get("items") or row_dict.get("dataList") or []
     return [row for row in rows if isinstance(row, dict)]
 
 
@@ -436,6 +580,12 @@ def _pick_value(payload: dict[str, Any], *keys: str) -> str | None:
         value = payload.get(key)
         if value not in (None, ""):
             return str(value)
+    for nested_key in ("payload", "basic", "detail", "det", "ext", "location", "mileage", "module"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            nested_value = _pick_value(nested, *keys)
+            if nested_value:
+                return nested_value
     return None
 
 
@@ -466,6 +616,16 @@ def _pick_alarm_text(payload: dict[str, Any], detail: dict[str, Any]) -> str | N
         payload.get("alarmType"),
         detail.get("alarmtypeValue"),
         payload.get("alarmtypeValue"),
+        detail.get("alarmName"),
+        payload.get("alarmName"),
+        detail.get("typeName"),
+        payload.get("typeName"),
+        detail.get("name"),
+        payload.get("name"),
+        _extract_alarm_type_from_alarm_detail(detail.get("alarmDetail")),
+        _extract_alarm_type_from_alarm_detail(payload.get("alarmDetail")),
+        _extract_alarm_type_from_alarm_detail((detail.get("detail") or {}).get("alarmDetail") if isinstance(detail.get("detail"), dict) else None),
+        _extract_alarm_type_from_alarm_detail((payload.get("detail") or {}).get("alarmDetail") if isinstance(payload.get("detail"), dict) else None),
     ):
         raw = _raw_string(candidate)
         if raw:
@@ -474,7 +634,7 @@ def _pick_alarm_text(payload: dict[str, Any], detail: dict[str, Any]) -> str | N
 
 
 def _pick_alarm_tp(payload: dict[str, Any], detail: dict[str, Any]) -> str | None:
-    det = detail.get("det") or {}
+    det = _as_dict(detail.get("det"))
     direct = _raw_string(det.get("tp")) or _raw_string(detail.get("tp")) or _raw_string(payload.get("tp"))
     if direct:
         return direct
@@ -510,8 +670,6 @@ def _classify_alarm(
     text_key = _normalize_alarm_type(raw_alarm_type)
     if text_key in HISTORICAL_ALARM_TYPE_MAP:
         return HISTORICAL_ALARM_TYPE_MAP[text_key], "text_alarm_type", "classified_dms"
-    if text_key:
-        return "No DMS", "text_alarm_type", "classified_non_dms"
 
     normalized_tp = _raw_string(raw_tp)
     tp_map = registry_subtype_map.get(normalized_tp or "") or LIVE_TP_MAP.get(normalized_tp or "")
@@ -527,10 +685,62 @@ def _classify_alarm(
         normalized_candidate = _normalize_alarm_type(candidate)
         if normalized_candidate in HISTORICAL_ALARM_TYPE_MAP:
             return HISTORICAL_ALARM_TYPE_MAP[normalized_candidate], "payload_category", "classified_dms"
+    for candidate in (raw_tp, raw_event_code):
+        normalized_candidate = _normalize_alarm_type(candidate)
+        if normalized_candidate in HISTORICAL_ALARM_TYPE_MAP:
+            return HISTORICAL_ALARM_TYPE_MAP[normalized_candidate], "historical_equivalent", "classified_dms"
+
+    for candidate in (raw_alarm_type, raw_tp, raw_event_code, payload_category, detail_category):
+        normalized_candidate = _normalize_alarm_type(candidate)
+        if _looks_like_dms_text(normalized_candidate):
+            return "Sin clasificar", "dms_like_unmapped", "unmapped"
         if normalized_candidate:
-            return "No DMS", "payload_category", "classified_non_dms"
+            return "No DMS", "non_dms_text", "classified_non_dms"
 
     return "Sin clasificar", "unclassified", "unmapped"
+
+
+def _pick_plate_value(
+    payload: dict[str, Any],
+    *,
+    detail: dict[str, Any] | None = None,
+    ext: dict[str, Any] | None = None,
+) -> str | None:
+    detail = detail or {}
+    ext = ext or {}
+    for candidate in (
+        _pick_value(payload, "plateNo", "plateno", "plate"),
+        _pick_value(detail, "plateNo", "plateno", "plate"),
+        _pick_value(ext, "plateNo", "plateno", "plate"),
+    ):
+        raw = _raw_string(candidate)
+        if raw:
+            return raw
+
+    for candidate in (
+        _pick_value(payload, "devicename", "deviceName"),
+        _pick_value(detail, "devicename", "deviceName"),
+        _pick_value(ext, "devicename", "deviceName"),
+    ):
+        raw = _raw_string(candidate)
+        if raw and _looks_like_vehicle_plate(raw):
+            return raw
+
+    last_status_json = payload.get("lastStatusJson")
+    if isinstance(last_status_json, str) and last_status_json.strip():
+        try:
+            parsed = json.loads(last_status_json)
+        except json.JSONDecodeError:
+            parsed = {}
+        parsed_ext = _as_dict(parsed.get("ext"))
+        for candidate in (
+            _pick_value(parsed_ext, "devicename", "deviceName"),
+            _pick_value(parsed, "devicename", "deviceName"),
+        ):
+            raw = _raw_string(candidate)
+            if raw and _looks_like_vehicle_plate(raw):
+                return raw
+    return None
 
 
 def _visibility_for_classification(classification_status: str) -> str:
@@ -569,6 +779,39 @@ def _normalize_distance_field_km(value: object) -> float | None:
     return round(parsed, 1)
 
 
+def _looks_like_dms_text(value: str) -> bool:
+    if not value:
+        return False
+    keywords = (
+        "eye",
+        "yawn",
+        "phone",
+        "smok",
+        "distract",
+        "fatigue",
+        "collision",
+        "camera",
+        "sunglass",
+        "dms",
+    )
+    return any(keyword in value for keyword in keywords)
+
+
+def _looks_like_vehicle_plate(value: str) -> bool:
+    normalized = re.sub(r"[^A-Za-z0-9]", "", value or "").upper()
+    return bool(PLATE_LIKE_RE.fullmatch(normalized))
+
+
+def _extract_alarm_type_from_alarm_detail(value: object) -> str | None:
+    raw = _raw_string(value)
+    if not raw:
+        return None
+    match = re.search(r"type\s*:\s*([^;]+)", raw, re.IGNORECASE)
+    if not match:
+        return None
+    return _raw_string(match.group(1))
+
+
 def _decode_ws_message(raw: str) -> dict[str, Any]:
     try:
         payload = json.loads(raw)
@@ -599,3 +842,7 @@ def _message_payload_value(message: dict[str, Any], key: str) -> str | None:
     if value in (None, ""):
         return None
     return str(value)
+
+
+def _as_dict(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}

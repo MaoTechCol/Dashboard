@@ -22,6 +22,7 @@
     "subtype_map": {
       "65": "Ojos cerrados"
     },
+    "plate_aliases": {},
     "notes": "La tabla subtype_map queda preparada para completar los codigos tp reales del cliente cuando se confirmen.",
     "quality_notes": [],
     "brand": {

@@ -2,6 +2,22 @@
 
 Backend local en FastAPI para el dashboard DMS basado en Howen VSS.
 
+## Batch historico de activacion
+
+Las reconstrucciones iniciales de empresas usan escritura masiva sin cambiar los cortes operativos de 15 minutos.
+
+- `HISTORICAL_BATCH_MODE=activation_only` habilita el batch solo para activaciones.
+- `HISTORICAL_BATCH_MODE=off` vuelve inmediatamente al pipeline individual anterior.
+- `HISTORICAL_BATCH_MODE=all_historical` queda reservado para una ampliacion posterior.
+- `HISTORICAL_BATCH_SIZE=500` controla el tamano de cada transaccion.
+
+El benchmark reproducible no toca datos productivos. En PostgreSQL usa un esquema temporal que elimina al terminar:
+
+```bash
+uv run python scripts/benchmark_alarm_batch.py --rows 6000 --batch-size 500
+uv run python scripts/benchmark_alarm_batch.py --configured-postgres --rows 6000 --batch-size 500
+```
+
 ## Manejo con uv
 
 Instalacion y sincronizacion:
@@ -36,6 +52,7 @@ Variables locales del portal:
 
 - `JWT_SECRET`
 - `SESSION_COOKIE_NAME`
+- `SESSION_COOKIE_SECURE`
 - `SESSION_TTL_MINUTES`
 - `SEED_ADMIN_USERNAME`
 - `SEED_ADMIN_PASSWORD`
@@ -43,8 +60,30 @@ Variables locales del portal:
 - `ANOMALY_FUTURE_TOLERANCE_MINUTES`
 - `LIVE_RETENTION_DAYS`
 - `ANOMALY_RETENTION_DAYS`
+- `CATCHUP_OVERLAP_MINUTES`
+- `CATCHUP_BOOTSTRAP_HOURS`
+- `CATCHUP_STALE_AFTER_MINUTES`
+- `CATCHUP_MAX_WINDOW_MINUTES`
+- `CATCHUP_DEVICE_BATCH_SIZE`
+- `CATCHUP_CHECK_INTERVAL_MINUTES`
+- `CATCHUP_RATE_LIMIT_BASE_SECONDS`
+- `CATCHUP_RATE_LIMIT_MAX_SECONDS`
+- `CATCHUP_ERROR_RETRY_SECONDS`
+- `PUBLIC_DASHBOARD_URL`
+- `PUBLIC_API_URL`
 
 Si las credenciales Howen quedan vacias, la API iniciara pero la ingesta permanecera reconectando hasta que completes `HOWEN_USERNAME` y `HOWEN_PASSWORD` o `HOWEN_PASSWORD_MD5`.
+
+## Postgres / Supabase
+
+El backend soporta `PostgreSQL` por `psycopg`.
+
+Ejemplo de produccion:
+
+```env
+DATABASE_URL=postgresql+psycopg://postgres:***@db.<project-ref>.supabase.co:5432/postgres?sslmode=require
+SESSION_COOKIE_SECURE=true
+```
 
 ## Credenciales semilla
 
@@ -53,6 +92,8 @@ Si las credenciales Howen quedan vacias, la API iniciara pero la ingesta permane
 
 ## Endpoints principales
 
+- `GET /api/healthz`
+- `GET /api/readyz`
 - `POST /api/auth/login`
 - `POST /api/auth/logout`
 - `GET /api/auth/me`

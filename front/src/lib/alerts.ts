@@ -25,6 +25,20 @@ interface GroupedAlert {
   isNight: boolean;
   isNew: boolean;
   rawCount: number;
+  note?: string;
+}
+
+interface TimelineMarker {
+  id: string;
+  kind: "marker";
+  label: string;
+  timeLabel: string;
+}
+
+interface TimelineAlertEntry {
+  id: string;
+  kind: "alert";
+  alert: GroupedAlert;
 }
 
 const DISPLAY_LABELS: Record<string, string> = {
@@ -91,11 +105,11 @@ export function formatCategory(category: string) {
 
 export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilter) {
   const timezoneName = snapshot.meta.timezone;
-  const now = dayjs(snapshot.meta.generatedAt).tz(timezoneName);
+  const snapshotCut = snapshot.meta.publishedCutAt ?? snapshot.meta.generatedAt;
+  const now = dayjs(snapshotCut).tz(timezoneName);
+  const windowStart = now.subtract(24, "hour");
   const rules = snapshot.rules;
-  const cycleMark = snapshot.feed.last_cycle_received_at
-    ? dayjs(snapshot.feed.last_cycle_received_at).tz(timezoneName)
-    : now;
+  const cycleMark = dayjs(snapshotCut).tz(timezoneName);
   const rawEvents = snapshot.recentEvents
     .map((event) => ({
       ...event,
@@ -113,9 +127,6 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
   for (const event of rawEvents) {
     const key = `${event.plate}|${event.category}`;
     const current = openGroups.get(key);
-    const gapSeconds = current
-      ? event.occurredAtDayjs.diff(current.events[current.events.length - 1].occurredAtDayjs, "second")
-      : null;
     const gapMinutes = current
       ? event.occurredAtDayjs.diff(current.events[current.events.length - 1].occurredAtDayjs, "minute", true)
       : null;
@@ -127,11 +138,7 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
           : rules.streak_window_minutes;
 
     if (current && gapMinutes !== null && gapMinutes <= windowMinutes) {
-      if (gapSeconds !== null && gapSeconds <= rules.echo_window_seconds) {
-        current.events[current.events.length - 1] = event;
-      } else {
-        current.events.push(event);
-      }
+      current.events.push(event);
       continue;
     }
 
@@ -164,6 +171,7 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
     let title = formatCategory(group.category);
     let detail = last.occurredAtDayjs.format("HH:mm");
     let label = "Medio";
+    let note: string | undefined;
 
     if (group.category === "Ojos cerrados") {
       const matchingYawn = grouped.find((candidate) => {
@@ -196,6 +204,9 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
       } else {
         dismissed += 1;
         continue;
+      }
+      if (sameDayCount > 12) {
+        note = "Puede ser por uso de gafas oscuras. Conviene revisar configuracion o calibracion del sensor.";
       }
     } else if (group.category === "Uso de celular") {
       level = "critico";
@@ -273,6 +284,7 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
       isNight: isNight(last.occurredAtDayjs, rules.night_window_start, rules.night_window_end),
       isNew: cycleGap >= 0 && cycleGap <= rules.ingestion_cycle_minutes,
       rawCount: group.events.length,
+      note,
     });
   }
 
@@ -292,12 +304,18 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
   });
 
   const emptyHint = buildEmptyHint(rawEvents, filter, now, rules);
+  const entries = buildTimelineEntries({
+    alerts: visible,
+    now,
+    windowStart,
+    nightStartHour: rules.night_window_start,
+    nightEndHour: rules.night_window_end,
+  });
 
   return {
     all: alerts,
     visible,
-    dayAlerts: visible.filter((alert) => !alert.isNight),
-    nightAlerts: visible.filter((alert) => alert.isNight),
+    entries,
     counts,
     dismissed,
     emptyHint,
@@ -326,4 +344,92 @@ function buildEmptyHint(
   }
   const label = filter === "noche" ? "de esa franja" : "de ese grupo";
   return `No hay alertas visibles para este filtro. Ultimo evento ${label}: ${timeLabel(latest.occurredAtDayjs, now)}.`;
+}
+
+function buildTimelineEntries({
+  alerts,
+  now,
+  windowStart,
+  nightStartHour,
+  nightEndHour,
+}: {
+  alerts: GroupedAlert[];
+  now: dayjs.Dayjs;
+  windowStart: dayjs.Dayjs;
+  nightStartHour: number;
+  nightEndHour: number;
+}) {
+  const markers = buildNightMarkers({ alerts, now, windowStart, nightStartHour, nightEndHour });
+  const entries: Array<TimelineAlertEntry | TimelineMarker> = alerts.map((alert) => ({
+    id: alert.id,
+    kind: "alert",
+    alert,
+  }));
+
+  for (const marker of markers) {
+    const index = entries.findIndex((entry) => {
+      if (entry.kind !== "alert") return false;
+      return dayjs(entry.alert.occurredAt).valueOf() <= marker.at.valueOf();
+    });
+    const payload: TimelineMarker = {
+      id: `marker-${marker.label}-${marker.at.toISOString()}`,
+      kind: "marker",
+      label: marker.label,
+      timeLabel: formatBoundaryTimeLabel(marker.at, now),
+    };
+    if (index === -1) {
+      entries.push(payload);
+    } else {
+      entries.splice(index, 0, payload);
+    }
+  }
+
+  return entries;
+}
+
+function buildNightMarkers({
+  alerts,
+  now,
+  windowStart,
+  nightStartHour,
+  nightEndHour,
+}: {
+  alerts: GroupedAlert[];
+  now: dayjs.Dayjs;
+  windowStart: dayjs.Dayjs;
+  nightStartHour: number;
+  nightEndHour: number;
+}) {
+  if (alerts.length < 2) return [];
+  const newestAlertAt = dayjs(alerts[0].occurredAt);
+  const oldestAlertAt = dayjs(alerts[alerts.length - 1].occurredAt);
+  const markers: Array<{ label: string; at: dayjs.Dayjs }> = [];
+  let cursor = windowStart.startOf("day").subtract(1, "day");
+  const lastCursor = now.startOf("day").add(1, "day");
+
+  while (cursor.isBefore(lastCursor) || cursor.isSame(lastCursor, "day")) {
+    const start = cursor.hour(nightStartHour).minute(0).second(0).millisecond(0);
+    const end = (nightStartHour < nightEndHour ? cursor : cursor.add(1, "day"))
+      .hour(nightEndHour)
+      .minute(0)
+      .second(0)
+      .millisecond(0);
+
+    if (start.isAfter(windowStart) && start.isBefore(now) && start.isBefore(newestAlertAt) && start.isAfter(oldestAlertAt)) {
+      markers.push({ label: "Comienzo de franja nocturna", at: start });
+    }
+    if (end.isAfter(windowStart) && end.isBefore(now) && end.isBefore(newestAlertAt) && end.isAfter(oldestAlertAt)) {
+      markers.push({ label: "Fin de franja nocturna", at: end });
+    }
+
+    cursor = cursor.add(1, "day");
+  }
+
+  return markers.sort((left, right) => right.at.valueOf() - left.at.valueOf());
+}
+
+function formatBoundaryTimeLabel(value: dayjs.Dayjs, now: dayjs.Dayjs) {
+  if (value.isSame(now, "day")) return value.format("HH:mm");
+  if (value.add(1, "day").isSame(now, "day")) return `ayer ${value.format("HH:mm")}`;
+  return value.format("DD/MM HH:mm");
 }

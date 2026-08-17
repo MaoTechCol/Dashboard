@@ -18,6 +18,41 @@ export interface CompanySummary {
   brand: CompanyBrand;
 }
 
+export interface AdminCompanyCatalogItem {
+  slug: string;
+  name: string;
+  customer: string;
+  timezone: string;
+  subdomain: string | null;
+  fleet_ids: string[];
+  device_ids: string[];
+  operational: boolean;
+  ready_in_selector: boolean;
+  rebuild_status: "idle" | "queued" | "running" | "succeeded" | "ready" | "failed";
+  rebuild_progress_pct: number | null;
+  rebuild_days_done: number;
+  rebuild_days_total: number;
+  rebuild_phase?: string | null;
+  rebuild_rows_total?: number;
+  rebuild_rows_processed?: number;
+  rebuild_current_device_id?: string | null;
+  rebuild_last_heartbeat_at?: string | null;
+  rebuild_started_at: string | null;
+  rebuild_finished_at: string | null;
+  rebuild_next_retry_at: string | null;
+  rebuild_published_cut_at: string | null;
+  rebuild_error_message: string | null;
+  can_deactivate: boolean;
+}
+
+export interface AdminCompanyCatalog {
+  total_companies: number;
+  operational_companies: number;
+  companies: AdminCompanyCatalogItem[];
+  activation_jobs: AdminCompanyCatalogItem[];
+  fleet_candidates: FleetCandidate[];
+}
+
 export interface SessionUser {
   username: string;
   role: "admin" | "client";
@@ -40,6 +75,9 @@ export interface FeedState {
   last_event_observed_at: string | null;
   last_alarm_at: string | null;
   last_status_at: string | null;
+  last_live_alarm_message_at: string | null;
+  last_live_dms_at: string | null;
+  last_live_unmapped_at: string | null;
   connection_state: string;
   last_error: string | null;
 }
@@ -170,6 +208,17 @@ export interface DashboardSnapshot {
     kmTotalClosedWindow: number;
     currentDayKmProvisional: number;
     currentDayIsProvisional: boolean;
+    lastDmsEventAt: string | null;
+    publishedCutAt?: string | null;
+    nextCutAt?: string | null;
+    cutStatus?: string;
+    lastCompletedHarvestAt?: string | null;
+    lastStatusMessageAt?: string | null;
+    lastStatusObservedAt?: string | null;
+    lastDmsPublishedAt?: string | null;
+    weekWindowStart: string;
+    weekWindowEnd: string;
+    weekWindowMode: "calendar_local";
   };
   feed: FeedState;
   dataQuality: DataQuality;
@@ -200,17 +249,45 @@ export interface AdminIngestionStatus {
   last_event_observed_at: string | null;
   last_alarm_at: string | null;
   last_status_at: string | null;
+  last_live_alarm_message_at: string | null;
+  last_live_dms_at: string | null;
+  last_live_unmapped_at: string | null;
   last_device_sync_at: string | null;
   last_error: string | null;
   anomaly_count_24h: number;
+  live_alarm_count_24h: number;
+  live_dms_count_24h: number;
+  raw_dms_count_24h: number;
+  backfill_dms_count_24h: number;
+  catchup_dms_count_24h: number;
+  live_unmapped_count_24h: number;
+  non_dms_count_24h: number;
+  live_non_dms_count_24h: number;
+  future_rejected_count_24h: number;
+  live_future_rejected_count_24h: number;
+  catchup_failures_24h: number;
+  last_successful_catchup_cursor_at: string | null;
+  last_successful_catchup_observed_at: string | null;
+  pending_range_start_at: string | null;
+  pending_range_end_at: string | null;
+  next_catchup_retry_at: string | null;
+  catchup_rate_limit_streak: number;
+  last_catchup_attempt_at: string | null;
+  last_catchup_error: string | null;
+  operational_recency: OperationalRecency;
 }
 
 export interface CoverageSummary {
   total_vehicles: number;
-  reporting_vehicles_24h: number;
+  vehicles_reporting_status_24h: number;
+  vehicles_with_any_alarm_24h: number;
+  vehicles_with_dms_alarm_24h: number;
+  vehicles_with_live_dms_24h: number;
+  vehicles_with_valid_day_km_today: number;
+  vehicles_missing_day_km_today: number;
+  vehicles_with_status_today: number;
   stale_vehicles: number;
   vehicles_with_snapshot_today: number;
-  vehicles_with_alarm_24h: number;
 }
 
 export interface KmSummary {
@@ -226,6 +303,42 @@ export interface ReportsSummary {
   latest_report_month: number | null;
 }
 
+export interface PublicationState {
+  dashboard_host: string | null;
+  dashboard_url: string | null;
+  api_url: string | null;
+  dns_status: "unconfigured" | "resolved" | "unresolved";
+  resolved_targets: string[];
+  local_validation_only: boolean;
+  message: string;
+}
+
+export interface OperationalRecency {
+  last_raw_dms_at: string | null;
+  last_accepted_dms_at: string | null;
+  last_visible_dms_at: string | null;
+  last_pending_review_at: string | null;
+  last_pending_visibility_at: string | null;
+  pending_review_count: number;
+  pending_actionable_count: number;
+  pending_visibility_count: number;
+  latest_pending_reason: string | null;
+  latest_pending_plate: string | null;
+}
+
+export interface AlarmHarvestOverview {
+  currentCutAt: string;
+  completedCompanies: number;
+  delayedCompanies: number;
+  rateLimitedCompanies: number;
+  queueDepth: number;
+  runningCuts: number;
+  queuedCuts: number;
+  activeRebuilds: number;
+  queuedRebuilds: number;
+  bootstrappingCompanies: number;
+}
+
 export interface AdminOverview {
   company_slug: string;
   company_name: string;
@@ -234,8 +347,11 @@ export interface AdminOverview {
   coverage: CoverageSummary;
   km: KmSummary;
   reports: ReportsSummary;
+  publication: PublicationState;
   anomaly_count_24h: number;
   active_notes: DataQualityNote[];
+  operational_recency: OperationalRecency;
+  alarmHarvest?: AlarmHarvestOverview;
 }
 
 export interface CompanyAssignment {
@@ -265,6 +381,8 @@ export interface FleetCandidate {
   latest_alarm_at: string | null;
   sample_plates: string[];
   selected: boolean;
+  assigned_company_slug: string | null;
+  assigned_company_name: string | null;
 }
 
 export interface MockDataSummary {
@@ -287,6 +405,23 @@ export interface UnclassifiedCode {
   sample_plate: string | null;
 }
 
+export interface RawAlarmDiagnostic {
+  guid: string;
+  source: string;
+  occurred_at: string | null;
+  received_at: string;
+  device_id: string | null;
+  plate_no: string | null;
+  raw_alarm_type: string | null;
+  raw_tp: string | null;
+  raw_event_code: string | null;
+  classification_status: string | null;
+  mapped_category: string | null;
+  mapping_source: string | null;
+  temporal_status: string | null;
+  ingest_result: string | null;
+}
+
 export interface AdminLiveSetup {
   company_slug: string;
   company_name: string;
@@ -294,6 +429,7 @@ export interface AdminLiveSetup {
   mock_data: MockDataSummary;
   fleet_candidates: FleetCandidate[];
   unclassified_codes: UnclassifiedCode[];
+  recent_raw_diagnostics: RawAlarmDiagnostic[];
 }
 
 export interface MockDataPurgeResult {
@@ -307,6 +443,7 @@ export interface RecentAudit {
   raw_events: number;
   grouped_episodes: number;
   visible_alerts: number;
+  fused_in_episode: number;
   dismissed_alerts: number;
   suppressed_by_rule: number;
   visible_raw_events: number;
@@ -321,6 +458,8 @@ export interface AlarmAudit {
   unclassified_total: number;
   mapping_sources: Record<string, number>;
   by_category: Record<string, number>;
+  audit_stages: Record<string, number>;
+  audit_reasons: Record<string, number>;
   by_subtype: Array<{ subtype: string; count: number }>;
 }
 
@@ -336,13 +475,15 @@ export interface AdminAudit {
   range_end: string;
   alarms: AlarmAudit;
   anomalies: AnomalyAudit;
+  requested_window: RecentAudit;
+  recent_7d: RecentAudit;
   recent_24h: RecentAudit;
 }
 
 export interface ReconciliationSummary {
   company_slug: string;
   company_name: string;
-  window_type: "calendar_day_local" | "rolling_24h";
+  window_type: "calendar_day_local" | "rolling_24h" | "calendar_month_local";
   range_start: string;
   range_end: string;
   raw_portal_equivalent: number;
@@ -358,14 +499,122 @@ export interface ReconciliationSummary {
   missing_local: number;
 }
 
+export interface ReconciliationRunResult {
+  job_id: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "rate_limited";
+  cached_result_available: boolean;
+  total_devices: number;
+  processed_devices: number;
+  succeeded_devices: number;
+  failed_devices: number;
+  rate_limited_devices: number;
+  current_device_id: string | null;
+  range_start: string;
+  range_end: string;
+  window_type: "calendar_day_local" | "rolling_24h" | "calendar_month_local";
+  summary?: ReconciliationSummary | null;
+  drilldown?: ReconciliationDrilldownRow[];
+}
+
+export interface ReconciliationJobResult {
+  job_id: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "rate_limited";
+  company_slug: string;
+  range_start: string;
+  range_end: string;
+  window_type: "calendar_day_local" | "rolling_24h" | "calendar_month_local";
+  cached_result_available: boolean;
+  total_devices: number;
+  processed_devices: number;
+  succeeded_devices: number;
+  failed_devices: number;
+  rate_limited_devices: number;
+  current_device_id: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  error_message: string | null;
+  summary: ReconciliationSummary | null;
+  drilldown: ReconciliationDrilldownRow[];
+}
+
+export interface ReconciliationReviewItem {
+  id: number;
+  company_slug: string;
+  guid: string | null;
+  device_id: string | null;
+  plate_no: string | null;
+  observed_at: string | null;
+  portal_begin_time: string | null;
+  portal_reporting_time: string | null;
+  raw_alarm_type: string | null;
+  raw_tp: string | null;
+  raw_event_code: string | null;
+  classification_status: string | null;
+  visibility_status: string | null;
+  category: string | null;
+  subtype: string | null;
+  reason: string;
+  diagnostic_note: string | null;
+  suggested_action: string;
+  review_status: string;
+  source_job_id: string | null;
+  source_window_type: string | null;
+  decision_note: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
+  applied_at: string | null;
+}
+
+export interface ReconciliationReviewList {
+  total_items: number;
+  counts_by_action: Record<string, number>;
+  counts_by_reason: Record<string, number>;
+  items: ReconciliationReviewItem[];
+}
+
+export interface ReconciliationReviewBulkDecisionResult {
+  updated: number;
+  items: ReconciliationReviewItem[];
+}
+
+export interface HistoricalRebuildResult {
+  company_slug: string;
+  timezone: string;
+  start_date_local: string;
+  end_date_local: string;
+  days_total: number;
+  devices_total: number;
+  inserted: number;
+  anomalies: number;
+  failed_count: number;
+  latest_observed_at: string | null;
+  published_cut_at: string | null;
+  recent_events: number | null;
+  week_total: number | null;
+  last_dms_event_at: string | null;
+  maintenance_mode: boolean;
+  day_results: Array<{
+    date_local: string;
+    inserted: number;
+    anomalies: number;
+    failed_count: number;
+    latest_observed_at: string | null;
+  }>;
+}
+
 export interface ReconciliationDrilldownRow {
   guid: string;
   plate_no: string | null;
   device_id: string | null;
+  observed_hour_local: string | null;
+  portal_begin_time: string | null;
+  portal_reporting_time: string | null;
   raw_alarm_type: string | null;
   raw_tp: string | null;
   raw_event_code: string | null;
   observed_at: string | null;
+  stored_observed_at: string | null;
+  stored_raw_event_time: string | null;
   classification_status: string;
   visibility_status: string;
   source: string;
@@ -374,17 +623,24 @@ export interface ReconciliationDrilldownRow {
   reason: string;
   episode_guid: string | null;
   episode_title: string | null;
+  portal_duplicate_count: number;
+  diagnostic_note: string | null;
 }
 
 export interface KmQualitySummary {
   company_slug: string;
   company_name: string;
+  total_vehicles: number;
   vehicles_with_valid_day_km: number;
   vehicles_with_invalid_day_km: number;
   vehicles_with_total_regression: number;
+  vehicles_with_snapshot_today: number;
+  vehicles_with_status_today: number;
   current_day_km_source: string;
   repaired_rows: number;
   sample_invalid_vehicles: string[];
+  sample_total_regression_vehicles: string[];
+  sample_missing_day_km_vehicles: string[];
 }
 
 export interface AdminVehicle {

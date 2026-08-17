@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.settings import get_settings
+from app.services.company_registry import normalize_plate_label
 
 
 class Base(DeclarativeBase):
@@ -21,7 +22,12 @@ connect_args = {}
 if settings.database_url.startswith("sqlite"):
     connect_args["check_same_thread"] = False
 
-engine = create_engine(settings.database_url, future=True, connect_args=connect_args)
+engine = create_engine(
+    settings.database_url,
+    future=True,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
@@ -59,7 +65,13 @@ def _run_compat_migrations() -> None:
     if "ingest_state" in existing_tables:
         _ensure_column("ingest_state", "last_cycle_received_at", "DATETIME")
         _ensure_column("ingest_state", "last_event_observed_at", "DATETIME")
+        _ensure_column("ingest_state", "last_live_alarm_message_at", "DATETIME")
+        _ensure_column("ingest_state", "last_live_dms_at", "DATETIME")
+        _ensure_column("ingest_state", "last_live_unmapped_at", "DATETIME")
         _ensure_column("ingest_state", "last_anomaly_at", "DATETIME")
+        _ensure_column("ingest_state", "maintenance_mode", "BOOLEAN DEFAULT FALSE")
+        _ensure_column("ingest_state", "maintenance_reason", "TEXT")
+        _ensure_column("ingest_state", "maintenance_started_at", "DATETIME")
     if "devices" in existing_tables:
         _ensure_column("devices", "company_slug", "VARCHAR(64)")
         _ensure_column("devices", "last_received_at", "DATETIME")
@@ -79,6 +91,7 @@ def _run_compat_migrations() -> None:
         _ensure_column("daily_mileage_snapshots", "repair_reason", "VARCHAR(255)")
         _ensure_column("daily_mileage_snapshots", "repaired_at", "DATETIME")
     if "alarm_events" in existing_tables:
+        _ensure_column("alarm_events", "provider_event_key", "VARCHAR(255)")
         _ensure_column("alarm_events", "company_slug", "VARCHAR(64)")
         _ensure_column("alarm_events", "mapping_source", "VARCHAR(32)")
         _ensure_column("alarm_events", "classification_status", "VARCHAR(32)")
@@ -89,10 +102,60 @@ def _run_compat_migrations() -> None:
         _ensure_column("alarm_events", "raw_event_code", "VARCHAR(32)")
         _ensure_column("alarm_events", "received_at", "DATETIME")
         _ensure_column("alarm_events", "raw_event_time", "VARCHAR(128)")
+        _ensure_index(
+            "ix_alarm_events_provider_event_key",
+            "alarm_events",
+            ["provider_event_key"],
+            unique=True,
+        )
+        _ensure_index(
+            "ix_alarm_events_company_device_occurred",
+            "alarm_events",
+            ["company_slug", "device_id", "occurred_at"],
+        )
+    if "howen_alarm_raw" in existing_tables:
+        _ensure_column("howen_alarm_raw", "provider_event_key", "VARCHAR(255)")
+        _ensure_column("howen_alarm_raw", "raw_event_time", "VARCHAR(128)")
+        _ensure_index(
+            "ix_howen_alarm_raw_provider_event_key",
+            "howen_alarm_raw",
+            ["provider_event_key"],
+            unique=True,
+        )
+        _ensure_index(
+            "ix_howen_alarm_raw_company_device_occurred",
+            "howen_alarm_raw",
+            ["company_slug", "device_id", "occurred_at"],
+        )
+    if "alarm_event_audit" in existing_tables:
+        _ensure_index(
+            "ix_alarm_event_audit_company_device_received",
+            "alarm_event_audit",
+            ["company_slug", "device_id", "received_at"],
+        )
+    if "catchup_cursor" in existing_tables:
+        _ensure_column("catchup_cursor", "last_successful_catchup_cursor_at", "DATETIME")
+        _ensure_column("catchup_cursor", "pending_range_start_at", "DATETIME")
+        _ensure_column("catchup_cursor", "pending_range_end_at", "DATETIME")
+        _ensure_column("catchup_cursor", "next_device_offset", "INTEGER")
+        _ensure_column("catchup_cursor", "next_retry_at", "DATETIME")
+        _ensure_column("catchup_cursor", "rate_limit_streak", "INTEGER")
+    if "company_historical_rebuild_jobs" in existing_tables:
+        _ensure_column("company_historical_rebuild_jobs", "next_retry_at", "DATETIME")
+        _ensure_column("company_historical_rebuild_jobs", "phase", "VARCHAR(32)")
+        _ensure_column("company_historical_rebuild_jobs", "rows_total", "INTEGER DEFAULT 0")
+        _ensure_column("company_historical_rebuild_jobs", "rows_processed", "INTEGER DEFAULT 0")
+        _ensure_column("company_historical_rebuild_jobs", "current_device_id", "VARCHAR(128)")
+        _ensure_column("company_historical_rebuild_jobs", "last_heartbeat_at", "DATETIME")
     _backfill_legacy_sources(existing_tables)
+    _normalize_legacy_plate_labels(existing_tables)
+    _backfill_raw_alarm_store()
+    _prune_alarm_event_store(existing_tables)
+    _repair_postgres_sequences(existing_tables)
 
 
 def _ensure_column(table_name: str, column_name: str, column_sql: str) -> None:
+    column_sql = _normalize_column_sql(column_sql)
     inspector = inspect(engine)
     columns = {column["name"] for column in inspector.get_columns(table_name)}
     if column_name in columns:
@@ -103,6 +166,33 @@ def _ensure_column(table_name: str, column_name: str, column_sql: str) -> None:
         except OperationalError as exc:
             if "duplicate column name" not in str(exc).lower():
                 raise
+
+
+def _normalize_column_sql(column_sql: str) -> str:
+    if column_sql != "DATETIME":
+        return column_sql
+    if engine.dialect.name.startswith("postgres"):
+        return "TIMESTAMP WITH TIME ZONE"
+    return "DATETIME"
+
+
+def _ensure_index(index_name: str, table_name: str, columns: list[str], *, unique: bool = False) -> None:
+    inspector = inspect(engine)
+    indexes = {index["name"] for index in inspector.get_indexes(table_name)}
+    if index_name in indexes:
+        return
+    unique_sql = "UNIQUE " if unique else ""
+    column_sql = ", ".join(columns)
+    with engine.begin() as connection:
+        try:
+            connection.execute(text(f"CREATE {unique_sql}INDEX IF NOT EXISTS {index_name} ON {table_name} ({column_sql})"))
+        except OperationalError:
+            if unique:
+                # Older deployments may contain duplicated legacy rows. In that case
+                # we keep the column and let the new pipeline populate unique values
+                # on subsequent rewrites instead of failing startup.
+                return
+            raise
 
 
 def _backfill_legacy_sources(existing_tables: set[str]) -> None:
@@ -145,13 +235,82 @@ def _backfill_legacy_sources(existing_tables: set[str]) -> None:
         statements.append("UPDATE daily_mileage_snapshots SET source = 'live' WHERE source IS NULL OR source = ''")
     if "mileage_readings" in existing_tables:
         statements.append("UPDATE mileage_readings SET source = 'status' WHERE source IS NULL OR source = ''")
+    if "catchup_cursor" in existing_tables:
+        statements.append(
+            """
+            UPDATE catchup_cursor
+            SET last_successful_catchup_cursor_at = last_successful_catchup_observed_at
+            WHERE last_successful_catchup_cursor_at IS NULL AND last_successful_catchup_observed_at IS NOT NULL
+            """
+        )
+        statements.append(
+            """
+            UPDATE catchup_cursor
+            SET next_device_offset = 0
+            WHERE next_device_offset IS NULL
+            """
+        )
+        statements.append(
+            """
+            UPDATE catchup_cursor
+            SET rate_limit_streak = 0
+            WHERE rate_limit_streak IS NULL
+            """
+        )
+    if "ingest_state" in existing_tables:
+        statements.append(
+            """
+            UPDATE ingest_state
+            SET maintenance_mode = FALSE
+            WHERE maintenance_mode IS NULL
+            """
+        )
     if not statements:
         _backfill_company_slugs(existing_tables)
         return
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+        if "howen_alarm_raw" in existing_tables and "alarm_events" in existing_tables:
+            connection.execute(
+                text(
+                    """
+                    UPDATE howen_alarm_raw
+                    SET raw_event_time = (
+                        SELECT alarms.raw_event_time
+                        FROM alarm_events AS alarms
+                        WHERE alarms.guid = howen_alarm_raw.guid
+                          AND alarms.raw_event_time IS NOT NULL
+                          AND alarms.raw_event_time <> ''
+                        LIMIT 1
+                    )
+                    WHERE (raw_event_time IS NULL OR raw_event_time = '')
+                      AND EXISTS (
+                        SELECT 1
+                        FROM alarm_events AS alarms
+                        WHERE alarms.guid = howen_alarm_raw.guid
+                          AND alarms.raw_event_time IS NOT NULL
+                          AND alarms.raw_event_time <> ''
+                      )
+                    """
+                )
+            )
     _backfill_company_slugs(existing_tables)
+
+
+def _prune_alarm_event_store(existing_tables: set[str]) -> None:
+    if "alarm_events" not in existing_tables:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                DELETE FROM alarm_events
+                WHERE classification_status IS NULL
+                   OR classification_status <> 'classified_dms'
+                """
+            )
+        )
 
 
 def _backfill_company_slugs(existing_tables: set[str]) -> None:
@@ -222,4 +381,138 @@ def _backfill_company_slugs(existing_tables: set[str]) -> None:
                         """
                     ),
                     params,
+                )
+
+
+def _backfill_raw_alarm_store() -> None:
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    if "alarm_events" not in existing_tables or "howen_alarm_raw" not in existing_tables:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO howen_alarm_raw (
+                    guid,
+                    company_slug,
+                    device_id,
+                    fleet_id,
+                    plate_no,
+                    source,
+                    occurred_at,
+                    received_at,
+                    raw_alarm_type,
+                    raw_tp,
+                    raw_event_code,
+                    raw_event_time,
+                    classification_status,
+                    mapped_category,
+                    mapping_source,
+                    temporal_status,
+                    ingest_result,
+                    payload_json,
+                    updated_at
+                )
+                SELECT
+                    guid,
+                    company_slug,
+                    device_id,
+                    fleet_id,
+                    plate_no,
+                    COALESCE(source, 'live'),
+                    occurred_at,
+                    COALESCE(received_at, occurred_at),
+                    raw_alarm_type,
+                    raw_tp,
+                    raw_event_code,
+                    raw_event_time,
+                    classification_status,
+                    category,
+                    mapping_source,
+                    'accepted',
+                    CASE
+                        WHEN classification_status = 'classified_dms' THEN 'inserted_alarm_event'
+                        WHEN classification_status = 'classified_non_dms' THEN 'kept_raw_only'
+                        WHEN classification_status = 'unmapped' THEN 'kept_raw_only'
+                        ELSE 'legacy_unknown'
+                    END,
+                    COALESCE(raw_payload, '{}'),
+                    COALESCE(received_at, occurred_at)
+                FROM alarm_events
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM howen_alarm_raw raw
+                    WHERE raw.guid = alarm_events.guid
+                )
+                """
+            )
+        )
+
+
+def _normalize_legacy_plate_labels(existing_tables: set[str]) -> None:
+    inspector = inspect(engine)
+    candidate_tables = [
+        table_name
+        for table_name in existing_tables
+        if "plate_no" in {column["name"] for column in inspector.get_columns(table_name)}
+    ]
+    if not candidate_tables:
+        return
+    with engine.begin() as connection:
+        for table_name in candidate_tables:
+            raw_plates = connection.execute(
+                text(f"SELECT DISTINCT plate_no FROM {table_name} WHERE plate_no IS NOT NULL AND plate_no <> ''")
+            ).scalars().all()
+            for raw_plate in raw_plates:
+                normalized_plate = normalize_plate_label(raw_plate)
+                if not normalized_plate or normalized_plate == raw_plate:
+                    continue
+                connection.execute(
+                    text(f"UPDATE {table_name} SET plate_no = :normalized WHERE plate_no = :raw"),
+                    {"normalized": normalized_plate, "raw": raw_plate},
+                )
+
+
+def _repair_postgres_sequences(existing_tables: set[str]) -> None:
+    if not engine.dialect.name.startswith("postgres"):
+        return
+
+    sequence_tables = (
+        ("daily_mileage_snapshots", "id"),
+        ("alarm_event_audit", "id"),
+        ("ingestion_anomalies", "id"),
+        ("report_assets", "id"),
+        ("user_accounts", "id"),
+    )
+    with engine.begin() as connection:
+        for table_name, column_name in sequence_tables:
+            if table_name not in existing_tables:
+                continue
+            sequence_name = connection.execute(
+                text("SELECT pg_get_serial_sequence(:table_name, :column_name)"),
+                {
+                    "table_name": table_name,
+                    "column_name": column_name,
+                },
+            ).scalar()
+            if not sequence_name:
+                continue
+            max_id = connection.execute(
+                text(f"SELECT COALESCE(MAX({column_name}), 0) FROM {table_name}")
+            ).scalar_one()
+            if max_id and int(max_id) > 0:
+                connection.execute(
+                    text("SELECT setval(:sequence_name, :max_id, true)"),
+                    {
+                        "sequence_name": sequence_name,
+                        "max_id": int(max_id),
+                    },
+                )
+            else:
+                connection.execute(
+                    text("SELECT setval(:sequence_name, 1, false)"),
+                    {
+                        "sequence_name": sequence_name,
+                    },
                 )

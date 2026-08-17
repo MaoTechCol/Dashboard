@@ -1,0 +1,15 @@
+[Unit]
+Description=DMS Dashboard FastAPI
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/dashboard/back
+EnvironmentFile=/opt/dashboard/back/.env
+ExecStart=/usr/bin/env uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
