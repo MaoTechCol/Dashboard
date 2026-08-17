@@ -35,6 +35,12 @@ class _Registry:
     def normalize_plate(self, _company, value):
         return self.normalize_plate_any(value)
 
+    def canonical_plate(self, device_id, *candidates):
+        for candidate in candidates:
+            if candidate and str(candidate).upper() != str(device_id).upper():
+                return str(candidate).upper()
+        return str(device_id).upper() if device_id else None
+
     def timezone_for(self, **_kwargs):
         return "America/Bogota"
 
@@ -219,6 +225,26 @@ class IngestionAlarmBatchTests(unittest.TestCase):
             self.assertIsNone(job.current_device_id)
             self.assertIsNotNone(job.last_heartbeat_at)
         self.assertEqual(result.chunks_committed, 3)
+
+    def test_batch_prefers_canonical_device_plate_over_numeric_provider_label(self) -> None:
+        now = utc_now().replace(microsecond=0)
+        alarm = self._alarm(guid="canonical-plate", occurred_at=now - timedelta(minutes=10))
+        alarm.plate_no = "867869064064439"
+
+        asyncio.run(
+            self.service.ingest_alarm_batch(
+                [alarm],
+                source="harvest",
+                company=self.service.registry.company,
+                device_context={"plate_no": "TTR888"},
+            )
+        )
+
+        with self.session_factory() as session:
+            raw = session.scalar(select(HowenAlarmRaw))
+            analytic = session.scalar(select(AlarmEvent))
+            self.assertEqual(raw.plate_no, "TTR888")
+            self.assertEqual(analytic.plate_no, "TTR888")
 
     def test_batch_matches_individual_pipeline_for_raw_and_analytic_rows(self) -> None:
         now = utc_now().replace(microsecond=0)

@@ -751,6 +751,10 @@ class IngestionService:
                         session.add(rebuild_job)
                         session.commit()
 
+                # The selector/admin catalog must observe the terminal state, not
+                # the earlier publishing state cached just before this commit.
+                self.mark_dirty()
+
             return {
                 "company_slug": request.company_slug,
                 "timezone": str(company_tz),
@@ -2217,8 +2221,11 @@ class IngestionService:
                 or context.get("company_slug")
                 or (record.company_slug if record else None)
             )
-            plate_no = self.registry.normalize_plate_any(
-                context.get("plate_no") or alarm.plate_no or (record.plate_no if record else None)
+            plate_no = self.registry.canonical_plate(
+                alarm.device_id,
+                context.get("plate_no"),
+                record.plate_no if record else None,
+                alarm.plate_no,
             )
             if resolved_company is not None:
                 plate_no = self.registry.normalize_plate(resolved_company, plate_no)
@@ -2276,7 +2283,11 @@ class IngestionService:
             end_at = ensure_utc(alarm.end_at)
             company_slug = context.get("company_slug")
             fleet_id = alarm.fleet_id or context.get("fleet_id")
-            plate_no = self.registry.normalize_plate_any(alarm.plate_no or context.get("plate_no"))
+            plate_no = self.registry.canonical_plate(
+                alarm.device_id,
+                context.get("plate_no"),
+                alarm.plate_no,
+            )
             if context.get("company") is not None:
                 plate_no = self.registry.normalize_plate(context["company"], plate_no)
             provider_event_key = _build_provider_event_key(
@@ -2708,7 +2719,11 @@ class IngestionService:
             record = session.get(DeviceRecord, alarm.device_id)
             effective_fleet_id = alarm.fleet_id or (record.fleet_id if record else None)
             company = self.registry.resolve_company(device_id=alarm.device_id, fleet_id=effective_fleet_id)
-            plate_no = self.registry.normalize_plate_any(alarm.plate_no or (record.plate_no if record else None))
+            plate_no = self.registry.canonical_plate(
+                alarm.device_id,
+                record.plate_no if record else None,
+                alarm.plate_no,
+            )
             if company is None and plate_no:
                 matched_record = session.scalar(
                     select(DeviceRecord)
@@ -3371,8 +3386,9 @@ class IngestionService:
             if not row.company_slug:
                 row.company_slug = company_slug
                 dirty = True
-            if plate_no and not row.plate_no:
-                row.plate_no = plate_no
+            canonical_plate = self.registry.canonical_plate(device_id, plate_no, row.plate_no)
+            if canonical_plate and row.plate_no != canonical_plate:
+                row.plate_no = canonical_plate
                 dirty = True
             if fleet_id and not row.fleet_id:
                 row.fleet_id = fleet_id
@@ -3387,8 +3403,9 @@ class IngestionService:
             if not row.company_slug:
                 row.company_slug = company_slug
                 dirty = True
-            if plate_no and not row.plate_no:
-                row.plate_no = plate_no
+            canonical_plate = self.registry.canonical_plate(device_id, plate_no, row.plate_no)
+            if canonical_plate and row.plate_no != canonical_plate:
+                row.plate_no = canonical_plate
                 dirty = True
             if fleet_id and not row.fleet_id:
                 row.fleet_id = fleet_id
@@ -3403,8 +3420,9 @@ class IngestionService:
             if not row.company_slug:
                 row.company_slug = company_slug
                 dirty = True
-            if plate_no and not row.plate_no:
-                row.plate_no = plate_no
+            canonical_plate = self.registry.canonical_plate(device_id, plate_no, row.plate_no)
+            if canonical_plate and row.plate_no != canonical_plate:
+                row.plate_no = canonical_plate
                 dirty = True
             if fleet_id and not row.fleet_id:
                 row.fleet_id = fleet_id

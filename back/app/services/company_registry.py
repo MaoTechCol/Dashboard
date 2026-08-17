@@ -349,6 +349,22 @@ class CompanyRegistry:
     def normalize_plate_any(self, plate_no: str | None) -> str | None:
         return normalize_plate_label(plate_no)
 
+    def canonical_plate(self, device_id: str | None, *candidates: str | None) -> str | None:
+        """Prefer a real Colombian plate over provider identifiers or stale labels."""
+        normalized_device_id = normalize_plate_label(device_id)
+        normalized_candidates = [
+            normalized
+            for value in candidates
+            if (normalized := normalize_plate_label(value))
+        ]
+        for candidate in normalized_candidates:
+            if is_colombian_plate_label(candidate):
+                return candidate
+        for candidate in normalized_candidates:
+            if candidate != normalized_device_id and not candidate.isdigit():
+                return candidate
+        return normalized_device_id or (normalized_candidates[0] if normalized_candidates else None)
+
     def plate_alias_applied(self, company: CompanyConfig, plate_no: str | None) -> tuple[str | None, bool]:
         normalized = normalize_plate_label(plate_no)
         if not normalized:
@@ -427,6 +443,16 @@ def normalize_plate_label(value: str | None) -> str | None:
             if candidate[:3].isalpha() and candidate[3:].isdigit():
                 return candidate
     return cleaned
+
+
+def is_colombian_plate_label(value: str | None) -> bool:
+    normalized = normalize_plate_label(value)
+    return bool(
+        normalized
+        and len(normalized) == 6
+        and normalized[:3].isalpha()
+        and normalized[3:].isdigit()
+    )
 
 
 def _normalize_plate_key(value: str | None) -> str | None:

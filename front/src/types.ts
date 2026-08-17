@@ -163,7 +163,7 @@ export interface DmsSnapshot {
   };
   fechas: string[];
   serie_cat: Record<string, number[]>;
-  km_dia: number[];
+  km_dia: Array<number | null>;
   dist_tipo: Array<{ tipo: string; cat: string; n: number }>;
   cat_order: string[];
   heat: Record<string, number[]>;
@@ -208,6 +208,10 @@ export interface DashboardSnapshot {
     kmTotalClosedWindow: number;
     currentDayKmProvisional: number;
     currentDayIsProvisional: boolean;
+    kmCoverageDays: number;
+    kmWindowDays: number;
+    kmCoverageStart: string | null;
+    kmDataComplete: boolean;
     lastDmsEventAt: string | null;
     publishedCutAt?: string | null;
     nextCutAt?: string | null;

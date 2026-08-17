@@ -340,6 +340,29 @@ class DashboardService:
             if self.registry.device_belongs(company, device.device_id, device.fleet_id)
         ]
 
+        canonical_plate_by_device = {
+            device.device_id: self.registry.canonical_plate(device.device_id, device.plate_no)
+            for device in company_devices
+        }
+        for event in company_events:
+            event.plate_no = self.registry.canonical_plate(
+                event.device_id,
+                canonical_plate_by_device.get(event.device_id),
+                event.plate_no,
+            )
+        for snapshot in company_snapshots:
+            snapshot.plate_no = self.registry.canonical_plate(
+                snapshot.device_id,
+                canonical_plate_by_device.get(snapshot.device_id),
+                snapshot.plate_no,
+            )
+        for reading in company_legacy:
+            reading.plate_no = self.registry.canonical_plate(
+                reading.device_id,
+                canonical_plate_by_device.get(reading.device_id),
+                reading.plate_no,
+            )
+
         dates_30 = _date_window(now_local.date(), 30)
         dates_7 = dates_30[-7:]
         dates_30_set = set(dates_30)
@@ -352,6 +375,7 @@ class DashboardService:
         last_dms_event_at = company_events[-1].occurred_at.isoformat() if company_events else None
         current_day_km_provisional = round(fleet_km_by_date.get(latest_day, 0.0), 1)
         km_total_closed_window = round(sum(fleet_km_by_date.get(day_key, 0.0) for day_key in closed_days), 1)
+        km_coverage_dates = [day_key for day_key in dates_30 if day_key in fleet_km_by_date]
 
         event_dates = defaultdict(list)
         events_by_vehicle = defaultdict(list)
@@ -484,6 +508,10 @@ class DashboardService:
                 "kmTotalClosedWindow": km_total_closed_window,
                 "currentDayKmProvisional": current_day_km_provisional,
                 "currentDayIsProvisional": True,
+                "kmCoverageDays": len(km_coverage_dates),
+                "kmWindowDays": len(dates_30),
+                "kmCoverageStart": km_coverage_dates[0].isoformat() if km_coverage_dates else None,
+                "kmDataComplete": len(km_coverage_dates) == len(dates_30),
                 "lastDmsEventAt": last_dms_event_at,
                 "weekWindowStart": dates_7[0].isoformat(),
                 "weekWindowEnd": dates_7[-1].isoformat(),
@@ -529,7 +557,10 @@ class DashboardService:
                 "semana": semana,
                 "fechas": [day_key.isoformat() for day_key in dates_30],
                 "serie_cat": serie_cat,
-                "km_dia": [round(fleet_km_by_date.get(day_key, 0.0), 1) for day_key in dates_30],
+                "km_dia": [
+                    round(fleet_km_by_date[day_key], 1) if day_key in fleet_km_by_date else None
+                    for day_key in dates_30
+                ],
                 "dist_tipo": [
                     {"tipo": subtype, "cat": category, "n": count}
                     for (subtype, category), count in dist_counter.most_common(20)
@@ -4007,31 +4038,9 @@ def _build_daily_km(
                 km = max(rows[-1].total_km - rows[0].total_km, 0.0)
             _merge_daily_km_value(grouped, fleet_by_date, plate, day_key, km)
 
-    alarm_samples: dict[str, dict[date, list[tuple[datetime, float]]]] = defaultdict(lambda: defaultdict(list))
-    for event in alarm_events:
-        if event.total_mileage_km is None:
-            continue
-        normalized_total = _normalize_persisted_alarm_km(event.total_mileage_km)
-        if normalized_total is None:
-            continue
-        plate = event.plate_no or event.device_id
-        day_key = ensure_utc(event.occurred_at).astimezone(tz).date()
-        alarm_samples[plate][day_key].append((event.occurred_at, normalized_total))
-
-    for plate, days in alarm_samples.items():
-        previous_end_total: float | None = None
-        for day_key in sorted(days):
-            samples = sorted(days[day_key], key=lambda item: item[0])
-            values = [value for _, value in samples]
-            if not values:
-                continue
-            day_min = min(values)
-            day_max = max(values)
-            km = max(day_max - day_min, 0.0)
-            if km <= 0 and previous_end_total is not None and day_max >= previous_end_total:
-                km = max(day_max - previous_end_total, 0.0)
-            _merge_daily_km_value(grouped, fleet_by_date, plate, day_key, km)
-            previous_end_total = day_max
+    # Alarm payloads are sparse observations, not an odometer series. Using
+    # their min/max as daily distance creates misleading partial history.
+    # Historical km is published only from status readings or daily snapshots.
     return grouped, fleet_by_date
 
 

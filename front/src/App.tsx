@@ -981,6 +981,8 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
 }
 
 function MonthTab({ snapshot }: { snapshot: DashboardSnapshot }) {
+  const kmCoverageDays = snapshot.meta.kmCoverageDays ?? snapshot.dms.km_dia.filter((value) => value !== null).length;
+  const kmWindowDays = snapshot.meta.kmWindowDays ?? snapshot.dms.fechas.length;
   const categorySeries = {
     labels: snapshot.dms.fechas.map(formatShortDate),
     datasets: snapshot.dms.cat_order.map((category) => ({
@@ -1037,7 +1039,15 @@ function MonthTab({ snapshot }: { snapshot: DashboardSnapshot }) {
       </div>
 
       <div className="metric-grid three">
-        <MetricCard label="Km recorridos (flota)" value={formatNumber(snapshot.dms.kpis.km)} />
+        <MetricCard
+          label="Km recorridos (dias con cobertura)"
+          value={formatNumber(snapshot.dms.kpis.km)}
+          detail={
+            snapshot.meta.kmDataComplete
+              ? "Cobertura completa de 30 dias"
+              : `Cobertura confiable ${kmCoverageDays}/${kmWindowDays} dias`
+          }
+        />
         <MetricCard label="Alarmas / 100 km" value={formatRate(snapshot.dms.kpis.por100km)} />
         <MetricCard label="Alarmas nocturnas" value={`${snapshot.dms.kpis.nocturno_pct}%`} />
       </div>
