@@ -429,6 +429,7 @@ class DashboardService:
             )
             total_30 = sum(counts_30.values())
             km_30 = round(sum(daily_km_by_vehicle.get(plate, {}).get(day_key, 0.0) for day_key in dates_30), 1)
+            km_coverage_complete = all(day_key in daily_km_by_vehicle.get(plate, {}) for day_key in dates_30)
             nocturnal = sum(
                 1
                 for event in plate_events
@@ -445,8 +446,8 @@ class DashboardService:
                     "placa": plate,
                     "total": total_30,
                     "km": km_30,
-                    "por100km": _rate(total_30, km_30),
-                    "riesgo100km": _rate(risk_score, km_30),
+                    "por100km": _rate(total_30, km_30) if km_coverage_complete else None,
+                    "riesgo100km": _rate(risk_score, km_30) if km_coverage_complete else None,
                     "nocturno": nocturnal,
                     "cats": {category: counts_30.get(category, 0) for category in category_order},
                     "baseline": baseline,
@@ -550,7 +551,7 @@ class DashboardService:
                     "alto": severity_totals.get("alto", 0),
                     "medio": severity_totals.get("medio", 0),
                     "km": total_km_30,
-                    "por100km": _rate(total_30, total_km_30),
+                    "por100km": _rate(total_30, total_km_30) if len(km_coverage_dates) == len(dates_30) else None,
                     "nocturno_pct": round((nocturnal_30 / total_30) * 100, 1) if total_30 else 0,
                     "rango": f"{dates_30[0].isoformat()} a {latest_day.isoformat()}",
                 },

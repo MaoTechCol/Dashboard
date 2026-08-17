@@ -1048,7 +1048,11 @@ function MonthTab({ snapshot }: { snapshot: DashboardSnapshot }) {
               : `Cobertura confiable ${kmCoverageDays}/${kmWindowDays} dias`
           }
         />
-        <MetricCard label="Alarmas / 100 km" value={formatRate(snapshot.dms.kpis.por100km)} />
+        <MetricCard
+          label="Alarmas / 100 km"
+          value={formatRate(snapshot.dms.kpis.por100km)}
+          detail={snapshot.meta.kmDataComplete ? undefined : "No calculado: cobertura de km incompleta"}
+        />
         <MetricCard label="Alarmas nocturnas" value={`${snapshot.dms.kpis.nocturno_pct}%`} />
       </div>
 
