@@ -246,6 +246,62 @@ class IngestionAlarmBatchTests(unittest.TestCase):
             self.assertEqual(raw.plate_no, "TTR888")
             self.assertEqual(analytic.plate_no, "TTR888")
 
+    def test_company_assignment_propagates_with_bulk_updates(self) -> None:
+        now = utc_now().replace(microsecond=0)
+        with self.session_factory() as session:
+            session.add_all(
+                [
+                    HowenAlarmRaw(
+                        guid="raw-assignment",
+                        device_id="device-1",
+                        plate_no="867869064064439",
+                        source="harvest",
+                        received_at=now,
+                        payload_json="{}",
+                    ),
+                    AlarmEvent(
+                        guid="alarm-assignment",
+                        device_id="device-1",
+                        plate_no="867869064064439",
+                        category="Ojos cerrados",
+                        occurred_at=now,
+                        source="harvest",
+                    ),
+                    DailyMileageSnapshot(
+                        device_id="device-1",
+                        plate_no="867869064064439",
+                        snapshot_date=now.date(),
+                        total_km=1000.0,
+                        day_km=12.5,
+                        observed_at=now,
+                        source="status",
+                    ),
+                ]
+            )
+            session.commit()
+
+        with self.session_factory() as session:
+            self.service._propagate_company_assignment(
+                session,
+                device_id="device-1",
+                company_slug="test-company",
+                plate_no="TTR888",
+                fleet_id="fleet-1",
+            )
+            session.commit()
+
+        with self.session_factory() as session:
+            rows = [
+                session.get(HowenAlarmRaw, "raw-assignment"),
+                session.get(AlarmEvent, "alarm-assignment"),
+                session.scalar(select(DailyMileageSnapshot)),
+            ]
+            for row in rows:
+                self.assertEqual(row.company_slug, "test-company")
+                self.assertEqual(row.plate_no, "TTR888")
+                self.assertEqual(row.fleet_id, "fleet-1")
+            self.assertEqual(rows[-1].day_km, 12.5)
+
     def test_batch_matches_individual_pipeline_for_raw_and_analytic_rows(self) -> None:
         now = utc_now().replace(microsecond=0)
         alarms = [

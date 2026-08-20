@@ -12,7 +12,7 @@ from time import monotonic
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, delete, func, insert, or_, select, text
+from sqlalchemy import and_, delete, func, insert, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -2137,6 +2137,7 @@ class IngestionService:
                 raw_plate = self.howen.extract_plate_candidate(row)
                 normalized_plate = self.registry.normalize_plate(company, raw_plate) if company else self.registry.normalize_plate_any(raw_plate)
                 record = session.get(DeviceRecord, device_id) or DeviceRecord(device_id=device_id)
+                previous_identity = (record.company_slug, record.fleet_id, record.plate_no)
                 record.plate_no = normalized_plate or record.plate_no
                 record.company_slug = company.slug if company else record.company_slug
                 record.fleet_id = fleet_id or record.fleet_id
@@ -2145,13 +2146,14 @@ class IngestionService:
                 record.record_source = "live"
                 record.last_seen_at = record.last_seen_at or now
                 session.add(record)
-                self._propagate_company_assignment(
-                    session,
-                    device_id=record.device_id,
-                    company_slug=record.company_slug,
-                    plate_no=record.plate_no,
-                    fleet_id=record.fleet_id,
-                )
+                if previous_identity != (record.company_slug, record.fleet_id, record.plate_no):
+                    self._propagate_company_assignment(
+                        session,
+                        device_id=record.device_id,
+                        company_slug=record.company_slug,
+                        plate_no=record.plate_no,
+                        fleet_id=record.fleet_id,
+                    )
             state = session.get(IngestState, "global")
             if state:
                 state.last_device_sync_at = now
@@ -2165,6 +2167,7 @@ class IngestionService:
         anomaly_reasons: list[str] = []
         with self.session_factory() as session:
             record = session.get(DeviceRecord, status.device_id) or DeviceRecord(device_id=status.device_id)
+            previous_identity = (record.company_slug, record.fleet_id, record.plate_no)
             effective_fleet_id = status.fleet_id or record.fleet_id
             company = self.registry.resolve_company(device_id=status.device_id, fleet_id=effective_fleet_id)
             if company is None and record.company_slug:
@@ -2236,13 +2239,14 @@ class IngestionService:
                         source="status",
                     )
                 )
-            self._propagate_company_assignment(
-                session,
-                device_id=status.device_id,
-                company_slug=record.company_slug,
-                plate_no=record.plate_no,
-                fleet_id=record.fleet_id,
-            )
+            if previous_identity != (record.company_slug, record.fleet_id, record.plate_no):
+                self._propagate_company_assignment(
+                    session,
+                    device_id=status.device_id,
+                    company_slug=record.company_slug,
+                    plate_no=record.plate_no,
+                    fleet_id=record.fleet_id,
+                )
 
             snapshot = session.scalar(
                 select(DailyMileageSnapshot).where(
@@ -2888,6 +2892,7 @@ class IngestionService:
             driver_name = alarm.driver_name or (record.driver_name if record else None)
             if not record:
                 record = DeviceRecord(device_id=alarm.device_id)
+            previous_identity = (record.company_slug, record.fleet_id, record.plate_no)
             record.plate_no = plate_no or record.plate_no
             record.company_slug = company_slug or record.company_slug
             record.fleet_id = fleet_id or record.fleet_id
@@ -2898,13 +2903,14 @@ class IngestionService:
                 if record.last_total_km is None or record.last_total_km > alarm.total_mileage_km or alarm.total_mileage_km >= record.last_total_km:
                     record.last_total_km = alarm.total_mileage_km
             session.add(record)
-            self._propagate_company_assignment(
-                session,
-                device_id=alarm.device_id,
-                company_slug=record.company_slug,
-                plate_no=record.plate_no,
-                fleet_id=record.fleet_id,
-            )
+            if previous_identity != (record.company_slug, record.fleet_id, record.plate_no):
+                self._propagate_company_assignment(
+                    session,
+                    device_id=alarm.device_id,
+                    company_slug=record.company_slug,
+                    plate_no=record.plate_no,
+                    fleet_id=record.fleet_id,
+                )
 
             raw_row = None
             if provider_event_key:
@@ -3492,57 +3498,19 @@ class IngestionService:
     ) -> None:
         if not device_id or not company_slug:
             return
-        raw_rows = session.scalars(
-            select(HowenAlarmRaw).where(HowenAlarmRaw.device_id == device_id)
-        ).all()
-        for row in raw_rows:
-            dirty = False
-            if not row.company_slug:
-                row.company_slug = company_slug
-                dirty = True
-            canonical_plate = self.registry.canonical_plate(device_id, plate_no, row.plate_no)
-            if canonical_plate and row.plate_no != canonical_plate:
-                row.plate_no = canonical_plate
-                dirty = True
-            if fleet_id and not row.fleet_id:
-                row.fleet_id = fleet_id
-                dirty = True
-            if dirty:
-                session.add(row)
-        alarm_rows = session.scalars(
-            select(AlarmEvent).where(AlarmEvent.device_id == device_id)
-        ).all()
-        for row in alarm_rows:
-            dirty = False
-            if not row.company_slug:
-                row.company_slug = company_slug
-                dirty = True
-            canonical_plate = self.registry.canonical_plate(device_id, plate_no, row.plate_no)
-            if canonical_plate and row.plate_no != canonical_plate:
-                row.plate_no = canonical_plate
-                dirty = True
-            if fleet_id and not row.fleet_id:
-                row.fleet_id = fleet_id
-                dirty = True
-            if dirty:
-                session.add(row)
-        snapshot_rows = session.scalars(
-            select(DailyMileageSnapshot).where(DailyMileageSnapshot.device_id == device_id)
-        ).all()
-        for row in snapshot_rows:
-            dirty = False
-            if not row.company_slug:
-                row.company_slug = company_slug
-                dirty = True
-            canonical_plate = self.registry.canonical_plate(device_id, plate_no, row.plate_no)
-            if canonical_plate and row.plate_no != canonical_plate:
-                row.plate_no = canonical_plate
-                dirty = True
-            if fleet_id and not row.fleet_id:
-                row.fleet_id = fleet_id
-                dirty = True
-            if dirty:
-                session.add(row)
+        for model in (HowenAlarmRaw, AlarmEvent, DailyMileageSnapshot):
+            values: dict[str, Any] = {
+                "company_slug": func.coalesce(model.company_slug, company_slug),
+            }
+            if plate_no:
+                values["plate_no"] = plate_no
+            if fleet_id:
+                values["fleet_id"] = func.coalesce(model.fleet_id, fleet_id)
+            session.execute(
+                update(model)
+                .where(model.device_id == device_id)
+                .values(**values)
+            )
 
 
 def _max_datetime(left, right):
