@@ -55,7 +55,7 @@ def _enqueue_snapshot_refresh(context: object, company_slug: str) -> dict[str, o
 
 
 @router.get("/health")
-def healthcheck(request: Request) -> dict[str, str]:
+async def healthcheck(request: Request) -> dict[str, str]:
     context = get_context(request)
     return {
         "status": "ok",
@@ -66,7 +66,7 @@ def healthcheck(request: Request) -> dict[str, str]:
 
 
 @router.get("/healthz")
-def healthz(request: Request) -> dict[str, str]:
+async def healthz(request: Request) -> dict[str, str]:
     context = get_context(request)
     return {
         "status": "ok",
@@ -188,7 +188,7 @@ def feed_status(
 
 
 @router.get("/dashboard")
-async def dashboard_snapshot(
+def dashboard_snapshot(
     request: Request,
     company: str | None = Query(default=None),
     refresh: bool = Query(default=False),
@@ -207,7 +207,7 @@ async def dashboard_snapshot(
 
 
 @router.get("/dashboard/{company_slug}")
-async def dashboard_snapshot_by_slug(
+def dashboard_snapshot_by_slug(
     company_slug: str,
     request: Request,
     refresh: bool = Query(default=False),
