@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import get_context, get_current_user, require_admin, resolve_company_slug
@@ -71,6 +71,8 @@ def readyz(request: Request, response: Response) -> dict[str, object]:
 
     try:
         with context.session_factory() as session:
+            if session.bind and session.bind.dialect.name.startswith("postgres"):
+                session.execute(text("SET LOCAL statement_timeout = '1500ms'"))
             session.execute(select(1))
         checks["database"] = True
     except SQLAlchemyError as exc:
@@ -80,11 +82,6 @@ def readyz(request: Request, response: Response) -> dict[str, object]:
         checks["company_registry"] = len(context.registry.all()) > 0
     except Exception as exc:  # pragma: no cover - defensive readiness guard
         diagnostics["registry_error"] = str(exc)
-
-    state = context.dashboard.build_admin_ingestion_status()
-    diagnostics["connection_state"] = state.get("connection_state", "idle")
-    diagnostics["last_error"] = state.get("last_error")
-    diagnostics["last_cycle_received_at"] = state.get("last_cycle_received_at")
 
     ready = all(checks.values())
     response.status_code = status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE

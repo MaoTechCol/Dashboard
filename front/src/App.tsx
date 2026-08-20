@@ -249,6 +249,7 @@ function App() {
   const [session, setSession] = useState<AuthMeResponse | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginForm, setLoginForm] = useState({ username: "admin", password: "Admin123!" });
   const [selectedCompany, setSelectedCompany] = useState<string | null>(null);
@@ -270,43 +271,34 @@ function App() {
 
   const reloadSession = useCallback(
     async (preferredCompany: string | null = null) => {
-      const payload = await apiJson<AuthMeResponse>("/auth/me");
+      const payload = await apiJson<AuthMeResponse>("/auth/me", { timeoutMs: 10_000 });
       applySession(payload, preferredCompany ?? selectedCompany);
     },
     [applySession, selectedCompany],
   );
 
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadSession = async () => {
-      try {
-        const payload = await apiJson<AuthMeResponse>("/auth/me");
-        if (!cancelled) {
-          applySession(payload);
-        }
-      } catch (error) {
-        if (cancelled) return;
-        if (error instanceof ApiError && error.status === 401) {
-          setSession(null);
-          setSelectedCompany(null);
-          setAuthError(null);
-        } else {
-          setAuthError(error instanceof Error ? error.message : "No se pudo validar la sesion");
-        }
-      } finally {
-        if (!cancelled) {
-          setAuthLoading(false);
-        }
+  const bootstrapSession = useCallback(async () => {
+    setAuthLoading(true);
+    setBootstrapError(null);
+    try {
+      const payload = await apiJson<AuthMeResponse>("/auth/me", { timeoutMs: 10_000 });
+      applySession(payload);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        setSession(null);
+        setSelectedCompany(null);
+        setAuthError(null);
+      } else {
+        setBootstrapError(error instanceof Error ? error.message : "No se pudo validar la sesion");
       }
-    };
-
-    void loadSession();
-
-    return () => {
-      cancelled = true;
-    };
+    } finally {
+      setAuthLoading(false);
+    }
   }, [applySession]);
+
+  useEffect(() => {
+    void bootstrapSession();
+  }, [bootstrapSession]);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -394,8 +386,22 @@ function App() {
     return (
       <div className="shell centered">
         <div className="empty-card">
-          <div className="empty-title">Validando sesion local</div>
-          <div className="empty-copy">Conectando el portal del dashboard con la API local.</div>
+          <div className="empty-title">Validando sesion</div>
+          <div className="empty-copy">Conectando el portal con el servicio DMS.</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (bootstrapError && !session) {
+    return (
+      <div className="shell centered">
+        <div className="empty-card connection-error-card">
+          <div className="empty-title">El servicio DMS no esta disponible</div>
+          <div className="empty-copy">{bootstrapError}</div>
+          <button className="primary-btn" type="button" onClick={() => void bootstrapSession()}>
+            Reintentar conexion
+          </button>
         </div>
       </div>
     );

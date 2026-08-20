@@ -3,6 +3,7 @@ const rawBase = import.meta.env.VITE_API_BASE_URL?.trim() || "/api";
 export const API_BASE = rawBase.replace(/\/$/, "");
 export const DASHBOARD_REFRESH_MS = Number(import.meta.env.VITE_DASHBOARD_REFRESH_MS?.trim() || "900000");
 export const FEED_REFRESH_MS = Number(import.meta.env.VITE_FEED_REFRESH_MS?.trim() || "60000");
+export const API_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_API_REQUEST_TIMEOUT_MS?.trim() || "20000");
 
 export class ApiError extends Error {
   status: number;
@@ -28,16 +29,39 @@ export function buildApiUrl(path: string): string {
   throw new Error("Relative VITE_API_BASE_URL requires a browser environment");
 }
 
-export async function apiFetch(path: string, init: RequestInit = {}) {
-  const response = await fetch(buildApiUrl(path), {
-    cache: "no-store",
-    credentials: "include",
-    ...init,
-  });
-  return response;
+type ApiRequestInit = RequestInit & { timeoutMs?: number };
+
+export async function apiFetch(path: string, init: ApiRequestInit = {}) {
+  const { timeoutMs = API_REQUEST_TIMEOUT_MS, signal: callerSignal, ...requestInit } = init;
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(callerSignal?.reason);
+
+  if (callerSignal?.aborted) {
+    abortFromCaller();
+  } else {
+    callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  }
+
+  const timeout = window.setTimeout(() => controller.abort("api-timeout"), timeoutMs);
+  try {
+    return await fetch(buildApiUrl(path), {
+      cache: "no-store",
+      credentials: "include",
+      ...requestInit,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted && !callerSignal?.aborted) {
+      throw new ApiError("El servicio no respondio a tiempo. Intenta nuevamente.", 0);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+    callerSignal?.removeEventListener("abort", abortFromCaller);
+  }
 }
 
-export async function apiJson<T>(path: string, init: RequestInit = {}) {
+export async function apiJson<T>(path: string, init: ApiRequestInit = {}) {
   const response = await apiFetch(path, init);
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));

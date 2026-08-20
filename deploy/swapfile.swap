@@ -1,0 +1,9 @@
+[Unit]
+Description=Emergency swap for DMS Dashboard
+Before=local-fs.target
+
+[Swap]
+What=/swapfile
+
+[Install]
+WantedBy=swap.target
