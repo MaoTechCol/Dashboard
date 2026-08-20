@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -10,7 +11,8 @@ from sqlalchemy.pool import StaticPool
 from app.core.database import Base
 from app.core.time import utc_now
 from app.models import BackgroundJob
-from app.services.job_queue import JobQueue
+from app.services.job_queue import JobQueue, RetryJob
+from app.worker import DashboardWorker
 
 
 def _queue() -> tuple[JobQueue, sessionmaker]:
@@ -126,3 +128,61 @@ def test_summary_distinguishes_healthy_and_stale_workers() -> None:
     assert stale["running"] == 1
     assert stale["healthy_running"] == 0
     assert stale["stale_running"] == 1
+
+
+def test_transient_completed_harvest_is_requeued() -> None:
+    queue, _ = _queue()
+    created = queue.enqueue(
+        job_type="harvest_cut",
+        payload={"company_slug": "demo"},
+        priority=100,
+        idempotency_key="harvest:demo:transient",
+        company_slug="demo",
+    )
+    claimed = queue.claim(worker_id="worker-a")
+    assert claimed is not None
+    queue.complete(
+        job_id=claimed.id,
+        worker_id="worker-a",
+        result={"status": "maintenance", "error_message": "paused"},
+    )
+
+    assert queue.requeue_transient_harvests() == 1
+    recovered = queue.get(created["job_id"])
+    assert recovered is not None
+    assert recovered["status"] == "queued"
+    assert recovered["attempts"] == 0
+    assert recovered["lease_owner"] is None
+
+
+def test_successful_harvest_is_not_requeued() -> None:
+    queue, _ = _queue()
+    created = queue.enqueue(
+        job_type="harvest_cut",
+        payload={},
+        priority=100,
+        idempotency_key="harvest:demo:complete",
+        company_slug="demo",
+    )
+    claimed = queue.claim(worker_id="worker-a")
+    assert claimed is not None
+    queue.complete(
+        job_id=claimed.id,
+        worker_id="worker-a",
+        result={"status": "succeeded"},
+    )
+
+    assert queue.requeue_transient_harvests() == 0
+    completed = queue.get(created["job_id"])
+    assert completed is not None
+    assert completed["status"] == "succeeded"
+
+
+def test_worker_retries_transient_harvest_results() -> None:
+    with pytest.raises(RetryJob):
+        DashboardWorker._require_completed_harvest(
+            {"status": "rate_limited", "error_message": "provider busy"}
+        )
+
+    result = {"status": "succeeded", "dms_total": 4}
+    assert DashboardWorker._require_completed_harvest(result) == result

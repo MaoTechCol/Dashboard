@@ -233,6 +233,51 @@ class JobQueue:
             "active": [self.serialize(row) for row in running[:10]],
         }
 
+    def requeue_transient_harvests(self) -> int:
+        """Repair harvest jobs incorrectly completed on a transient engine state."""
+        transient_statuses = {
+            "bootstrap_running",
+            "failed",
+            "maintenance",
+            "partial",
+            "queued",
+            "rate_limited",
+            "running",
+        }
+        now = utc_now()
+        recovered = 0
+        with self.session_factory() as session:
+            rows = list(
+                session.scalars(
+                    select(BackgroundJob).where(
+                        BackgroundJob.job_type == "harvest_cut",
+                        BackgroundJob.status == "succeeded",
+                        BackgroundJob.result_json.is_not(None),
+                    )
+                )
+            )
+            for job in rows:
+                try:
+                    result = json.loads(job.result_json or "{}")
+                except json.JSONDecodeError:
+                    continue
+                result_status = str(result.get("status") or "").strip().lower() if isinstance(result, dict) else ""
+                if result_status not in transient_statuses:
+                    continue
+                job.status = "queued"
+                job.attempts = 0
+                job.next_attempt_at = now
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.heartbeat_at = None
+                job.started_at = None
+                job.finished_at = None
+                job.last_error = f"Recovered transient harvest result: {result_status}"
+                session.add(job)
+                recovered += 1
+            session.commit()
+        return recovered
+
     @staticmethod
     def payload(job: BackgroundJob) -> dict[str, Any]:
         try:

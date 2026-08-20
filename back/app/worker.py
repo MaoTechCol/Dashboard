@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from app.bootstrap import AppContext, build_context
 from app.core.time import ensure_utc
-from app.models import CompanyHistoricalRebuildJob
+from app.models import CompanyHistoricalRebuildJob, IngestState
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, KmRepairRequest
 from app.services.job_queue import (
     PRIORITY_HARVEST_CUT,
@@ -36,6 +36,10 @@ class DashboardWorker:
 
     async def run(self) -> None:
         logger.info("worker_start worker_id=%s", self.worker_id)
+        await asyncio.to_thread(self._recover_stale_maintenance)
+        recovered_harvests = await asyncio.to_thread(self.queue.requeue_transient_harvests)
+        if recovered_harvests:
+            logger.warning("worker_transient_harvests_requeued count=%s", recovered_harvests)
         await self.context.ingestion.start(
             include_harvest_scheduler=False,
             resume_historical_rebuilds=False,
@@ -72,6 +76,22 @@ class DashboardWorker:
     def stop(self) -> None:
         self._stop.set()
 
+    def _recover_stale_maintenance(self) -> None:
+        summary = self.queue.summary()
+        if int(summary.get("healthy_running") or 0) > 0:
+            return
+        with self.context.session_factory() as session:
+            state = session.get(IngestState, "global")
+            if not state or not state.maintenance_mode:
+                return
+            stale_reason = state.maintenance_reason
+            state.maintenance_mode = False
+            state.maintenance_reason = None
+            state.maintenance_started_at = None
+            session.add(state)
+            session.commit()
+        logger.warning("worker_stale_maintenance_cleared reason=%s", stale_reason)
+
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -90,9 +110,10 @@ class DashboardWorker:
 
     async def _enqueue_due_harvests(self) -> None:
         due_cuts = await asyncio.to_thread(self.context.ingestion.due_harvest_cuts)
+        queued_count = 0
         for company_slug, cut_at in due_cuts:
             cut_iso = cut_at.isoformat()
-            await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.queue.enqueue,
                 job_type="harvest_cut",
                 payload={"company_slug": company_slug, "cut_at": cut_iso, "force": False},
@@ -100,8 +121,10 @@ class DashboardWorker:
                 idempotency_key=f"harvest:{company_slug}:{cut_iso}",
                 company_slug=company_slug,
             )
-        if due_cuts:
-            logger.info("worker_harvests_enqueued count=%s", len(due_cuts))
+            if result.get("status") == "queued":
+                queued_count += 1
+        if queued_count:
+            logger.info("worker_harvests_enqueued count=%s due=%s", queued_count, len(due_cuts))
 
     def _enqueue_orphaned_rebuilds(self) -> None:
         """Move rebuilds left by the pre-worker process into the durable queue."""
@@ -228,18 +251,20 @@ class DashboardWorker:
         self.context.registry.reload()
         if job_type == "harvest_cut":
             cut_at = _parse_datetime(payload.get("cut_at"))
-            return await self.context.ingestion.run_harvest_cut(
+            result = await self.context.ingestion.run_harvest_cut(
                 company_slug=str(payload["company_slug"]),
                 cut_at=cut_at,
                 force=bool(payload.get("force", False)),
             )
+            return self._require_completed_harvest(result)
         if job_type == "refresh_snapshot":
             company_slug = str(payload["company_slug"])
-            return await self.context.ingestion.run_harvest_cut(
+            result = await self.context.ingestion.run_harvest_cut(
                 company_slug=company_slug,
                 cut_at=_parse_datetime(payload.get("cut_at")),
                 force=True,
             )
+            return self._require_completed_harvest(result)
         if job_type == "historical_rebuild":
             request = HistoricalRebuildRequest.model_validate(payload["request"])
             result = await self.context.ingestion.rebuild_historical_window(
@@ -282,6 +307,22 @@ class DashboardWorker:
             self.context.ingestion.mark_dirty()
             return result
         raise ValueError(f"Unsupported background job type: {job_type}")
+
+    @staticmethod
+    def _require_completed_harvest(result: dict[str, Any]) -> dict[str, Any]:
+        result_status = str(result.get("status") or "").strip().lower()
+        if result_status in {
+            "bootstrap_running",
+            "failed",
+            "maintenance",
+            "partial",
+            "queued",
+            "rate_limited",
+            "running",
+        }:
+            message = str(result.get("error_message") or f"Harvest ended in {result_status}")
+            raise RetryJob(message)
+        return result
 
 
 def _parse_datetime(value: Any) -> datetime:
