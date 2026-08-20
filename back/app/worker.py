@@ -13,11 +13,11 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from app.bootstrap import AppContext, build_context
+from app.core.systemd import notify_systemd, watchdog_loop
 from app.core.time import ensure_utc
 from app.models import CompanyHistoricalRebuildJob, IngestState
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, KmRepairRequest
 from app.services.job_queue import (
-    PRIORITY_HARVEST_CUT,
     PRIORITY_HISTORICAL_REBUILD,
     JobQueue,
     RetryJob,
@@ -40,11 +40,16 @@ class DashboardWorker:
         recovered_harvests = await asyncio.to_thread(self.queue.requeue_transient_harvests)
         if recovered_harvests:
             logger.warning("worker_transient_harvests_requeued count=%s", recovered_harvests)
+        compacted = await asyncio.to_thread(self.queue.compact_redundant_jobs)
+        if any(compacted.values()):
+            logger.warning("worker_redundant_jobs_compacted counts=%s", compacted)
         await self.context.ingestion.start(
             include_harvest_scheduler=False,
             resume_historical_rebuilds=False,
         )
         await asyncio.to_thread(self._enqueue_orphaned_rebuilds)
+        watchdog_task = asyncio.create_task(watchdog_loop(self._stop), name="worker-systemd-watchdog")
+        notify_systemd("READY=1\nSTATUS=Worker disponible")
         scheduler_task = asyncio.create_task(self._scheduler_loop(), name="worker-scheduler")
         consumer_task = asyncio.create_task(self._consumer_loop(), name="worker-consumer")
         stop_task = asyncio.create_task(self._stop.wait(), name="worker-stop")
@@ -66,10 +71,12 @@ class DashboardWorker:
                     raise exception
                 raise RuntimeError(f"Critical worker task stopped unexpectedly: {task.get_name()}")
         finally:
+            notify_systemd("STOPPING=1")
             for task in critical_tasks:
                 task.cancel()
+            watchdog_task.cancel()
             stop_task.cancel()
-            await asyncio.gather(*critical_tasks, stop_task, return_exceptions=True)
+            await asyncio.gather(*critical_tasks, watchdog_task, stop_task, return_exceptions=True)
             await self.context.ingestion.stop()
             logger.info("worker_stop worker_id=%s", self.worker_id)
 
@@ -114,14 +121,12 @@ class DashboardWorker:
         for company_slug, cut_at in due_cuts:
             cut_iso = cut_at.isoformat()
             result = await asyncio.to_thread(
-                self.queue.enqueue,
-                job_type="harvest_cut",
-                payload={"company_slug": company_slug, "cut_at": cut_iso, "force": False},
-                priority=PRIORITY_HARVEST_CUT,
-                idempotency_key=f"harvest:{company_slug}:{cut_iso}",
+                self.queue.enqueue_latest_harvest,
                 company_slug=company_slug,
+                cut_at=cut_at,
+                payload={"company_slug": company_slug, "cut_at": cut_iso, "force": False},
             )
-            if result.get("status") == "queued":
+            if result.get("created"):
                 queued_count += 1
         if queued_count:
             logger.info("worker_harvests_enqueued count=%s due=%s", queued_count, len(due_cuts))
@@ -321,7 +326,7 @@ class DashboardWorker:
             "running",
         }:
             message = str(result.get("error_message") or f"Harvest ended in {result_status}")
-            raise RetryJob(message)
+            raise RetryJob(message, _parse_optional_datetime(result.get("next_retry_at")))
         return result
 
 

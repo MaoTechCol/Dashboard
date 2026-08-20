@@ -186,3 +186,110 @@ def test_worker_retries_transient_harvest_results() -> None:
 
     result = {"status": "succeeded", "dms_total": 4}
     assert DashboardWorker._require_completed_harvest(result) == result
+
+
+def test_latest_harvest_supersedes_older_queued_cut() -> None:
+    queue, _ = _queue()
+    first_cut = utc_now().replace(second=0, microsecond=0)
+    first = queue.enqueue_latest_harvest(
+        company_slug="demo",
+        cut_at=first_cut,
+        payload={"company_slug": "demo", "cut_at": first_cut.isoformat()},
+    )
+    latest_cut = first_cut + timedelta(minutes=45)
+    latest = queue.enqueue_latest_harvest(
+        company_slug="demo",
+        cut_at=latest_cut,
+        payload={"company_slug": "demo", "cut_at": latest_cut.isoformat()},
+    )
+
+    assert first["created"] is True
+    assert latest["created"] is True
+    superseded = queue.get(first["job_id"])
+    assert superseded is not None
+    assert superseded["status"] == "succeeded"
+    assert superseded["result"] == {
+        "status": "superseded",
+        "superseded_by": latest["job_id"],
+    }
+    assert queue.summary()["queued"] == 1
+
+
+def test_latest_harvest_reuses_covering_job() -> None:
+    queue, _ = _queue()
+    latest_cut = utc_now().replace(second=0, microsecond=0)
+    latest = queue.enqueue_latest_harvest(
+        company_slug="demo",
+        cut_at=latest_cut,
+        payload={"company_slug": "demo", "cut_at": latest_cut.isoformat()},
+    )
+    older = queue.enqueue_latest_harvest(
+        company_slug="demo",
+        cut_at=latest_cut - timedelta(minutes=15),
+        payload={"company_slug": "demo", "cut_at": latest_cut.isoformat()},
+    )
+
+    assert older["job_id"] == latest["job_id"]
+    assert older["created"] is False
+    assert queue.summary()["queued"] == 1
+
+
+def test_manual_refresh_reuses_covering_harvest() -> None:
+    queue, _ = _queue()
+    cut_at = utc_now().replace(second=0, microsecond=0)
+    harvest = queue.enqueue_latest_harvest(
+        company_slug="demo",
+        cut_at=cut_at,
+        payload={"company_slug": "demo", "cut_at": cut_at.isoformat()},
+    )
+    refresh = queue.enqueue_latest_refresh(
+        company_slug="demo",
+        cut_at=cut_at,
+        payload={"company_slug": "demo", "cut_at": cut_at.isoformat()},
+    )
+
+    assert refresh["job_id"] == harvest["job_id"]
+    assert refresh["created"] is False
+    assert refresh["reused_for_refresh"] is True
+
+
+def test_worker_uses_provider_retry_timestamp() -> None:
+    retry_at = utc_now() + timedelta(minutes=2)
+    with pytest.raises(RetryJob) as exc_info:
+        DashboardWorker._require_completed_harvest(
+            {
+                "status": "rate_limited",
+                "error_message": "provider busy",
+                "next_retry_at": retry_at.isoformat(),
+            }
+        )
+
+    assert exc_info.value.retry_at == retry_at
+
+
+def test_failed_harvest_can_be_requeued_for_the_same_cut() -> None:
+    queue, session_factory = _queue()
+    cut_at = utc_now().replace(second=0, microsecond=0)
+    created = queue.enqueue_latest_harvest(
+        company_slug="demo",
+        cut_at=cut_at,
+        payload={"company_slug": "demo", "cut_at": cut_at.isoformat()},
+    )
+    with session_factory() as session:
+        failed = session.get(BackgroundJob, created["job_id"])
+        assert failed is not None
+        failed.status = "failed"
+        failed.attempts = failed.max_attempts
+        failed.last_error = "provider unavailable"
+        session.add(failed)
+        session.commit()
+
+    recovered = queue.enqueue_latest_harvest(
+        company_slug="demo",
+        cut_at=cut_at,
+        payload={"company_slug": "demo", "cut_at": cut_at.isoformat()},
+    )
+    assert recovered["job_id"] == created["job_id"]
+    assert recovered["status"] == "queued"
+    assert recovered["attempts"] == 0
+    assert recovered["requeued"] is True

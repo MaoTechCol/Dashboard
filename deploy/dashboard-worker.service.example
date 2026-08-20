@@ -2,9 +2,13 @@
 Description=DMS Dashboard background worker
 Wants=network-online.target
 After=network-online.target dashboard-api.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
+WatchdogSec=90s
 User=root
 WorkingDirectory=/opt/dashboard/back
 EnvironmentFile=/opt/dashboard/back/.env
@@ -12,6 +16,7 @@ Environment=PROCESS_ROLE=worker
 ExecStart=/opt/dashboard/back/.venv/bin/python -m app.worker
 Restart=always
 RestartSec=5
+OOMPolicy=stop
 TimeoutStopSec=60
 MemoryHigh=700M
 MemoryMax=1100M

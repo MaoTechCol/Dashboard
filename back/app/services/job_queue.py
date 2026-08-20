@@ -50,7 +50,9 @@ class JobQueue:
                 select(BackgroundJob).where(BackgroundJob.idempotency_key == idempotency_key)
             )
             if existing:
-                return self.serialize(existing)
+                result = self.serialize(existing)
+                result["created"] = False
+                return result
 
             job = BackgroundJob(
                 id=uuid4().hex,
@@ -72,10 +74,241 @@ class JobQueue:
                     select(BackgroundJob).where(BackgroundJob.idempotency_key == idempotency_key)
                 )
                 if existing:
-                    return self.serialize(existing)
+                    result = self.serialize(existing)
+                    result["created"] = False
+                    return result
                 raise
             session.refresh(job)
-            return self.serialize(job)
+            result = self.serialize(job)
+            result["created"] = True
+            return result
+
+    def enqueue_latest_harvest(
+        self,
+        *,
+        company_slug: str,
+        cut_at: datetime,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep at most one queued harvest per company, always for the newest cut."""
+        requested_cut = ensure_utc(cut_at) or utc_now()
+        now = utc_now()
+        with self.session_factory() as session:
+            idempotency_key = f"harvest:{company_slug}:{requested_cut.isoformat()}"
+            exact = session.scalar(
+                select(BackgroundJob).where(BackgroundJob.idempotency_key == idempotency_key)
+            )
+            if exact and exact.status == "failed":
+                self._requeue_failed_job(exact, payload=payload, now=now)
+                session.add(exact)
+                session.commit()
+                session.refresh(exact)
+                result = self.serialize(exact)
+                result["created"] = True
+                result["requeued"] = True
+                return result
+            active = list(
+                session.scalars(
+                    select(BackgroundJob).where(
+                        BackgroundJob.company_slug == company_slug,
+                        BackgroundJob.job_type == "harvest_cut",
+                        BackgroundJob.status.in_(("queued", "running")),
+                    )
+                )
+            )
+            candidates = [
+                (row, self._payload_cut(row))
+                for row in active
+            ]
+            covering = [
+                (row, row_cut)
+                for row, row_cut in candidates
+                if row_cut is not None and row_cut >= requested_cut
+            ]
+            if covering:
+                selected, _ = max(covering, key=lambda item: item[1])
+                self._supersede_queued(
+                    session,
+                    [row for row, _ in candidates if row.status == "queued" and row.id != selected.id],
+                    superseded_by=selected.id,
+                    now=now,
+                )
+                session.commit()
+                result = self.serialize(selected)
+                result["created"] = False
+                return result
+
+            queued = [row for row, _ in candidates if row.status == "queued"]
+            job = BackgroundJob(
+                id=uuid4().hex,
+                job_type="harvest_cut",
+                company_slug=company_slug,
+                priority=PRIORITY_HARVEST_CUT,
+                status="queued",
+                payload_json=json.dumps(payload, ensure_ascii=True, default=str),
+                idempotency_key=idempotency_key,
+                max_attempts=int(self.settings.worker_max_attempts),
+                next_attempt_at=now,
+            )
+            self._supersede_queued(
+                session,
+                queued,
+                superseded_by=job.id,
+                now=now,
+            )
+            session.add(job)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                existing = session.scalar(
+                    select(BackgroundJob).where(
+                        BackgroundJob.idempotency_key == job.idempotency_key
+                    )
+                )
+                if not existing:
+                    raise
+                result = self.serialize(existing)
+                result["created"] = False
+                return result
+            session.refresh(job)
+            result = self.serialize(job)
+            result["created"] = True
+            return result
+
+    def enqueue_latest_refresh(
+        self,
+        *,
+        company_slug: str,
+        cut_at: datetime,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Reuse a covering harvest and collapse repeated manual refresh clicks."""
+        requested_cut = ensure_utc(cut_at) or utc_now()
+        now = utc_now()
+        with self.session_factory() as session:
+            idempotency_key = f"refresh:{company_slug}:{requested_cut.isoformat()}"
+            exact = session.scalar(
+                select(BackgroundJob).where(BackgroundJob.idempotency_key == idempotency_key)
+            )
+            if exact and exact.status == "failed":
+                self._requeue_failed_job(exact, payload=payload, now=now)
+                session.add(exact)
+                session.commit()
+                session.refresh(exact)
+                result = self.serialize(exact)
+                result["created"] = True
+                result["requeued"] = True
+                return result
+            harvests = list(
+                session.scalars(
+                    select(BackgroundJob).where(
+                        BackgroundJob.company_slug == company_slug,
+                        BackgroundJob.job_type == "harvest_cut",
+                        BackgroundJob.status.in_(("queued", "running")),
+                    )
+                )
+            )
+            harvest_candidates = [(row, self._payload_cut(row)) for row in harvests]
+            covering_harvests = [
+                (row, row_cut)
+                for row, row_cut in harvest_candidates
+                if row_cut is not None and row_cut >= requested_cut
+            ]
+            if covering_harvests:
+                selected, _ = max(covering_harvests, key=lambda item: item[1])
+                result = self.serialize(selected)
+                result["created"] = False
+                result["reused_for_refresh"] = True
+                return result
+
+            refreshes = list(
+                session.scalars(
+                    select(BackgroundJob).where(
+                        BackgroundJob.company_slug == company_slug,
+                        BackgroundJob.job_type == "refresh_snapshot",
+                        BackgroundJob.status.in_(("queued", "running")),
+                    )
+                )
+            )
+            refresh_candidates = [(row, self._payload_cut(row)) for row in refreshes]
+            covering_refreshes = [
+                (row, row_cut)
+                for row, row_cut in refresh_candidates
+                if row_cut is not None and row_cut >= requested_cut
+            ]
+            if covering_refreshes:
+                selected, _ = max(covering_refreshes, key=lambda item: item[1])
+                result = self.serialize(selected)
+                result["created"] = False
+                return result
+
+            queued = [row for row in refreshes if row.status == "queued"]
+            job = BackgroundJob(
+                id=uuid4().hex,
+                job_type="refresh_snapshot",
+                company_slug=company_slug,
+                priority=PRIORITY_REFRESH,
+                status="queued",
+                payload_json=json.dumps(payload, ensure_ascii=True, default=str),
+                idempotency_key=idempotency_key,
+                max_attempts=int(self.settings.worker_max_attempts),
+                next_attempt_at=now,
+            )
+            self._supersede_queued(session, queued, superseded_by=job.id, now=now)
+            session.add(job)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                existing = session.scalar(
+                    select(BackgroundJob).where(
+                        BackgroundJob.idempotency_key == job.idempotency_key
+                    )
+                )
+                if not existing:
+                    raise
+                result = self.serialize(existing)
+                result["created"] = False
+                return result
+            session.refresh(job)
+            result = self.serialize(job)
+            result["created"] = True
+            return result
+
+    def compact_redundant_jobs(self) -> dict[str, int]:
+        """Remove stale queued cuts and refreshes left by an older scheduler."""
+        now = utc_now()
+        compacted = {"harvest_cut": 0, "refresh_snapshot": 0}
+        with self.session_factory() as session:
+            queued = list(
+                session.scalars(
+                    select(BackgroundJob).where(
+                        BackgroundJob.status == "queued",
+                        BackgroundJob.job_type.in_(("harvest_cut", "refresh_snapshot")),
+                    )
+                )
+            )
+            groups: dict[tuple[str, str], list[BackgroundJob]] = {}
+            for row in queued:
+                groups.setdefault((row.company_slug or "", row.job_type), []).append(row)
+            for (_, job_type), rows in groups.items():
+                if len(rows) <= 1:
+                    continue
+                keep = max(
+                    rows,
+                    key=lambda row: (self._payload_cut(row) or ensure_utc(row.created_at) or now),
+                )
+                redundant = [row for row in rows if row.id != keep.id]
+                self._supersede_queued(
+                    session,
+                    redundant,
+                    superseded_by=keep.id,
+                    now=now,
+                )
+                compacted[job_type] += len(redundant)
+            session.commit()
+        return compacted
 
     def claim(self, *, worker_id: str) -> BackgroundJob | None:
         now = utc_now()
@@ -110,6 +343,7 @@ class JobQueue:
             job.started_at = job.started_at or now
             job.finished_at = None
             job.last_error = None
+            job.result_json = None
             job.attempts = int(job.attempts or 0) + 1
             session.add(job)
             session.commit()
@@ -277,6 +511,60 @@ class JobQueue:
                 recovered += 1
             session.commit()
         return recovered
+
+    @classmethod
+    def _payload_cut(cls, job: BackgroundJob) -> datetime | None:
+        value = cls.payload(job).get("cut_at")
+        if isinstance(value, datetime):
+            return ensure_utc(value)
+        if not value:
+            return None
+        try:
+            return ensure_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _supersede_queued(
+        session: Any,
+        rows: list[BackgroundJob],
+        *,
+        superseded_by: str,
+        now: datetime,
+    ) -> None:
+        for row in rows:
+            if row.status != "queued":
+                continue
+            row.status = "succeeded"
+            row.result_json = json.dumps(
+                {"status": "superseded", "superseded_by": superseded_by},
+                ensure_ascii=True,
+            )
+            row.last_error = None
+            row.finished_at = now
+            row.heartbeat_at = now
+            row.lease_owner = None
+            row.lease_expires_at = None
+            session.add(row)
+
+    @staticmethod
+    def _requeue_failed_job(
+        job: BackgroundJob,
+        *,
+        payload: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        job.status = "queued"
+        job.payload_json = json.dumps(payload, ensure_ascii=True, default=str)
+        job.attempts = 0
+        job.next_attempt_at = now
+        job.started_at = None
+        job.finished_at = None
+        job.heartbeat_at = None
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.last_error = None
+        job.result_json = None
 
     @staticmethod
     def payload(job: BackgroundJob) -> dict[str, Any]:

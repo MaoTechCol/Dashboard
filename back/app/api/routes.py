@@ -37,7 +37,6 @@ from app.services.job_queue import (
     PRIORITY_HARVEST_CUT,
     PRIORITY_HISTORICAL_REBUILD,
     PRIORITY_RECONCILIATION,
-    PRIORITY_REFRESH,
 )
 
 router = APIRouter()
@@ -45,12 +44,10 @@ router = APIRouter()
 
 def _enqueue_snapshot_refresh(context: object, company_slug: str) -> dict[str, object]:
     cut_at = context.ingestion.latest_due_cut()
-    return context.jobs.enqueue(
-        job_type="refresh_snapshot",
-        payload={"company_slug": company_slug, "cut_at": cut_at.isoformat()},
-        priority=PRIORITY_REFRESH,
-        idempotency_key=f"refresh:{company_slug}:{cut_at.isoformat()}",
+    return context.jobs.enqueue_latest_refresh(
         company_slug=company_slug,
+        cut_at=cut_at,
+        payload={"company_slug": company_slug, "cut_at": cut_at.isoformat()},
     )
 
 
@@ -370,7 +367,7 @@ def admin_companies(request: Request) -> dict[str, object]:
     return payload.model_dump(mode="json")
 
 
-@router.post("/admin/companies")
+@router.post("/admin/companies", status_code=status.HTTP_202_ACCEPTED)
 async def admin_activate_company(request: Request, payload: CompanyActivationRequest) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
@@ -414,7 +411,7 @@ async def admin_activate_company(request: Request, payload: CompanyActivationReq
     return admin_companies(request)
 
 
-@router.post("/admin/companies/{company_slug}/deactivate")
+@router.post("/admin/companies/{company_slug}/deactivate", status_code=status.HTTP_202_ACCEPTED)
 async def admin_deactivate_company(company_slug: str, request: Request) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
@@ -512,7 +509,7 @@ def admin_company_assignment(request: Request, payload: CompanyAssignmentRequest
     return context.dashboard.build_admin_live_setup(payload.company_slug)
 
 
-@router.post("/admin/purge-mock")
+@router.post("/admin/purge-mock", status_code=status.HTTP_202_ACCEPTED)
 def admin_purge_mock(request: Request) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
@@ -524,7 +521,7 @@ def admin_purge_mock(request: Request) -> dict[str, object]:
     )
 
 
-@router.post("/admin/replay-status-anomalies")
+@router.post("/admin/replay-status-anomalies", status_code=status.HTTP_202_ACCEPTED)
 async def admin_replay_status_anomalies(request: Request) -> dict[str, int]:
     require_admin(request)
     context = get_context(request)
@@ -553,7 +550,7 @@ def admin_audit(
     return context.dashboard.build_admin_audit(company_slug, start_at=start_at, end_at=end_at)
 
 
-@router.post("/admin/reconciliation/run")
+@router.post("/admin/reconciliation/run", status_code=status.HTTP_202_ACCEPTED)
 async def admin_reconciliation_run(request: Request, payload: ReconciliationRunRequest) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
@@ -788,7 +785,7 @@ def admin_km_quality(
     return context.dashboard.build_km_quality(company_slug)
 
 
-@router.post("/admin/km/repair")
+@router.post("/admin/km/repair", status_code=status.HTTP_202_ACCEPTED)
 def admin_km_repair(request: Request, payload: KmRepairRequest) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
@@ -846,7 +843,7 @@ def admin_raw_alarms(
     )
 
 
-@router.post("/admin/backfill")
+@router.post("/admin/backfill", status_code=status.HTTP_202_ACCEPTED)
 async def admin_backfill(request: Request, payload: BackfillRequest) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
@@ -870,7 +867,7 @@ async def admin_backfill(request: Request, payload: BackfillRequest) -> dict[str
     )
 
 
-@router.post("/admin/harvest/rerun-cut")
+@router.post("/admin/harvest/rerun-cut", status_code=status.HTTP_202_ACCEPTED)
 async def admin_rerun_harvest_cut(request: Request, payload: HarvestRerunRequest) -> dict[str, object]:
     user = require_admin(request)
     context = get_context(request)
@@ -884,7 +881,7 @@ async def admin_rerun_harvest_cut(request: Request, payload: HarvestRerunRequest
     )
 
 
-@router.post("/admin/harvest/rebuild-history")
+@router.post("/admin/harvest/rebuild-history", status_code=status.HTTP_202_ACCEPTED)
 async def admin_rebuild_historical_window(request: Request, payload: HistoricalRebuildRequest) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)

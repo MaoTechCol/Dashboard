@@ -18,9 +18,13 @@ out while a historical rebuild shared the API process.
 - Upload and runtime storage: `data/storage.tar.gz`
 - Baseline counts: `data/baseline-counts.json`
 - File integrity: `SHA256SUMS`
+- Portable off-host integrity file: `SHA256SUMS.portable`
 
 The backup includes the backend environment and must remain private. Never commit
 the backup directory or its contents.
+
+Integrity was verified both on the Droplet and against the off-host copy. PostgreSQL
+17 successfully parsed the complete custom archive (577 restore catalog entries).
 
 ## Baseline counts
 
@@ -57,3 +61,16 @@ Historical rebuilds, 15-minute cuts, Howen, km maintenance, purges and snapshot
 publication run in `dashboard-worker.service`. FastAPI only authenticates, reads
 published state and enqueues durable jobs. The temporary Nginx rebuild guard can
 be removed after both services and the queue heartbeat pass the smoke test.
+
+## Tandas 1-2 operational safeguards
+
+- The scheduler keeps only the newest pending cut per company. Its query window
+  starts at the last published cut with overlap, so missed quarters are recovered
+  without creating one provider job per quarter.
+- A retry preserves devices that already completed successfully and resumes only
+  pending devices.
+- Howen rate limits release the worker immediately and persist `next_attempt_at`;
+  the worker no longer sleeps through exponential cooldowns while holding the job.
+- Manual refresh reuses a covering harvest and repeated refreshes are coalesced.
+- API and worker notify systemd readiness and heartbeat watchdogs. Memory limits,
+  restart limits and `OOMPolicy` are part of the versioned service units.

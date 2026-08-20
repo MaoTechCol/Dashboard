@@ -2,9 +2,13 @@
 Description=DMS Dashboard FastAPI
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
+WatchdogSec=45s
 User=root
 WorkingDirectory=/opt/dashboard/back
 EnvironmentFile=/opt/dashboard/back/.env
@@ -12,6 +16,7 @@ Environment=PROCESS_ROLE=api
 ExecStart=/opt/dashboard/back/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
+OOMPolicy=stop
 TimeoutStopSec=30
 MemoryHigh=350M
 MemoryMax=550M

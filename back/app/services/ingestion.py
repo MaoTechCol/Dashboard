@@ -188,8 +188,6 @@ class IngestionService:
     def due_harvest_cuts(self) -> list[tuple[str, datetime]]:
         self.registry.reload()
         latest_due_cut = self._latest_due_cut()
-        interval = self._harvest_interval()
-        max_cuts = max(int(self.settings.harvest_max_cuts_per_cycle), 1)
         pending: list[tuple[str, datetime]] = []
         for company in self.registry.all():
             if not self.registry.is_operational(company) or self._activation_bootstrap_running(company.slug):
@@ -200,12 +198,10 @@ class IngestionService:
             if last_cut is None:
                 pending.append((company.slug, latest_due_cut))
                 continue
-            next_cut = last_cut + interval
-            company_count = 0
-            while next_cut <= latest_due_cut and company_count < max_cuts:
-                pending.append((company.slug, next_cut))
-                next_cut += interval
-                company_count += 1
+            if last_cut < latest_due_cut:
+                # The newest cut absorbs any gap. Queueing every missed quarter only
+                # multiplies provider calls and delays recovery after an outage.
+                pending.append((company.slug, latest_due_cut))
         return pending
 
     async def run_harvest_cut(self, *, company_slug: str, cut_at: datetime, force: bool = False) -> dict[str, Any]:
@@ -539,10 +535,26 @@ class IngestionService:
         aligned_seconds = int(lagged.timestamp()) // interval_seconds * interval_seconds
         return datetime.fromtimestamp(aligned_seconds, tz=ZoneInfo("UTC"))
 
-    def _harvest_window_for_cut(self, cut_at: datetime) -> tuple[datetime, datetime]:
+    def _harvest_window_for_cut(
+        self,
+        cut_at: datetime,
+        *,
+        company_slug: str | None = None,
+    ) -> tuple[datetime, datetime]:
         cut_at = ensure_utc(cut_at) or utc_now()
         previous_cut = cut_at - self._harvest_interval()
-        window_start = previous_cut - timedelta(minutes=max(int(self.settings.harvest_overlap_minutes), 0))
+        overlap = timedelta(minutes=max(int(self.settings.harvest_overlap_minutes), 0))
+        window_start = previous_cut - overlap
+        if company_slug:
+            with self.session_factory() as session:
+                publication = session.get(PublishedDashboardSnapshot, company_slug)
+                published_cut = (
+                    ensure_utc(publication.published_cut_at)
+                    if publication and publication.published_cut_at
+                    else None
+                )
+            if published_cut is not None and published_cut < previous_cut:
+                window_start = min(window_start, published_cut - overlap)
         return window_start, cut_at
 
     async def _yield_to_ready_harvests(self) -> None:
@@ -1119,8 +1131,6 @@ class IngestionService:
             return
         self._cleanup_orphan_harvest_runs(include_current_cut=False)
         latest_due_cut = self._latest_due_cut()
-        interval = self._harvest_interval()
-        max_cuts = max(int(self.settings.harvest_max_cuts_per_cycle), 1)
 
         for company in self.registry.all():
             if not self.registry.is_operational(company):
@@ -1136,11 +1146,8 @@ class IngestionService:
                 last_cut = ensure_utc(publication.published_cut_at) if publication and publication.published_cut_at else None
             if last_cut is None:
                 pending_cuts.append(latest_due_cut)
-            else:
-                next_cut = last_cut + interval
-                while next_cut <= latest_due_cut and len(pending_cuts) < max_cuts:
-                    pending_cuts.append(next_cut)
-                    next_cut += interval
+            elif last_cut < latest_due_cut:
+                pending_cuts.append(latest_due_cut)
             for cut_at in pending_cuts:
                 await self._run_harvest_for_cut(company_slug=company.slug, cut_at=cut_at, force=False)
 
@@ -1169,7 +1176,10 @@ class IngestionService:
             }
 
         cut_at = ensure_utc(cut_at) or utc_now()
-        window_start, window_end = self._harvest_window_for_cut(cut_at)
+        window_start, window_end = self._harvest_window_for_cut(
+            cut_at,
+            company_slug=company.slug,
+        )
         device_ids = self._list_company_device_ids(company_slug)
         lock = self._harvest_locks.setdefault(company.slug, asyncio.Lock())
         async with lock:
@@ -1208,14 +1218,12 @@ class IngestionService:
                     )
                     session.add(run)
                     session.flush()
+                first_attempt = run.started_at is None
                 run.window_start = window_start
                 run.window_end = window_end
                 run.status = "running"
                 run.devices_total = len(device_ids)
-                run.devices_done = 0
-                run.rows_total = 0
-                run.dms_total = 0
-                run.started_at = utc_now()
+                run.started_at = run.started_at or utc_now()
                 run.finished_at = None
                 run.error_message = None
 
@@ -1225,8 +1233,12 @@ class IngestionService:
                         select(AlarmHarvestDevice).where(AlarmHarvestDevice.run_id == run.id)
                     )
                 }
+                completed_devices: set[str] = set()
                 for device_id in device_ids:
                     device_row = existing_devices.get(device_id) or AlarmHarvestDevice(run_id=run.id, device_id=device_id)
+                    if not force and device_row.status == "succeeded":
+                        completed_devices.add(device_id)
+                        continue
                     device_row.status = "queued"
                     device_row.provider_rows = 0
                     device_row.provider_dms_rows = 0
@@ -1237,8 +1249,24 @@ class IngestionService:
                     device_row.started_at = None
                     device_row.finished_at = None
                     session.add(device_row)
+                completed_rows = [
+                    row for device_id, row in existing_devices.items() if device_id in completed_devices
+                ]
+                run.devices_done = len(completed_devices)
+                run.rows_total = sum(int(row.provider_rows or 0) for row in completed_rows)
+                run.dms_total = sum(int(row.provider_dms_rows or 0) for row in completed_rows)
                 session.commit()
                 run_id = run.id
+                pending_device_ids = [device_id for device_id in device_ids if device_id not in completed_devices]
+
+            if not first_attempt and pending_device_ids:
+                logger.info(
+                    "harvest_resume company=%s cut=%s completed=%s pending=%s",
+                    company.slug,
+                    cut_at.isoformat(),
+                    len(device_ids) - len(pending_device_ids),
+                    len(pending_device_ids),
+                )
 
             await self._set_publication_state(
                 company_slug=company.slug,
@@ -1249,10 +1277,13 @@ class IngestionService:
 
             run_status = "succeeded"
             any_failed = False
-            rows_total = 0
-            dms_total = 0
+            with self.session_factory() as session:
+                current_run = session.get(AlarmHarvestRun, run_id)
+                rows_total = int(current_run.rows_total or 0) if current_run else 0
+                dms_total = int(current_run.dms_total or 0) if current_run else 0
+            next_retry_at: datetime | None = None
 
-            for device_id in device_ids:
+            for device_id in pending_device_ids:
                 with self.session_factory() as session:
                     device_row = session.scalar(
                         select(AlarmHarvestDevice).where(
@@ -1273,7 +1304,29 @@ class IngestionService:
                         start_at=window_start,
                         end_at=window_end,
                         source="harvest",
+                        defer_on_rate_limit=True,
                     )
+                except HistoricalBackfillDeferred as exc:
+                    run_status = "rate_limited"
+                    next_retry_at = ensure_utc(exc.next_retry_at)
+                    with self.session_factory() as session:
+                        device_row = session.scalar(
+                            select(AlarmHarvestDevice).where(
+                                AlarmHarvestDevice.run_id == run_id,
+                                AlarmHarvestDevice.device_id == device_id,
+                            )
+                        )
+                        if device_row:
+                            device_row.status = "rate_limited"
+                            device_row.error_message = str(exc)
+                            device_row.finished_at = utc_now()
+                            session.add(device_row)
+                        run_row = session.get(AlarmHarvestRun, run_id)
+                        if run_row:
+                            run_row.error_message = str(exc)
+                            session.add(run_row)
+                        session.commit()
+                    break
                 except Exception as exc:
                     status_label = "rate_limited" if self.howen.is_rate_limited(exc) else "failed"
                     if status_label == "rate_limited":
@@ -1393,7 +1446,10 @@ class IngestionService:
                     status=run_status,
                     last_error=self._harvest_run_error(run_id),
                 )
-            return self._serialize_harvest_run(run_id)
+            serialized = self._serialize_harvest_run(run_id)
+            if next_retry_at is not None:
+                serialized["next_retry_at"] = next_retry_at.isoformat()
+            return serialized
 
     async def _run_live_forever(self) -> None:
         force_login = False

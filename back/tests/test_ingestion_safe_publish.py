@@ -35,7 +35,11 @@ class IngestionSafePublishTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = IngestionService.__new__(IngestionService)
         self.service.registry = _DummyRegistry()
-        self.service.settings = SimpleNamespace(default_timezone="UTC")
+        self.service.settings = SimpleNamespace(
+            default_timezone="UTC",
+            harvest_cut_interval_minutes=15,
+            harvest_overlap_minutes=30,
+        )
         self.utc = ZoneInfo("UTC")
 
     def test_past_rebuild_range_keeps_current_publication_cut(self) -> None:
@@ -63,6 +67,34 @@ class IngestionSafePublishTests(unittest.TestCase):
         )
 
         self.assertEqual(resolved_cut, current_cut)
+
+    def test_harvest_window_absorbs_gap_from_last_publication(self) -> None:
+        published_cut = datetime(2026, 8, 16, 12, 0, tzinfo=self.utc)
+        cut_at = datetime(2026, 8, 16, 13, 0, tzinfo=self.utc)
+        publication = PublishedDashboardSnapshot(company_slug="ismocol", published_cut_at=published_cut)
+        self.service.session_factory = lambda: _DummySession(publication)
+
+        window_start, window_end = self.service._harvest_window_for_cut(
+            cut_at,
+            company_slug="ismocol",
+        )
+
+        self.assertEqual(window_start, datetime(2026, 8, 16, 11, 30, tzinfo=self.utc))
+        self.assertEqual(window_end, cut_at)
+
+    def test_harvest_window_keeps_normal_overlap_without_gap(self) -> None:
+        published_cut = datetime(2026, 8, 16, 12, 45, tzinfo=self.utc)
+        cut_at = datetime(2026, 8, 16, 13, 0, tzinfo=self.utc)
+        publication = PublishedDashboardSnapshot(company_slug="ismocol", published_cut_at=published_cut)
+        self.service.session_factory = lambda: _DummySession(publication)
+
+        window_start, window_end = self.service._harvest_window_for_cut(
+            cut_at,
+            company_slug="ismocol",
+        )
+
+        self.assertEqual(window_start, datetime(2026, 8, 16, 12, 15, tzinfo=self.utc))
+        self.assertEqual(window_end, cut_at)
 
 
 if __name__ == "__main__":
