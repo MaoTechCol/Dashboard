@@ -14,6 +14,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.orm import load_only
 
 from app.core.catalog import CATEGORY_META, CATEGORY_ORDER
 from app.core.time import as_timezone, ensure_utc, parse_timestamp, utc_now
@@ -224,13 +225,36 @@ class DashboardService:
         cutoff = reference_utc - timedelta(days=self.settings.live_retention_days)
         recent_cutoff = reference_utc - timedelta(hours=24)
         anomaly_cutoff = reference_utc - timedelta(hours=24)
+        alarm_membership = _company_membership_clause(AlarmEvent, company)
+        snapshot_membership = _company_membership_clause(DailyMileageSnapshot, company)
+        device_membership = _company_membership_clause(DeviceRecord, company)
 
         with self.session_factory() as session:
             publication = session.get(PublishedDashboardSnapshot, company_slug)
             events = list(
                 session.scalars(
                     select(AlarmEvent)
+                    .options(
+                        load_only(
+                            AlarmEvent.guid,
+                            AlarmEvent.device_id,
+                            AlarmEvent.plate_no,
+                            AlarmEvent.company_slug,
+                            AlarmEvent.fleet_id,
+                            AlarmEvent.driver_name,
+                            AlarmEvent.category,
+                            AlarmEvent.subtype,
+                            AlarmEvent.classification_status,
+                            AlarmEvent.occurred_at,
+                            AlarmEvent.start_at,
+                            AlarmEvent.end_at,
+                            AlarmEvent.latitude,
+                            AlarmEvent.longitude,
+                            AlarmEvent.total_mileage_km,
+                        )
+                    )
                     .where(
+                        alarm_membership,
                         AlarmEvent.source.in_(ACTIVE_EVENT_SOURCES),
                         AlarmEvent.occurred_at >= cutoff,
                         AlarmEvent.occurred_at <= reference_utc,
@@ -240,7 +264,21 @@ class DashboardService:
             )
             daily_snapshots = list(
                 session.scalars(
-                    select(DailyMileageSnapshot).where(
+                    select(DailyMileageSnapshot)
+                    .options(
+                        load_only(
+                            DailyMileageSnapshot.device_id,
+                            DailyMileageSnapshot.plate_no,
+                            DailyMileageSnapshot.company_slug,
+                            DailyMileageSnapshot.fleet_id,
+                            DailyMileageSnapshot.snapshot_date,
+                            DailyMileageSnapshot.total_km,
+                            DailyMileageSnapshot.day_km,
+                            DailyMileageSnapshot.observed_at,
+                        )
+                    )
+                    .where(
+                        snapshot_membership,
                         DailyMileageSnapshot.source.in_(ACTIVE_SNAPSHOT_SOURCES),
                         DailyMileageSnapshot.observed_at >= cutoff,
                         DailyMileageSnapshot.observed_at <= reference_utc,
@@ -248,20 +286,26 @@ class DashboardService:
                     .order_by(DailyMileageSnapshot.observed_at)
                 )
             )
-            legacy_mileages = list(
-                session.scalars(
-                    select(MileageReading).where(
-                        MileageReading.source.in_(ACTIVE_MILEAGE_SOURCES),
-                        MileageReading.recorded_at >= cutoff,
-                        MileageReading.recorded_at <= reference_utc,
-                    )
-                    .order_by(MileageReading.recorded_at)
-                )
-            )
+            # Status observations can exceed hundreds of thousands of rows in
+            # 40 days. Daily snapshots are the validated publication layer;
+            # loading every observation here made each cut consume the VPS.
+            legacy_mileages: list[MileageReading] = []
             devices = list(
                 session.scalars(
                     select(DeviceRecord)
-                    .where(DeviceRecord.record_source == "live")
+                    .options(
+                        load_only(
+                            DeviceRecord.device_id,
+                            DeviceRecord.plate_no,
+                            DeviceRecord.company_slug,
+                            DeviceRecord.fleet_id,
+                            DeviceRecord.last_seen_at,
+                            DeviceRecord.last_received_at,
+                            DeviceRecord.last_total_km,
+                            DeviceRecord.last_day_km,
+                        )
+                    )
+                    .where(device_membership, DeviceRecord.record_source == "live")
                     .order_by(DeviceRecord.device_id)
                 )
             )
@@ -275,6 +319,7 @@ class DashboardService:
             anomalies = list(
                 session.scalars(
                     select(IngestionAnomaly)
+                    .options(load_only(IngestionAnomaly.received_at))
                     .where(
                         IngestionAnomaly.received_at >= anomaly_cutoff,
                         IngestionAnomaly.received_at <= reference_utc,
@@ -4506,8 +4551,8 @@ def _parse_json(raw_value: str | None) -> dict[str, Any]:
 
 def _load_review_status_map(session: Any, company_slug: str) -> dict[str, str]:
     rows = list(
-        session.scalars(
-            select(ReconciliationReview).where(
+        session.execute(
+            select(ReconciliationReview.guid, ReconciliationReview.review_status).where(
                 ReconciliationReview.company_slug == company_slug,
                 ReconciliationReview.guid.is_not(None),
                 ReconciliationReview.review_status.in_(("approved", "discarded")),
@@ -4515,10 +4560,26 @@ def _load_review_status_map(session: Any, company_slug: str) -> dict[str, str]:
         )
     )
     result: dict[str, str] = {}
-    for row in rows:
-        if row.guid:
-            result[row.guid] = row.review_status
+    for guid, review_status in rows:
+        if guid:
+            result[guid] = review_status
     return result
+
+
+def _company_membership_clause(model: Any, company: CompanyConfig) -> Any:
+    conditions: list[Any] = []
+    company_column = getattr(model, "company_slug", None)
+    device_column = getattr(model, "device_id", None)
+    fleet_column = getattr(model, "fleet_id", None)
+    if company_column is not None:
+        conditions.append(company_column == company.slug)
+    if device_column is not None and company.device_ids:
+        conditions.append(device_column.in_(company.device_ids))
+    if fleet_column is not None and company.fleet_ids:
+        conditions.append(fleet_column.in_(company.fleet_ids))
+    if not conditions:
+        return device_column == "__unassigned_company__"
+    return or_(*conditions)
 
 
 def _nested_value(payload: dict[str, Any], key: str) -> Any:
