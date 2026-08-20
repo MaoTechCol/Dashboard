@@ -170,19 +170,24 @@ class IngestionService:
         self,
         *,
         include_harvest_scheduler: bool = True,
+        include_realtime_publisher: bool = True,
         resume_historical_rebuilds: bool = True,
     ) -> None:
         self._harvest_scheduler_enabled = include_harvest_scheduler
         self._ensure_state_row()
         self._recover_stale_harvest_runs()
         self._runner_task = asyncio.create_task(self._run_live_forever(), name="ingestion-runner")
-        self._publisher_task = asyncio.create_task(self._publisher_loop(), name="dashboard-publisher")
+        if include_realtime_publisher:
+            self._publisher_task = asyncio.create_task(self._publisher_loop(), name="dashboard-publisher")
         if include_harvest_scheduler:
             self._harvest_task = asyncio.create_task(self._harvest_loop(), name="dashboard-harvest")
             asyncio.create_task(self._run_due_harvests(), name="dashboard-harvest-startup")
         if resume_historical_rebuilds:
             await self._resume_due_historical_rebuilds()
-        self.mark_dirty()
+        if include_realtime_publisher:
+            self.mark_dirty()
+        else:
+            self.dashboard.clear_runtime_caches()
 
     def latest_due_cut(self) -> datetime:
         return self._latest_due_cut()

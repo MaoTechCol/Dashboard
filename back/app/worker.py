@@ -45,6 +45,7 @@ class DashboardWorker:
             logger.warning("worker_redundant_jobs_compacted counts=%s", compacted)
         await self.context.ingestion.start(
             include_harvest_scheduler=False,
+            include_realtime_publisher=False,
             resume_historical_rebuilds=False,
         )
         await asyncio.to_thread(self._enqueue_orphaned_rebuilds)
