@@ -149,6 +149,7 @@ class IngestionService:
         self._runner_task: asyncio.Task[None] | None = None
         self._publisher_task: asyncio.Task[None] | None = None
         self._harvest_task: asyncio.Task[None] | None = None
+        self._harvest_scheduler_enabled = True
         self._dirty = asyncio.Event()
         self._last_purge_at = None
         self._last_device_sync_at = None
@@ -171,6 +172,7 @@ class IngestionService:
         include_harvest_scheduler: bool = True,
         resume_historical_rebuilds: bool = True,
     ) -> None:
+        self._harvest_scheduler_enabled = include_harvest_scheduler
         self._ensure_state_row()
         self._recover_stale_harvest_runs()
         self._runner_task = asyncio.create_task(self._run_live_forever(), name="ingestion-runner")
@@ -1460,7 +1462,8 @@ class IngestionService:
                 session = await self.howen.resolve_session(force_login=force_login)
                 await self.sync_devices(force=True)
                 await self._set_state(connection_state="connected", last_error=None)
-                asyncio.create_task(self._run_due_harvests(), name="dashboard-harvest-kickoff")
+                if self._harvest_scheduler_enabled:
+                    asyncio.create_task(self._run_due_harvests(), name="dashboard-harvest-kickoff")
                 force_login = False
 
                 async for message in self.howen.listen(session):

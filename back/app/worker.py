@@ -63,6 +63,8 @@ class DashboardWorker:
                 (*critical_tasks, stop_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if self._stop.is_set():
+                return
             for task in done:
                 if task is stop_task:
                     continue
