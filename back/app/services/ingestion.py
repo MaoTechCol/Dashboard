@@ -165,15 +165,52 @@ class IngestionService:
     def _can_start_historical_rebuild(self) -> bool:
         return self._historical_rebuild_running_count() < self._historical_rebuild_max_concurrency()
 
-    async def start(self) -> None:
+    async def start(
+        self,
+        *,
+        include_harvest_scheduler: bool = True,
+        resume_historical_rebuilds: bool = True,
+    ) -> None:
         self._ensure_state_row()
         self._recover_stale_harvest_runs()
         self._runner_task = asyncio.create_task(self._run_live_forever(), name="ingestion-runner")
         self._publisher_task = asyncio.create_task(self._publisher_loop(), name="dashboard-publisher")
-        self._harvest_task = asyncio.create_task(self._harvest_loop(), name="dashboard-harvest")
-        await self._resume_due_historical_rebuilds()
-        asyncio.create_task(self._run_due_harvests(), name="dashboard-harvest-startup")
+        if include_harvest_scheduler:
+            self._harvest_task = asyncio.create_task(self._harvest_loop(), name="dashboard-harvest")
+            asyncio.create_task(self._run_due_harvests(), name="dashboard-harvest-startup")
+        if resume_historical_rebuilds:
+            await self._resume_due_historical_rebuilds()
         self.mark_dirty()
+
+    def latest_due_cut(self) -> datetime:
+        return self._latest_due_cut()
+
+    def due_harvest_cuts(self) -> list[tuple[str, datetime]]:
+        self.registry.reload()
+        latest_due_cut = self._latest_due_cut()
+        interval = self._harvest_interval()
+        max_cuts = max(int(self.settings.harvest_max_cuts_per_cycle), 1)
+        pending: list[tuple[str, datetime]] = []
+        for company in self.registry.all():
+            if not self.registry.is_operational(company) or self._activation_bootstrap_running(company.slug):
+                continue
+            with self.session_factory() as session:
+                publication = session.get(PublishedDashboardSnapshot, company.slug)
+                last_cut = ensure_utc(publication.published_cut_at) if publication and publication.published_cut_at else None
+            if last_cut is None:
+                pending.append((company.slug, latest_due_cut))
+                continue
+            next_cut = last_cut + interval
+            company_count = 0
+            while next_cut <= latest_due_cut and company_count < max_cuts:
+                pending.append((company.slug, next_cut))
+                next_cut += interval
+                company_count += 1
+        return pending
+
+    async def run_harvest_cut(self, *, company_slug: str, cut_at: datetime, force: bool = False) -> dict[str, Any]:
+        self.registry.reload()
+        return await self._run_harvest_for_cut(company_slug=company_slug, cut_at=cut_at, force=force)
 
     async def stop(self) -> None:
         tasks = [
@@ -199,6 +236,13 @@ class IngestionService:
             self._publisher_task = None
             self._harvest_task = None
             self._historical_rebuild_tasks.clear()
+
+    def critical_runtime_tasks(self) -> tuple[asyncio.Task[None], ...]:
+        return tuple(
+            task
+            for task in (self._runner_task, self._publisher_task)
+            if task is not None
+        )
 
     def mark_dirty(self) -> None:
         self.dashboard.clear_runtime_caches()
@@ -824,7 +868,13 @@ class IngestionService:
             if maintenance_enabled:
                 await self.set_maintenance_mode(enabled=False, reason=None)
 
-    def queue_historical_rebuild(self, request: HistoricalRebuildRequest) -> int:
+    def queue_historical_rebuild(
+        self,
+        request: HistoricalRebuildRequest,
+        *,
+        spawn: bool = True,
+        purpose: str = "activation_bootstrap",
+    ) -> int:
         start_date_local, end_date_local, _ = self._resolve_historical_rebuild_range(
             company_slug=request.company_slug,
             start_date_value=request.start_date,
@@ -837,14 +887,14 @@ class IngestionService:
                 select(CompanyHistoricalRebuildJob)
                 .where(
                     CompanyHistoricalRebuildJob.company_slug == request.company_slug,
-                    CompanyHistoricalRebuildJob.purpose == "activation_bootstrap",
+                    CompanyHistoricalRebuildJob.purpose == purpose,
                     CompanyHistoricalRebuildJob.status.in_(("queued", "running")),
                 )
                 .order_by(CompanyHistoricalRebuildJob.created_at.desc(), CompanyHistoricalRebuildJob.id.desc())
             ).first()
             if existing:
                 next_retry_at = ensure_utc(existing.next_retry_at)
-                if (not next_retry_at or next_retry_at <= utc_now()) and self._can_start_historical_rebuild():
+                if spawn and (not next_retry_at or next_retry_at <= utc_now()) and self._can_start_historical_rebuild():
                     resume_request = HistoricalRebuildRequest(
                         company_slug=existing.company_slug,
                         start_date=existing.start_date,
@@ -856,7 +906,7 @@ class IngestionService:
                 return existing.id
             rebuild_job = CompanyHistoricalRebuildJob(
                 company_slug=request.company_slug,
-                purpose="activation_bootstrap",
+                purpose=purpose,
                 status="queued",
                 start_date=start_date_local,
                 end_date=end_date_local,
@@ -868,7 +918,7 @@ class IngestionService:
             session.commit()
             session.refresh(rebuild_job)
             rebuild_job_id = rebuild_job.id
-        if self._can_start_historical_rebuild():
+        if spawn and self._can_start_historical_rebuild():
             self._spawn_historical_rebuild_task(request=request, rebuild_job_id=rebuild_job_id)
         return rebuild_job_id
 

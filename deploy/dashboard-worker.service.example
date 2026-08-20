@@ -1,0 +1,21 @@
+[Unit]
+Description=DMS Dashboard background worker
+Wants=network-online.target
+After=network-online.target dashboard-api.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/dashboard/back
+EnvironmentFile=/opt/dashboard/back/.env
+Environment=PROCESS_ROLE=worker
+ExecStart=/opt/dashboard/back/.venv/bin/python -m app.worker
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+MemoryHigh=700M
+MemoryMax=1100M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

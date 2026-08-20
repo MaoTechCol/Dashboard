@@ -1,15 +1,21 @@
 [Unit]
 Description=DMS Dashboard FastAPI
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=root
 WorkingDirectory=/opt/dashboard/back
 EnvironmentFile=/opt/dashboard/back/.env
-ExecStart=/usr/bin/env uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+Environment=PROCESS_ROLE=api
+ExecStart=/opt/dashboard/back/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
+TimeoutStopSec=30
+MemoryHigh=350M
+MemoryMax=550M
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target

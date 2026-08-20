@@ -69,3 +69,21 @@ export async function apiJson<T>(path: string, init: ApiRequestInit = {}) {
   }
   return (await response.json()) as T;
 }
+
+export async function waitForBackgroundJob<T extends { status: string; last_error?: string | null }>(
+  jobId: string,
+  options: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<T | null> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const intervalMs = options.intervalMs ?? 1_000;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const job = await apiJson<T>(`/jobs/${encodeURIComponent(jobId)}`, { timeoutMs: Math.min(10_000, timeoutMs) });
+    if (job.status === "succeeded") return job;
+    if (job.status === "failed") {
+      throw new ApiError(job.last_error || "El trabajo en segundo plano fallo.", 500);
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, intervalMs));
+  }
+  return null;
+}

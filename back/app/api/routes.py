@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
@@ -30,9 +30,28 @@ from app.schemas import (
     ReconciliationReviewDecisionRequest,
     ReconciliationRunRequest,
 )
-from app.services.howen import HowenRateLimitError
+from app.services.job_queue import (
+    PRIORITY_BACKFILL,
+    PRIORITY_COMPANY_PURGE,
+    PRIORITY_DATA_MAINTENANCE,
+    PRIORITY_HARVEST_CUT,
+    PRIORITY_HISTORICAL_REBUILD,
+    PRIORITY_RECONCILIATION,
+    PRIORITY_REFRESH,
+)
 
 router = APIRouter()
+
+
+def _enqueue_snapshot_refresh(context: object, company_slug: str) -> dict[str, object]:
+    cut_at = context.ingestion.latest_due_cut()
+    return context.jobs.enqueue(
+        job_type="refresh_snapshot",
+        payload={"company_slug": company_slug, "cut_at": cut_at.isoformat()},
+        priority=PRIORITY_REFRESH,
+        idempotency_key=f"refresh:{company_slug}:{cut_at.isoformat()}",
+        company_slug=company_slug,
+    )
 
 
 @router.get("/health")
@@ -42,6 +61,7 @@ def healthcheck(request: Request) -> dict[str, str]:
         "status": "ok",
         "mode": context.settings.ingest_mode,
         "app": context.settings.app_name,
+        "role": context.settings.process_role,
     }
 
 
@@ -52,6 +72,7 @@ def healthz(request: Request) -> dict[str, str]:
         "status": "ok",
         "mode": context.settings.ingest_mode,
         "app": context.settings.app_name,
+        "role": context.settings.process_role,
     }
 
 
@@ -62,11 +83,16 @@ def readyz(request: Request, response: Response) -> dict[str, object]:
         "database": False,
         "company_registry": False,
         "upload_dir": context.settings.upload_dir.exists(),
-        "live_credentials": context.settings.ingest_mode != "live" or context.ingestion.howen.has_durable_credentials(),
+        "live_credentials": (
+            context.settings.process_role == "api"
+            or context.settings.ingest_mode != "live"
+            or context.ingestion.howen.has_durable_credentials()
+        ),
     }
     diagnostics: dict[str, object] = {
         "connection_state": "unknown",
         "mode": context.settings.ingest_mode,
+        "role": context.settings.process_role,
     }
 
     try:
@@ -95,6 +121,7 @@ def readyz(request: Request, response: Response) -> dict[str, object]:
 @router.post("/auth/login")
 def login(payload: LoginRequest, response: Response, request: Request) -> LoginResponse:
     context = get_context(request)
+    context.registry.reload()
     user = context.auth.authenticate(payload.username.strip(), payload.password)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales invalidas")
@@ -130,6 +157,7 @@ def logout(response: Response, request: Request) -> dict[str, bool]:
 @router.get("/auth/me")
 def auth_me(request: Request) -> AuthMeResponse:
     context = get_context(request)
+    context.registry.reload()
     user = get_current_user(request)
     companies = context.auth.serialize_companies(context.auth.visible_companies(user))
     return AuthMeResponse(
@@ -142,6 +170,7 @@ def auth_me(request: Request) -> AuthMeResponse:
 @router.get("/companies")
 def list_companies(request: Request) -> list[dict[str, object]]:
     context = get_context(request)
+    context.registry.reload()
     user = get_current_user(request)
     return [company.model_dump(mode="json") for company in context.auth.visible_companies(user)]
 
@@ -168,8 +197,13 @@ async def dashboard_snapshot(
     company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
     context = get_context(request)
     if refresh:
-        await context.ingestion.refresh_snapshot(company_slug)
-    return context.dashboard.build_snapshot(company_slug)
+        refresh_job = _enqueue_snapshot_refresh(context, company_slug)
+    else:
+        refresh_job = None
+    payload = context.dashboard.build_snapshot(company_slug)
+    if refresh_job:
+        payload.setdefault("meta", {})["refreshJob"] = refresh_job
+    return payload
 
 
 @router.get("/dashboard/{company_slug}")
@@ -182,8 +216,13 @@ async def dashboard_snapshot_by_slug(
     resolved_slug = resolve_company_slug(request=request, user=user, requested_slug=company_slug)
     context = get_context(request)
     if refresh:
-        await context.ingestion.refresh_snapshot(resolved_slug)
-    return context.dashboard.build_snapshot(resolved_slug)
+        refresh_job = _enqueue_snapshot_refresh(context, resolved_slug)
+    else:
+        refresh_job = None
+    payload = context.dashboard.build_snapshot(resolved_slug)
+    if refresh_job:
+        payload.setdefault("meta", {})["refreshJob"] = refresh_job
+    return payload
 
 
 @router.get("/reports")
@@ -318,13 +357,15 @@ def admin_overview(
     context = get_context(request)
     require_admin(request)
     company_slug = company.strip() if company else None
-    return context.dashboard.build_admin_overview(company_slug)
+    payload = context.dashboard.build_admin_overview(company_slug)
+    return payload | {"backgroundJobs": context.jobs.summary()}
 
 
 @router.get("/admin/companies")
 def admin_companies(request: Request) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
+    context.registry.reload()
     payload = AdminCompanyCatalogView.model_validate(context.dashboard.build_admin_company_catalog())
     return payload.model_dump(mode="json")
 
@@ -352,13 +393,22 @@ async def admin_activate_company(request: Request, payload: CompanyActivationReq
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    context.ingestion.queue_historical_rebuild(
-        HistoricalRebuildRequest(
-            company_slug=company.slug,
-            days=30,
-            publish_snapshot=True,
-            maintenance=False,
-        )
+    rebuild_request = HistoricalRebuildRequest(
+        company_slug=company.slug,
+        days=30,
+        publish_snapshot=True,
+        maintenance=False,
+    )
+    rebuild_job_id = context.ingestion.queue_historical_rebuild(rebuild_request, spawn=False)
+    context.jobs.enqueue(
+        job_type="historical_rebuild",
+        payload={
+            "request": rebuild_request.model_dump(mode="json"),
+            "rebuild_job_id": rebuild_job_id,
+        },
+        priority=PRIORITY_HISTORICAL_REBUILD,
+        idempotency_key=f"historical_rebuild:activation:{rebuild_job_id}",
+        company_slug=company.slug,
     )
     context.ingestion.mark_dirty()
     return admin_companies(request)
@@ -373,10 +423,13 @@ async def admin_deactivate_company(company_slug: str, request: Request) -> dict[
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
-    await context.ingestion.purge_company_operational_data(company_slug=company_slug)
-    context.auth.delete_company_users(company_slug=company_slug)
-    context.registry.delete_company(slug=company_slug)
-    context.ingestion.mark_dirty()
+    context.jobs.enqueue(
+        job_type="company_purge",
+        payload={"company_slug": company_slug},
+        priority=PRIORITY_COMPANY_PURGE,
+        idempotency_key=f"company_purge:{company_slug}:{uuid4().hex}",
+        company_slug=company_slug,
+    )
     return admin_companies(request)
 
 
@@ -463,18 +516,24 @@ def admin_company_assignment(request: Request, payload: CompanyAssignmentRequest
 def admin_purge_mock(request: Request) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
-    result = context.dashboard.purge_mock_legacy()
-    context.ingestion.mark_dirty()
-    return result
+    return context.jobs.enqueue(
+        job_type="purge_mock",
+        payload={},
+        priority=PRIORITY_DATA_MAINTENANCE,
+        idempotency_key=f"purge_mock:{uuid4().hex}",
+    )
 
 
 @router.post("/admin/replay-status-anomalies")
 async def admin_replay_status_anomalies(request: Request) -> dict[str, int]:
     require_admin(request)
     context = get_context(request)
-    result = await context.ingestion.replay_status_anomalies()
-    context.ingestion.mark_dirty()
-    return result
+    return context.jobs.enqueue(
+        job_type="replay_status_anomalies",
+        payload={},
+        priority=PRIORITY_BACKFILL,
+        idempotency_key=f"replay_status_anomalies:{uuid4().hex}",
+    )
 
 
 @router.get("/admin/audit")
@@ -498,7 +557,40 @@ def admin_audit(
 async def admin_reconciliation_run(request: Request, payload: ReconciliationRunRequest) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
-    return await context.dashboard.run_reconciliation(payload)
+    reconciliation = await context.dashboard.run_reconciliation(payload, start_task=False)
+    reconciliation_job_id = str(reconciliation["job_id"])
+    context.jobs.enqueue(
+        job_type="reconciliation",
+        payload={"reconciliation_job_id": reconciliation_job_id},
+        priority=PRIORITY_RECONCILIATION,
+        idempotency_key=f"reconciliation:{reconciliation_job_id}",
+        company_slug=payload.company_slug,
+    )
+    return reconciliation
+
+
+@router.get("/jobs/{job_id}")
+def background_job_status(request: Request, job_id: str) -> dict[str, object]:
+    user = get_current_user(request)
+    context = get_context(request)
+    job = context.jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trabajo no encontrado")
+    if user.role != "admin" and job.get("company_slug") != user.company_slug:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trabajo fuera del alcance de la sesion")
+    return job
+
+
+@router.get("/admin/jobs")
+def admin_background_jobs(
+    request: Request,
+    company: str | None = Query(default=None),
+    job_status: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, object]]:
+    require_admin(request)
+    context = get_context(request)
+    return context.jobs.list_recent(company_slug=company, status=job_status, limit=limit)
 
 
 @router.get("/admin/reconciliation/jobs/{job_id}")
@@ -700,7 +792,13 @@ def admin_km_quality(
 def admin_km_repair(request: Request, payload: KmRepairRequest) -> dict[str, object]:
     require_admin(request)
     context = get_context(request)
-    return context.dashboard.repair_km(payload)
+    return context.jobs.enqueue(
+        job_type="km_repair",
+        payload={"request": payload.model_dump(mode="json")},
+        priority=PRIORITY_DATA_MAINTENANCE,
+        idempotency_key=f"km_repair:{payload.company_slug}:{uuid4().hex}",
+        company_slug=payload.company_slug,
+    )
 
 
 @router.get("/admin/vehicles")
@@ -760,13 +858,16 @@ async def admin_backfill(request: Request, payload: BackfillRequest) -> dict[str
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La empresa no esta operativa")
     if payload.start_at >= payload.end_at:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start_at debe ser menor que end_at")
-    try:
-        return await context.ingestion.backfill_historical(payload)
-    except HowenRateLimitError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=str(exc) or "Howen esta limitando solicitudes de backfill",
-        ) from exc
+    return context.jobs.enqueue(
+        job_type="backfill",
+        payload={"request": payload.model_dump(mode="json")},
+        priority=PRIORITY_BACKFILL,
+        idempotency_key=(
+            f"backfill:{payload.company_slug or '-'}:{payload.device_id or '-'}:"
+            f"{payload.start_at.isoformat()}:{payload.end_at.isoformat()}"
+        ),
+        company_slug=payload.company_slug,
+    )
 
 
 @router.post("/admin/harvest/rerun-cut")
@@ -774,13 +875,13 @@ async def admin_rerun_harvest_cut(request: Request, payload: HarvestRerunRequest
     user = require_admin(request)
     context = get_context(request)
     company_slug = resolve_company_slug(request=request, user=user, requested_slug=payload.company_slug)
-    try:
-        return await context.ingestion.rerun_harvest_cut(company_slug=company_slug, cut_at=payload.cut_at)
-    except HowenRateLimitError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=str(exc) or "Howen esta limitando solicitudes del corte historico",
-        ) from exc
+    return context.jobs.enqueue(
+        job_type="harvest_cut",
+        payload={"company_slug": company_slug, "cut_at": payload.cut_at.isoformat(), "force": True},
+        priority=PRIORITY_HARVEST_CUT,
+        idempotency_key=f"harvest:rerun:{company_slug}:{payload.cut_at.isoformat()}:{uuid4().hex}",
+        company_slug=company_slug,
+    )
 
 
 @router.post("/admin/harvest/rebuild-history")
@@ -790,12 +891,18 @@ async def admin_rebuild_historical_window(request: Request, payload: HistoricalR
     company = context.registry.get(payload.company_slug)
     if not context.registry.is_operational(company):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La empresa no esta operativa")
-    try:
-        return await context.ingestion.rebuild_historical_window(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except HowenRateLimitError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=str(exc) or "Howen esta limitando solicitudes de reconstruccion historica",
-        ) from exc
+    rebuild_job_id = context.ingestion.queue_historical_rebuild(
+        payload,
+        spawn=False,
+        purpose="manual_rebuild",
+    )
+    return context.jobs.enqueue(
+        job_type="historical_rebuild",
+        payload={
+            "request": payload.model_dump(mode="json"),
+            "rebuild_job_id": rebuild_job_id,
+        },
+        priority=PRIORITY_HISTORICAL_REBUILD,
+        idempotency_key=f"historical_rebuild:manual:{rebuild_job_id}",
+        company_slug=payload.company_slug,
+    )

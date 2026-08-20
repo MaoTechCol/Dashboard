@@ -72,6 +72,14 @@ class Settings(BaseSettings):
     historical_batch_mode: str = "activation_only"
     historical_batch_size: int = 500
     reconciliation_cache_ttl_minutes: int = 120
+    process_role: str = "api"
+    worker_poll_interval_seconds: float = 1.0
+    worker_scheduler_interval_seconds: int = 15
+    worker_lease_seconds: int = 90
+    worker_heartbeat_seconds: int = 20
+    worker_retry_base_seconds: int = 30
+    worker_retry_max_seconds: int = 900
+    worker_max_attempts: int = 5
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -100,6 +108,14 @@ class Settings(BaseSettings):
         if mode not in {"off", "activation_only", "all_historical"}:
             raise ValueError("HISTORICAL_BATCH_MODE must be off, activation_only, or all_historical")
         return mode
+
+    @field_validator("process_role", mode="before")
+    @classmethod
+    def _validate_process_role(cls, value: object) -> str:
+        role = str(value or "api").strip().lower()
+        if role not in {"api", "worker", "all"}:
+            raise ValueError("PROCESS_ROLE must be api, worker, or all")
+        return role
 
     @property
     def root_dir(self) -> Path:

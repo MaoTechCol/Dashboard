@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiJson, DASHBOARD_REFRESH_MS } from "../api";
+import { apiJson, DASHBOARD_REFRESH_MS, waitForBackgroundJob } from "../api";
+import type { BackgroundJobStatus } from "../types";
 import type { DashboardSnapshot } from "../types";
 
 function nextAlignedRefreshDelay(intervalMs: number) {
@@ -47,7 +48,17 @@ export function useDashboardStream(companySlug: string | null) {
         params.set("_ts", String(Date.now()));
       }
       const payload = await apiJson<DashboardSnapshot>(`/dashboard?${params.toString()}`);
-      setSnapshot(payload);
+      const refreshJob = payload.meta.refreshJob;
+      if (force && refreshJob && refreshJob.status !== "succeeded") {
+        await waitForBackgroundJob<BackgroundJobStatus>(refreshJob.job_id);
+        const currentCompany = companyRef.current;
+        if (currentCompany === nextCompany) {
+          const refreshed = await apiJson<DashboardSnapshot>(`/dashboard?company=${encodeURIComponent(nextCompany)}`);
+          setSnapshot(refreshed);
+        }
+      } else {
+        setSnapshot(payload);
+      }
       setLoading(false);
       setError(null);
     })();
@@ -90,7 +101,7 @@ export function useDashboardStream(companySlug: string | null) {
       }, delay);
     };
 
-    void runLoad(true, true);
+    void runLoad(true, false);
     scheduleNextRefresh();
 
     return () => {

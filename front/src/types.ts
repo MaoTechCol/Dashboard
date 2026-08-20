@@ -223,6 +223,7 @@ export interface DashboardSnapshot {
     weekWindowStart: string;
     weekWindowEnd: string;
     weekWindowMode: "calendar_local";
+    refreshJob?: BackgroundJobStatus;
   };
   feed: FeedState;
   dataQuality: DataQuality;
@@ -231,6 +232,23 @@ export interface DashboardSnapshot {
   recentEvents: RecentEvent[];
   deviationByVehicle: Record<string, number>;
   reports: ReportFile[];
+}
+
+export interface BackgroundJobStatus {
+  job_id: string;
+  job_type: string;
+  company_slug: string | null;
+  priority: number;
+  status: "queued" | "running" | "succeeded" | "failed";
+  attempts: number;
+  max_attempts: number;
+  next_attempt_at: string | null;
+  last_error: string | null;
+  result: Record<string, unknown> | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface FeedPollPayload {
@@ -343,6 +361,17 @@ export interface AlarmHarvestOverview {
   bootstrappingCompanies: number;
 }
 
+export interface BackgroundJobQueueSummary {
+  queued: number;
+  running: number;
+  failed: number;
+  healthy_running: number;
+  stale_running: number;
+  highest_priority_queued: number | null;
+  last_heartbeat_at: string | null;
+  active: BackgroundJobStatus[];
+}
+
 export interface AdminOverview {
   company_slug: string;
   company_name: string;
@@ -356,6 +385,7 @@ export interface AdminOverview {
   active_notes: DataQualityNote[];
   operational_recency: OperationalRecency;
   alarmHarvest?: AlarmHarvestOverview;
+  backgroundJobs?: BackgroundJobQueueSummary;
 }
 
 export interface CompanyAssignment {
@@ -582,6 +612,9 @@ export interface ReconciliationReviewBulkDecisionResult {
 }
 
 export interface HistoricalRebuildResult {
+  job_id?: string;
+  job_type?: string;
+  status?: "queued" | "running" | "succeeded" | "failed";
   company_slug: string;
   timezone: string;
   start_date_local: string;

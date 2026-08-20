@@ -356,6 +356,35 @@ class AlarmHarvestDevice(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
+class BackgroundJob(Base):
+    __tablename__ = "background_jobs"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_background_jobs_idempotency_key"),
+        Index("ix_background_jobs_claim", "status", "next_attempt_at", "priority", "created_at"),
+        Index("ix_background_jobs_company_type", "company_slug", "job_type", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(64), index=True)
+    company_slug: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="queued")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, default=utc_now)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
 class ReconciliationJobDevice(Base):
     __tablename__ = "reconciliation_job_devices"
     __table_args__ = (

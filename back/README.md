@@ -28,17 +28,22 @@ cp .env.example .env
 uv sync
 ```
 
-Arranque local sin activar `.venv` manualmente:
+Arranque local sin activar `.venv` manualmente, en dos terminales:
 
 ```bash
 cd back
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+PROCESS_ROLE=api uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+```bash
+cd back
+PROCESS_ROLE=worker uv run python -m app.worker
 ```
 
 Si prefieres modo estable sin `--reload`:
 
 ```bash
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+PROCESS_ROLE=api uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 Variables del login Howen:

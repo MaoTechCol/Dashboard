@@ -571,7 +571,6 @@ function App() {
               adminUsername={session.user.username}
               company={activeCompany}
               enabled={activeModule === "administracion"}
-              onRefreshDashboard={dashboard.refresh}
               onReloadSession={reloadSession}
               selectedCompany={selectedCompany}
               snapshotVersion={dashboard.snapshot?.meta.generatedAt ?? null}
@@ -584,7 +583,6 @@ function App() {
               <AdminAuditModule
                 company={activeCompany}
                 enabled={activeModule === "auditoria"}
-                onRefreshDashboard={dashboard.refresh}
                 selectedCompany={selectedCompany}
                 snapshot={dashboard.snapshot}
                 snapshotVersion={dashboard.snapshot?.meta.generatedAt ?? null}
@@ -1313,22 +1311,14 @@ function ReportsModule({
       publish_snapshot: true,
     };
 
-    const response = await apiJson<{
-      inserted: number;
-      anomalies: number;
-      devices: number;
-      published_cut_at?: string | null;
-      recent_events?: number;
-      week_total?: number;
-    }>("/admin/backfill", {
+    const response = await apiJson<{ job_id: string; status: string }>("/admin/backfill", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     setReportActionSuccess(
-      `Backfill completado: ${response.inserted} eventos insertados, ${response.anomalies} anomalias, ${response.devices} dispositivos procesados.${response.published_cut_at ? ` Snapshot republicado en ${formatDateTime(response.published_cut_at, company?.timezone)}.` : ""}`,
+      `Backfill encolado (${response.job_id.slice(0, 8)}). El worker lo procesara sin bloquear el portal y publicara el resultado al terminar.`,
     );
-    onRefreshDashboard();
   };
 
   const safeHandleUpload = async (event: FormEvent<HTMLFormElement>) => {
@@ -1517,7 +1507,6 @@ interface AdminOperationsModuleProps {
   adminUsername: string;
   company: CompanySummary | null;
   enabled: boolean;
-  onRefreshDashboard: () => void;
   onReloadSession: (preferredCompany?: string | null) => Promise<void>;
   selectedCompany: string | null;
   snapshotVersion: string | null;
@@ -1568,7 +1557,6 @@ function AdminOperationsModule({
   adminUsername,
   company,
   enabled,
-  onRefreshDashboard,
   onReloadSession,
   selectedCompany,
   snapshotVersion,
@@ -1941,16 +1929,8 @@ function AdminOperationsModule({
         },
       );
       setCompanyCatalog(nextCatalog);
-      await loadAdmin(true);
-      const fallbackCompany =
-        nextCatalog.companies.find((item) => item.operational && item.ready_in_selector && item.slug !== companyToDeactivate.slug)?.slug ??
-        nextCatalog.companies.find((item) => item.operational && item.ready_in_selector)?.slug ??
-        nextCatalog.companies.find((item) => item.operational)?.slug ??
-        null;
-      await onReloadSession(fallbackCompany);
-      onRefreshDashboard();
       setSuccess(
-        `${companyToDeactivate.name} quedo desactivada y su base operativa local fue retirada. Si la necesitas de nuevo, vuelvela a marcar aqui y asignale una nueva contrasena.`,
+        `La desactivacion de ${companyToDeactivate.name} quedo encolada. El worker retirara datos, usuario y selector de forma auditada sin bloquear la consola.`,
       );
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "No se pudo desactivar la empresa");
@@ -2235,6 +2215,20 @@ function AdminOperationsModule({
             overview?.alarmHarvest
               ? `${overview.alarmHarvest.activeRebuilds} corriendo · ${overview.alarmHarvest.queuedRebuilds} en espera`
               : "Bootstrap historico de empresas"
+          }
+        />
+        <MetricCard
+          label="Cola durable del worker"
+          tone={(overview?.backgroundJobs?.failed ?? 0) || (overview?.backgroundJobs?.stale_running ?? 0) ? "danger" : "white"}
+          value={
+            overview?.backgroundJobs
+              ? `${overview.backgroundJobs.running + overview.backgroundJobs.queued}`
+              : (loading ? "..." : "0")
+          }
+          detail={
+            overview?.backgroundJobs
+              ? `${overview.backgroundJobs.running} ejecutando · ${overview.backgroundJobs.queued} en espera · ${overview.backgroundJobs.failed} fallidos${overview.backgroundJobs.stale_running ? ` · ${overview.backgroundJobs.stale_running} sin heartbeat` : ""}`
+              : "Jobs persistidos con lease y reintentos"
           }
         />
       </section>
@@ -2623,7 +2617,6 @@ function AdminOperationsModule({
 interface AdminAuditModuleProps {
   company: CompanySummary | null;
   enabled: boolean;
-  onRefreshDashboard: () => void;
   selectedCompany: string;
   snapshot: DashboardSnapshot | null;
   snapshotVersion: string | null;
@@ -2632,7 +2625,6 @@ interface AdminAuditModuleProps {
 function AdminAuditModule({
   company,
   enabled,
-  onRefreshDashboard,
   selectedCompany,
   snapshot,
   snapshotVersion,
@@ -3233,10 +3225,8 @@ function AdminAuditModule({
         }),
       });
       setSuccess(
-        `Repoblado del mes completado para ${company?.name ?? selectedCompany}: ${response.inserted} DMS insertadas, ${response.anomalies} anomalias y ${response.failed_count} dispositivos con fallo. Snapshot republicado en ${response.published_cut_at ? formatDateTime(response.published_cut_at, timezoneName) : "sin corte nuevo"}.`,
+        `Repoblado del mes encolado para ${company?.name ?? selectedCompany} (${response.job_id?.slice(0, 8) ?? "job"}). El worker conserva el progreso y publicara el snapshot solo al completar toda la ventana.`,
       );
-      onRefreshDashboard();
-      await refreshDiagnostic(true);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "No se pudo repoblar el historico del mes actual");
     } finally {

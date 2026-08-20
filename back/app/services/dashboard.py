@@ -1865,7 +1865,12 @@ class DashboardService:
         self._admin_audit_cache[cache_key] = (now_monotonic, payload)
         return payload
 
-    async def run_reconciliation(self, payload: ReconciliationRunRequest) -> dict[str, Any]:
+    async def run_reconciliation(
+        self,
+        payload: ReconciliationRunRequest,
+        *,
+        start_task: bool = True,
+    ) -> dict[str, Any]:
         company = self.registry.get(payload.company_slug)
         range_start, range_end = _resolve_reconciliation_range(
             company=company,
@@ -1917,7 +1922,8 @@ class DashboardService:
                 session.commit()
         if not job_id:
             raise RuntimeError("No se pudo crear o reutilizar el job de conciliacion")
-        self._ensure_reconciliation_task(job_id)
+        if start_task:
+            self._ensure_reconciliation_task(job_id)
         job_payload = self.get_reconciliation_job(job_id)
         return ReconciliationRunResponse(
             job_id=job_payload["job_id"],
@@ -2730,6 +2736,10 @@ class DashboardService:
             self._run_reconciliation_job(job_id),
             name=f"reconciliation-{job_id}",
         )
+
+    async def process_reconciliation_job(self, job_id: str) -> dict[str, Any]:
+        await self._run_reconciliation_job(job_id)
+        return self.get_reconciliation_job(job_id)
 
     def _resolve_reconciliation_cached_payload(
         self,

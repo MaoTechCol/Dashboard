@@ -18,13 +18,15 @@ npm run build
 - Reportes: copiar `back/storage/uploads`
 - Verificar permisos de escritura sobre `back/storage/`
 
-## 3. Publicar backend
+## 3. Publicar API y worker
 
 ```bash
 sudo cp /opt/dashboard/deploy/dashboard-api.service.example /etc/systemd/system/dashboard-api.service
+sudo cp /opt/dashboard/deploy/dashboard-worker.service.example /etc/systemd/system/dashboard-worker.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now dashboard-api
+sudo systemctl enable --now dashboard-api dashboard-worker
 sudo systemctl status dashboard-api
+sudo systemctl status dashboard-worker
 ```
 
 ## 4. Publicar frontend con nginx
@@ -47,6 +49,8 @@ python3 scripts/smoke_test.py --base-url http://127.0.0.1:8000/api --username ad
 
 - `GET /api/healthz` responde `200`
 - `GET /api/readyz` responde `200`
+- `dashboard-api.service` y `dashboard-worker.service` estan activos con PID y memoria independientes
+- `GET /api/admin/jobs` muestra heartbeat vigente para cualquier job `running`
 - login exitoso
 - `GET /api/auth/me` con cookie de sesion
 - `GET /api/dashboard?company=ismocol`
