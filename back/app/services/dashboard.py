@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import load_only
 
 from app.core.catalog import CATEGORY_META, CATEGORY_ORDER
@@ -286,10 +286,6 @@ class DashboardService:
                     .order_by(DailyMileageSnapshot.observed_at)
                 )
             )
-            # Status observations can exceed hundreds of thousands of rows in
-            # 40 days. Daily snapshots are the validated publication layer;
-            # loading every observation here made each cut consume the VPS.
-            legacy_mileages: list[MileageReading] = []
             devices = list(
                 session.scalars(
                     select(DeviceRecord)
@@ -308,6 +304,12 @@ class DashboardService:
                     .where(device_membership, DeviceRecord.record_source == "live")
                     .order_by(DeviceRecord.device_id)
                 )
+            )
+            legacy_daily_km = _load_legacy_daily_km(
+                session,
+                company=company,
+                cutoff=cutoff,
+                reference_utc=reference_utc,
             )
             reports = list(
                 session.scalars(
@@ -389,6 +391,16 @@ class DashboardService:
             device.device_id: self.registry.canonical_plate(device.device_id, device.plate_no)
             for device in company_devices
         }
+        canonical_legacy_daily_km = [
+            (
+                canonical_plate_by_device.get(device_id)
+                or self.registry.canonical_plate(device_id, plate_no)
+                or device_id,
+                day_key,
+                day_km,
+            )
+            for device_id, plate_no, day_key, day_km in legacy_daily_km
+        ]
         for event in company_events:
             event.plate_no = self.registry.canonical_plate(
                 event.device_id,
@@ -414,7 +426,13 @@ class DashboardService:
         dates_7_set = set(dates_7)
         latest_day = dates_30[-1]
         closed_days = dates_30[:-1]
-        daily_km_by_vehicle, fleet_km_by_date = _build_daily_km(company_snapshots, company_legacy, company_events, tz)
+        daily_km_by_vehicle, fleet_km_by_date = _build_daily_km(
+            company_snapshots,
+            company_legacy,
+            company_events,
+            tz,
+            legacy_daily_km=canonical_legacy_daily_km,
+        )
         _merge_current_day_from_device_state(company_devices, daily_km_by_vehicle, fleet_km_by_date, latest_day, tz)
         recent_events = [_serialize_event(event, tz) for event in company_events if event.occurred_at >= recent_cutoff]
         last_dms_event_at = company_events[-1].occurred_at.isoformat() if company_events else None
@@ -4051,6 +4069,8 @@ def _build_daily_km(
     legacy_mileages: list[MileageReading],
     alarm_events: list[AlarmEvent],
     tz: ZoneInfo,
+    *,
+    legacy_daily_km: list[tuple[str, date, float]] | None = None,
 ) -> tuple[dict[str, dict[date, float]], dict[date, float]]:
     grouped: dict[str, dict[date, float]] = defaultdict(dict)
     fleet_by_date: dict[date, float] = defaultdict(float)
@@ -4094,10 +4114,72 @@ def _build_daily_km(
                 km = max(rows[-1].total_km - rows[0].total_km, 0.0)
             _merge_daily_km_value(grouped, fleet_by_date, plate, day_key, km)
 
+    for plate, day_key, km in legacy_daily_km or []:
+        _merge_daily_km_value(grouped, fleet_by_date, plate, day_key, km)
+
     # Alarm payloads are sparse observations, not an odometer series. Using
     # their min/max as daily distance creates misleading partial history.
     # Historical km is published only from status readings or daily snapshots.
     return grouped, fleet_by_date
+
+
+def _load_legacy_daily_km(
+    session: Any,
+    *,
+    company: CompanyConfig,
+    cutoff: datetime,
+    reference_utc: datetime,
+) -> list[tuple[str, str | None, date, float]]:
+    """Aggregate status observations in SQL instead of loading every sample."""
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        day_expression = func.date(func.timezone(company.timezone, MileageReading.recorded_at))
+    else:
+        day_expression = func.date(MileageReading.recorded_at)
+    partition = (MileageReading.device_id, day_expression)
+    ranked = (
+        select(
+            MileageReading.device_id.label("device_id"),
+            MileageReading.plate_no.label("plate_no"),
+            day_expression.label("day_key"),
+            MileageReading.total_km.label("total_km"),
+            MileageReading.day_km.label("day_km"),
+            func.row_number()
+            .over(partition_by=partition, order_by=MileageReading.recorded_at.asc())
+            .label("first_rank"),
+            func.row_number()
+            .over(partition_by=partition, order_by=MileageReading.recorded_at.desc())
+            .label("last_rank"),
+        )
+        .where(
+            _company_membership_clause(MileageReading, company),
+            MileageReading.source.in_(ACTIVE_MILEAGE_SOURCES),
+            MileageReading.recorded_at >= cutoff,
+            MileageReading.recorded_at <= reference_utc,
+        )
+        .subquery()
+    )
+    rows = session.execute(
+        select(
+            ranked.c.device_id,
+            func.max(ranked.c.plate_no).label("plate_no"),
+            ranked.c.day_key,
+            func.max(ranked.c.day_km).label("explicit_day_km"),
+            func.max(case((ranked.c.first_rank == 1, ranked.c.total_km))).label("first_total_km"),
+            func.max(case((ranked.c.last_rank == 1, ranked.c.total_km))).label("last_total_km"),
+        ).group_by(ranked.c.device_id, ranked.c.day_key)
+    ).all()
+    aggregates: list[tuple[str, str | None, date, float]] = []
+    for row in rows:
+        day_key = row.day_key if isinstance(row.day_key, date) else date.fromisoformat(str(row.day_key))
+        if row.explicit_day_km is not None:
+            day_km = float(row.explicit_day_km)
+        elif row.first_total_km is not None and row.last_total_km is not None:
+            day_km = max(float(row.last_total_km) - float(row.first_total_km), 0.0)
+        else:
+            continue
+        aggregates.append((str(row.device_id), row.plate_no, day_key, round(day_km, 1)))
+    return aggregates
 
 
 def _merge_daily_km_value(
