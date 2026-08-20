@@ -311,6 +311,7 @@ class DashboardService:
                 cutoff=cutoff,
                 reference_utc=reference_utc,
             )
+            legacy_mileages: list[MileageReading] = []
             reports = list(
                 session.scalars(
                     select(ReportAsset)
