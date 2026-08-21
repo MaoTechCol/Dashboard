@@ -57,23 +57,38 @@ class CompanyRegistry:
         """Use JSON once as a seed; the database is authoritative afterwards."""
         if not self._session_factory:
             return
-        from app.models import ManagedCompany, SystemSetting
+        from app.models import ManagedCompany, PublishedDashboardSnapshot, SystemSetting, UserAccount
 
-        marker_key = "managed_companies_seeded_v1"
+        marker_key = "managed_companies_seeded_v2"
         with self._session_factory() as session:
             if session.get(SystemSetting, marker_key):
                 return
-            if session.query(ManagedCompany).count() == 0:
-                for item in self._load_payload():
-                    slug = str(item.get("slug") or "").strip()
-                    if slug:
-                        session.add(
-                            ManagedCompany(
-                                slug=slug,
-                                config_json=json.dumps(item, ensure_ascii=True),
-                                is_active=True,
-                            )
+            existing_slugs = set(session.scalars(select(ManagedCompany.slug)))
+            seed_empty_registry = not existing_slugs
+            for item in self._load_payload():
+                slug = str(item.get("slug") or "").strip()
+                if not slug or slug in existing_slugs:
+                    continue
+                has_active_user = session.scalar(
+                    select(UserAccount.id).where(
+                        UserAccount.company_slug == slug,
+                        UserAccount.is_active.is_(True),
+                    ).limit(1)
+                )
+                has_published_snapshot = session.scalar(
+                    select(PublishedDashboardSnapshot.company_slug).where(
+                        PublishedDashboardSnapshot.company_slug == slug,
+                        PublishedDashboardSnapshot.snapshot_json.is_not(None),
+                    ).limit(1)
+                )
+                if seed_empty_registry or has_active_user or has_published_snapshot:
+                    session.add(
+                        ManagedCompany(
+                            slug=slug,
+                            config_json=json.dumps(item, ensure_ascii=True),
+                            is_active=True,
                         )
+                    )
             session.add(SystemSetting(key=marker_key, value_json=json.dumps({"seeded": True})))
             session.commit()
 
