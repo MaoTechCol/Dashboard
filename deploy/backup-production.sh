@@ -83,8 +83,15 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
 PY
 )
 
-git -C "$APP_DIR" rev-parse HEAD > "$DESTINATION/data/git-commit.txt"
-git -C "$APP_DIR" describe --tags --always --dirty > "$DESTINATION/data/git-version.txt"
+if git -C "$APP_DIR" rev-parse HEAD > "$DESTINATION/data/git-commit.txt" 2>/dev/null; then
+  git -C "$APP_DIR" describe --tags --always --dirty > "$DESTINATION/data/git-version.txt"
+elif [[ -s "$APP_DIR/DEPLOYED_RELEASE" ]]; then
+  cp "$APP_DIR/DEPLOYED_RELEASE" "$DESTINATION/data/git-commit.txt"
+  cp "$APP_DIR/DEPLOYED_RELEASE" "$DESTINATION/data/git-version.txt"
+else
+  printf '%s\n' "unknown" > "$DESTINATION/data/git-commit.txt"
+  printf '%s\n' "unknown" > "$DESTINATION/data/git-version.txt"
+fi
 systemctl is-active dashboard-api.service dashboard-worker.service nginx \
   > "$DESTINATION/data/service-state.txt" || true
 
