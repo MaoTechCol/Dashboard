@@ -269,6 +269,44 @@ class HowenClient:
                     monotonic() + self._current_request_spacing(),
                 )
 
+    async def _post_form(
+        self,
+        url: str,
+        body: dict[str, Any],
+        *,
+        token: str,
+        timeout: float,
+    ) -> dict[str, Any]:
+        headers = {
+            "token": token,
+            "platform": "web",
+            "version": "v2",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        async with self._get_request_lock():
+            now = monotonic()
+            next_request_at = self._next_request_at.get(self._account_key, 0.0)
+            if next_request_at > now:
+                await asyncio.sleep(next_request_at - now)
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(url, data=body, headers=headers)
+                    if response.status_code == 429:
+                        self._register_rate_limit()
+                    response.raise_for_status()
+                    payload = response.json()
+                    if self.is_rate_limited(payload.get("msg") or ""):
+                        self._register_rate_limit()
+                    elif payload.get("status") == 10000:
+                        self._register_request_success()
+                    return payload
+            finally:
+                self._next_request_at[self._account_key] = max(
+                    self._next_request_at.get(self._account_key, 0.0),
+                    monotonic() + self._current_request_spacing(),
+                )
+
     async def login(self) -> HowenSession:
         if not self.settings.howen_username:
             raise RuntimeError("HOWEN_USERNAME is required for live ingestion")
@@ -409,6 +447,98 @@ class HowenClient:
                 end_at=end_at,
             )
 
+    async def fetch_evidence_alarms(
+        self,
+        token: str,
+        *,
+        device_ids: list[str],
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[dict[str, Any]]:
+        """Fetch every video-backed alarm shown by Howen's Alarm Clips view."""
+        normalized_ids = sorted({str(device_id).strip() for device_id in device_ids if str(device_id).strip()})
+        if not normalized_ids:
+            return []
+
+        url = f"{self.settings.howen_http_base.rstrip('/')}/record/findEvidences.action"
+        page_size = max(int(getattr(self.settings, "howen_evidence_page_size", 100)), 1)
+        max_devices = max(int(getattr(self.settings, "howen_evidence_max_devices_per_request", 50)), 1)
+        rows: list[dict[str, Any]] = []
+
+        for offset in range(0, len(normalized_ids), max_devices):
+            device_batch = normalized_ids[offset : offset + max_devices]
+            page_num = 1
+            previous_fingerprint: tuple[str, ...] | None = None
+            while True:
+                body = {
+                    "token": token,
+                    "scheme": "http",
+                    "lang": "en_US",
+                    "conditionName": ",".join(device_batch),
+                    "startTime": start_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "endTime": end_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "alarmType": "",
+                    "takeType": "",
+                    "reviewType": "",
+                    "driverCardId": "",
+                    "pageNum": str(page_num),
+                    "pageCount": str(page_size),
+                }
+                payload = await self._post_form(url, body, token=token, timeout=45.0)
+                if payload.get("status") != 10000:
+                    if self.is_no_data_error(payload.get("msg") or ""):
+                        break
+                    if self.is_rate_limited(payload.get("msg") or ""):
+                        raise HowenRateLimitError(
+                            payload.get("msg") or "Requests too frequent, please try again later"
+                        )
+                    raise RuntimeError(payload.get("msg") or "Unable to fetch Howen alarm evidences")
+
+                page_rows = _extract_rows(payload)
+                if not page_rows:
+                    break
+                fingerprint = tuple(
+                    str(row.get("alarmGuid") or row.get("alarmID") or row.get("guid") or "")
+                    for row in page_rows
+                )
+                if previous_fingerprint == fingerprint:
+                    break
+                rows.extend(page_rows)
+                previous_fingerprint = fingerprint
+                if len(page_rows) < page_size:
+                    break
+                page_num += 1
+
+        return rows
+
+    async def fetch_evidence_alarms_authorized(
+        self,
+        *,
+        device_ids: list[str],
+        start_at: datetime,
+        end_at: datetime,
+        force_login: bool = False,
+    ) -> list[dict[str, Any]]:
+        session = await self.resolve_session(force_login=force_login)
+        try:
+            return await self.fetch_evidence_alarms(
+                session.token,
+                device_ids=device_ids,
+                start_at=start_at,
+                end_at=end_at,
+            )
+        except Exception as exc:
+            if not self.is_auth_error(exc):
+                raise
+            await self.invalidate_session()
+            session = await self.resolve_session(force_login=True)
+            return await self.fetch_evidence_alarms(
+                session.token,
+                device_ids=device_ids,
+                start_at=start_at,
+                end_at=end_at,
+            )
+
     async def listen(self, session: HowenSession) -> AsyncIterator[dict[str, Any]]:
         if not self.settings.howen_username:
             raise RuntimeError("HOWEN_USERNAME is required for websocket login")
@@ -518,6 +648,7 @@ class HowenClient:
         plate_no = self.registry.normalize_plate(company, raw_plate_no) if company else self.registry.normalize_plate_any(raw_plate_no)
         guid = str(
             payload.get("alarmID")
+            or payload.get("alarmGuid")
             or payload.get("guid")
             or detail.get("uuid")
             or uuid4().hex
@@ -577,7 +708,13 @@ class HowenClient:
 
         # In Howen historical alarms, reportTime is often stored five hours ahead of
         # the portal-visible event time. Prefer the operational end/start time first.
-        event_time = detail.get("endTime") or detail.get("startTime") or detail.get("reportTime")
+        event_time = (
+            detail.get("alarmTime")
+            or detail.get("alarmTimeEnd")
+            or detail.get("endTime")
+            or detail.get("startTime")
+            or detail.get("reportTime")
+        )
         occurred_at = parse_timestamp(event_time, timezone_name)
         if not occurred_at:
             return None
@@ -586,8 +723,17 @@ class HowenClient:
             guid=guid,
             device_id=device_id,
             occurred_at=occurred_at,
-            start_at=parse_timestamp(detail.get("startTime") or detail.get("endTime"), timezone_name),
-            end_at=parse_timestamp(detail.get("endTime") or detail.get("reportTime"), timezone_name),
+            start_at=parse_timestamp(
+                detail.get("alarmTime") or detail.get("startTime") or detail.get("endTime"),
+                timezone_name,
+            ),
+            end_at=parse_timestamp(
+                detail.get("alarmTimeEnd")
+                or detail.get("alarmTime")
+                or detail.get("endTime")
+                or detail.get("reportTime"),
+                timezone_name,
+            ),
             category=category,
             subtype=raw_alarm_type or raw_tp,
             mapping_source=mapping_source,

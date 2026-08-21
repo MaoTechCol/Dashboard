@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     howen_request_spacing_seconds: float = 2.5
     howen_request_spacing_max_seconds: float = 8.0
     howen_request_recovery_successes: int = 20
+    howen_alarm_source: str = "evidence_bulk"
+    howen_evidence_page_size: int = 48
+    howen_evidence_max_devices_per_request: int = 50
+    howen_evidence_fallback_to_device_api: bool = True
     harvest_cut_interval_minutes: int = 15
     harvest_overlap_minutes: int = 30
     harvest_check_interval_seconds: int = 20
@@ -122,6 +126,14 @@ class Settings(BaseSettings):
         if mode not in {"off", "activation_only", "all_historical"}:
             raise ValueError("HISTORICAL_BATCH_MODE must be off, activation_only, or all_historical")
         return mode
+
+    @field_validator("howen_alarm_source", mode="before")
+    @classmethod
+    def _validate_howen_alarm_source(cls, value: object) -> str:
+        source = str(value or "evidence_bulk").strip().lower()
+        if source not in {"evidence_bulk", "official_device"}:
+            raise ValueError("HOWEN_ALARM_SOURCE must be evidence_bulk or official_device")
+        return source
 
     @field_validator("process_role", mode="before")
     @classmethod

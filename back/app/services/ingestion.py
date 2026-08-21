@@ -1387,6 +1387,8 @@ class IngestionService:
                 rows_total = int(current_run.rows_total or 0) if current_run else 0
                 dms_total = int(current_run.dms_total or 0) if current_run else 0
             next_retry_at: datetime | None = None
+            evidence_rows_by_device: dict[str, list[dict[str, Any]]] | None = None
+            use_device_api_fallback = False
 
             for device_id in pending_device_ids:
                 with self.session_factory() as session:
@@ -1404,13 +1406,56 @@ class IngestionService:
                         session.add(device_row)
                         session.commit()
                 try:
-                    rows = await self._fetch_historical_backfill_rows(
-                        device_id=device_id,
-                        start_at=window_start,
-                        end_at=window_end,
-                        source="harvest",
-                        defer_on_rate_limit=True,
-                    )
+                    if (
+                        str(getattr(self.settings, "howen_alarm_source", "evidence_bulk")) == "evidence_bulk"
+                        and not use_device_api_fallback
+                    ):
+                        if evidence_rows_by_device is None:
+                            try:
+                                evidence_rows_by_device = await self._fetch_evidence_harvest_rows(
+                                    device_ids=pending_device_ids,
+                                    start_at=window_start,
+                                    end_at=window_end,
+                                )
+                                logger.info(
+                                    "harvest_evidence_bulk company=%s cut=%s devices=%s rows=%s",
+                                    company.slug,
+                                    cut_at.isoformat(),
+                                    len(pending_device_ids),
+                                    sum(len(items) for items in evidence_rows_by_device.values()),
+                                )
+                            except Exception as exc:
+                                if self.howen.is_rate_limited(exc):
+                                    raise
+                                if not bool(
+                                    getattr(self.settings, "howen_evidence_fallback_to_device_api", True)
+                                ):
+                                    raise
+                                logger.warning(
+                                    "harvest_evidence_fallback company=%s cut=%s error=%s",
+                                    company.slug,
+                                    cut_at.isoformat(),
+                                    exc,
+                                )
+                                use_device_api_fallback = True
+                        if not use_device_api_fallback:
+                            rows = evidence_rows_by_device.get(device_id, [])
+                        else:
+                            rows = await self._fetch_historical_backfill_rows(
+                                device_id=device_id,
+                                start_at=window_start,
+                                end_at=window_end,
+                                source="harvest",
+                                defer_on_rate_limit=True,
+                            )
+                    else:
+                        rows = await self._fetch_historical_backfill_rows(
+                            device_id=device_id,
+                            start_at=window_start,
+                            end_at=window_end,
+                            source="harvest",
+                            defer_on_rate_limit=True,
+                        )
                 except HistoricalBackfillDeferred as exc:
                     run_status = "rate_limited"
                     next_retry_at = ensure_utc(exc.next_retry_at)
@@ -1560,6 +1605,42 @@ class IngestionService:
             if next_retry_at is not None:
                 serialized["next_retry_at"] = next_retry_at.isoformat()
             return serialized
+
+    async def _fetch_evidence_harvest_rows(
+        self,
+        *,
+        device_ids: list[str],
+        start_at: datetime,
+        end_at: datetime,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not device_ids:
+            return {}
+        local_start_at, local_end_at = self._historical_window_for_device(
+            device_id=device_ids[0],
+            start_at=start_at,
+            end_at=end_at,
+        )
+        rows = await self.howen.fetch_evidence_alarms_authorized(
+            device_ids=device_ids,
+            start_at=local_start_at,
+            end_at=local_end_at,
+            force_login=False,
+        )
+        expected_ids = set(device_ids)
+        grouped: dict[str, list[dict[str, Any]]] = {device_id: [] for device_id in device_ids}
+        for row in rows:
+            device_id = str(
+                row.get("deviceID") or row.get("deviceno") or row.get("deviceid") or ""
+            ).strip()
+            if device_id in expected_ids:
+                grouped[device_id].append(row)
+                continue
+            await self._record_normalization_failure(
+                source_type="harvest_evidence_device",
+                payload=row,
+                received_at=utc_now(),
+            )
+        return grouped
 
     async def _run_live_forever(self) -> None:
         force_login = False
