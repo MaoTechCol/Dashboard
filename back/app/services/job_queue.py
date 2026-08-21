@@ -486,6 +486,7 @@ class JobQueue:
 
     def summary(self) -> dict[str, Any]:
         now = utc_now()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         with self.session_factory() as session:
             rows = list(
                 session.scalars(
@@ -497,7 +498,11 @@ class JobQueue:
 
         queued = [row for row in rows if row.status == "queued"]
         running = [row for row in rows if row.status == "running"]
-        failed = [row for row in rows if row.status == "failed"]
+        failed = [
+            row
+            for row in rows
+            if row.status == "failed" and ensure_utc(row.finished_at or row.updated_at or row.created_at) >= month_start
+        ]
         healthy_running = [
             row
             for row in running

@@ -193,6 +193,45 @@ def test_summary_distinguishes_healthy_and_stale_workers() -> None:
     assert stale["stale_running"] == 1
 
 
+def test_summary_counts_only_failed_jobs_from_the_current_month() -> None:
+    queue, session_factory = _queue()
+    now = utc_now()
+    with session_factory() as session:
+        session.add_all(
+            [
+                BackgroundJob(
+                    id="failed-current-month",
+                    job_type="harvest_cut",
+                    priority=100,
+                    payload_json="{}",
+                    idempotency_key="failed-current-month",
+                    status="failed",
+                    attempts=1,
+                    max_attempts=1,
+                    created_at=now,
+                    updated_at=now,
+                    finished_at=now,
+                ),
+                BackgroundJob(
+                    id="failed-previous-month",
+                    job_type="harvest_cut",
+                    priority=100,
+                    payload_json="{}",
+                    idempotency_key="failed-previous-month",
+                    status="failed",
+                    attempts=1,
+                    max_attempts=1,
+                    created_at=now - timedelta(days=40),
+                    updated_at=now - timedelta(days=40),
+                    finished_at=now - timedelta(days=40),
+                ),
+            ]
+        )
+        session.commit()
+
+    assert queue.summary()["failed"] == 1
+
+
 def test_transient_completed_harvest_is_requeued() -> None:
     queue, _ = _queue()
     created = queue.enqueue(

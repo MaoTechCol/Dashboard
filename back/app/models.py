@@ -116,6 +116,7 @@ class AlarmEventAudit(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     guid: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
+    provider_event_key: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
     company_slug: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
     device_id: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
     fleet_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)

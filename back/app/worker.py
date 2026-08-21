@@ -154,6 +154,8 @@ class DashboardWorker:
         while not self._stop.is_set():
             try:
                 await self._enqueue_due_harvests()
+                # Retention belongs to the worker so API requests never pay for it.
+                await asyncio.to_thread(self.context.ingestion.purge_retention)
             except asyncio.CancelledError:
                 raise
             except Exception:

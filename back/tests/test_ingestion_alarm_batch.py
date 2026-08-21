@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base
 from app.core.time import utc_now
-from app.models import AlarmEvent, AlarmEventAudit, CompanyHistoricalRebuildJob, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestionAnomaly
+from app.models import AlarmEvent, AlarmEventAudit, CompanyHistoricalRebuildJob, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestionAnomaly, ReconciliationReview
 from app.schemas import NormalizedAlarm
 from app.services.ingestion import IngestionService
 
@@ -71,6 +71,8 @@ class IngestionAlarmBatchTests(unittest.TestCase):
             default_timezone="America/Bogota",
             historical_batch_mode="activation_only",
             historical_batch_size=2,
+            live_retention_days=40,
+            anomaly_retention_days=90,
         )
         self.service.session_factory = self.session_factory
         self.service.registry = _Registry()
@@ -172,7 +174,15 @@ class IngestionAlarmBatchTests(unittest.TestCase):
             self.assertEqual(session.scalar(select(func.count()).select_from(HowenAlarmRaw)), 3)
             self.assertEqual(session.scalar(select(func.count()).select_from(AlarmEvent)), 1)
             self.assertEqual(session.scalar(select(func.count()).select_from(IngestionAnomaly)), 1)
-            self.assertGreater(session.scalar(select(func.count()).select_from(AlarmEventAudit)), 0)
+            audits = list(session.scalars(select(AlarmEventAudit)))
+            self.assertGreater(len(audits), 0)
+            self.assertLessEqual(len(audits), 2)
+            self.assertTrue(all(row.payload_json == "{}" for row in audits))
+            self.assertTrue(all(row.provider_event_key for row in audits))
+            analytic = session.scalar(select(AlarmEvent))
+            raw = session.scalar(select(HowenAlarmRaw).where(HowenAlarmRaw.guid == "dms-1"))
+            self.assertIsNone(analytic.raw_payload)
+            self.assertIn('"alarmID": "dms-1"', raw.payload_json)
             self.assertEqual(session.scalar(select(func.count()).select_from(DailyMileageSnapshot)), 0)
             device = session.get(DeviceRecord, "device-1")
             self.assertIsNotNone(device)
@@ -399,6 +409,104 @@ class IngestionAlarmBatchTests(unittest.TestCase):
         self.assertEqual(retry.raw_updated, 2)
         self.assertEqual(retry.dms_inserted, 2)
         self.assertEqual(retry.dms_updated, 2)
+
+    def test_retention_compacts_payloads_and_preserves_pending_decisions(self) -> None:
+        now = utc_now().replace(microsecond=0)
+        old_live = now - timedelta(days=41)
+        old_decision = now - timedelta(days=91)
+        recent = now - timedelta(days=2)
+        with self.session_factory() as session:
+            session.add_all(
+                [
+                    HowenAlarmRaw(
+                        guid="old-raw",
+                        provider_event_key="provider-old",
+                        company_slug="test-company",
+                        device_id="device-1",
+                        source="harvest",
+                        occurred_at=old_live,
+                        received_at=old_live,
+                        payload_json='{"provider": "payload"}',
+                    ),
+                    HowenAlarmRaw(
+                        guid="recent-raw",
+                        provider_event_key="provider-recent",
+                        company_slug="test-company",
+                        device_id="device-1",
+                        source="harvest",
+                        occurred_at=recent,
+                        received_at=recent,
+                        payload_json='{"provider": "payload"}',
+                    ),
+                    AlarmEvent(
+                        guid="recent-raw",
+                        provider_event_key="provider-recent",
+                        company_slug="test-company",
+                        device_id="device-1",
+                        category="Ojos cerrados",
+                        occurred_at=recent,
+                        source="harvest",
+                        raw_payload='{"duplicate": true}',
+                    ),
+                    AlarmEventAudit(
+                        guid="recent-raw",
+                        company_slug="test-company",
+                        device_id="device-1",
+                        observed_at=recent,
+                        received_at=recent,
+                        stage="mapping_review_harvest",
+                        reason="unmapped",
+                        payload_json='{"duplicate": true}',
+                    ),
+                    IngestionAnomaly(
+                        source_type="harvest_alarm",
+                        device_id="device-1",
+                        company_slug="test-company",
+                        received_at=old_decision,
+                        reason="future_timestamp",
+                        payload_json="{}",
+                    ),
+                    ReconciliationReview(
+                        review_key="old-approved",
+                        company_slug="test-company",
+                        reason="manual_review",
+                        suggested_action="review_raw",
+                        review_status="approved",
+                        portal_payload_json="{}",
+                        decided_at=old_decision,
+                        created_at=old_decision,
+                    ),
+                    ReconciliationReview(
+                        review_key="old-pending",
+                        company_slug="test-company",
+                        reason="manual_review",
+                        suggested_action="review_raw",
+                        review_status="pending",
+                        portal_payload_json="{}",
+                        created_at=old_decision,
+                    ),
+                ]
+            )
+            session.commit()
+
+        counts = self.service.purge_retention(force=True)
+
+        with self.session_factory() as session:
+            self.assertIsNone(session.get(HowenAlarmRaw, "old-raw"))
+            self.assertIsNotNone(session.get(HowenAlarmRaw, "recent-raw"))
+            event = session.get(AlarmEvent, "recent-raw")
+            audit = session.scalar(select(AlarmEventAudit))
+            self.assertIsNone(event.raw_payload)
+            self.assertEqual(audit.provider_event_key, "provider-recent")
+            self.assertEqual(audit.payload_json, "{}")
+            self.assertEqual(session.scalar(select(func.count()).select_from(IngestionAnomaly)), 0)
+            reviews = set(session.scalars(select(ReconciliationReview.review_key)))
+            self.assertEqual(reviews, {"old-pending"})
+
+        self.assertEqual(counts["raw_events_deleted"], 1)
+        self.assertEqual(counts["analytic_payloads_compacted"], 1)
+        self.assertEqual(counts["audits_compacted"], 1)
+        self.assertEqual(counts["decisions_deleted"], 1)
 
 
 if __name__ == "__main__":

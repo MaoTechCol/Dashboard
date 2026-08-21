@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base
 from app.core.settings import Settings
-from app.models import AlarmEvent, HowenAlarmRaw, ReconciliationReview
+from app.models import AlarmEvent, HowenAlarmRaw, PublishedDashboardSnapshot, ReconciliationReview
 from app.schemas import CompanyBrand, CompanyConfig, DashboardRules
 from app.services.company_registry import CompanyRegistry
 from app.services.dashboard import DashboardService
@@ -214,6 +214,29 @@ class AdminDiagnosticFunnelTests(unittest.TestCase):
         self.assertEqual(len(page["items"]), 5)
         self.assertTrue(all(row["suggested_action"] == "review_raw" for row in page["items"]))
         self.assertTrue(all(row["reason"] == "mapping" for row in page["items"]))
+
+    def test_operational_recency_uses_the_last_published_visible_dms(self) -> None:
+        published_at = datetime(2026, 8, 21, 17, 45, tzinfo=timezone.utc)
+        with self.sessions() as session:
+            session.add(
+                PublishedDashboardSnapshot(
+                    company_slug="ismocol",
+                    cut_status="succeeded",
+                    published_cut_at=published_at,
+                    last_dms_published_at=published_at,
+                    snapshot_json="{}",
+                )
+            )
+            session.commit()
+
+        with self.sessions() as session:
+            recency = self.service._build_operational_recency(
+                session,
+                company=_company(),
+                reference_at=published_at + timedelta(minutes=10),
+            )
+
+        self.assertEqual(recency["last_visible_dms_at"], "2026-08-21T17:45:00Z")
 
 
 if __name__ == "__main__":

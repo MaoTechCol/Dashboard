@@ -904,6 +904,11 @@ class DashboardService:
 
         last_accepted_dms_at = ensure_utc(session.scalar(accepted_stmt))
         last_visible_dms_at = ensure_utc(session.scalar(visible_stmt))
+        publication = session.get(PublishedDashboardSnapshot, company.slug)
+        published_visible_at = ensure_utc(publication.last_dms_published_at) if publication else None
+        if published_visible_at and (last_visible_dms_at is None or published_visible_at > last_visible_dms_at):
+            # This is the authoritative timestamp for what the client actually sees.
+            last_visible_dms_at = published_visible_at
         last_raw_dms_at = ensure_utc(
             session.scalar(
                 select(func.max(func.coalesce(HowenAlarmRaw.occurred_at, HowenAlarmRaw.received_at))).where(
@@ -3966,7 +3971,8 @@ class DashboardService:
                     existing.latitude = normalized.latitude
                     existing.longitude = normalized.longitude
                     existing.total_mileage_km = normalized.total_mileage_km
-                    existing.raw_payload = json.dumps(normalized.raw, ensure_ascii=True)
+                    # The provider payload is stored once in HowenAlarmRaw.
+                    existing.raw_payload = None
                     raw_row.ingest_result = "inserted_alarm_event" if audit_reason == "inserted_from_portal" else "updated_alarm_event"
 
                     snapshot_date = occurred_at.astimezone(ZoneInfo(company.timezone or self.settings.default_timezone)).date()
@@ -4024,6 +4030,7 @@ class DashboardService:
                         stage="reconciliation",
                         reason=audit_reason,
                         payload=normalized.raw,
+                        provider_event_key=raw_row.provider_event_key,
                     )
             session.commit()
 
@@ -5229,6 +5236,7 @@ def _append_dashboard_audit(
     stage: str,
     reason: str,
     payload: dict[str, Any],
+    provider_event_key: str | None = None,
 ) -> None:
     if guid:
         existing = session.scalar(
@@ -5243,6 +5251,7 @@ def _append_dashboard_audit(
     session.add(
         AlarmEventAudit(
             guid=guid,
+            provider_event_key=provider_event_key,
             company_slug=company_slug,
             device_id=device_id,
             fleet_id=fleet_id,
@@ -5254,7 +5263,7 @@ def _append_dashboard_audit(
             raw_event_code=raw_event_code,
             stage=stage,
             reason=reason,
-            payload_json=json.dumps(payload, ensure_ascii=True),
+            payload_json="{}",
         )
     )
 

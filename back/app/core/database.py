@@ -177,6 +177,13 @@ def _run_compat_migrations() -> None:
             "alarm_events",
             ["company_slug", "occurred_at"],
         )
+    if "alarm_event_audit" in existing_tables:
+        _ensure_column("alarm_event_audit", "provider_event_key", "VARCHAR(255)")
+        _ensure_index(
+            "ix_alarm_event_audit_provider_event_key",
+            "alarm_event_audit",
+            ["provider_event_key"],
+        )
     if "howen_alarm_raw" in existing_tables:
         _ensure_column("howen_alarm_raw", "provider_event_key", "VARCHAR(255)")
         _ensure_column("howen_alarm_raw", "raw_event_time", "VARCHAR(128)")

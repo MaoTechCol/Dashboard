@@ -2236,7 +2236,7 @@ function AdminOperationsModule({
           }
           detail={
             overview?.backgroundJobs
-              ? `${overview.backgroundJobs.running} ejecutando · ${overview.backgroundJobs.queued} en espera · ${overview.backgroundJobs.failed} fallidos históricos${overview.backgroundJobs.stale_running ? ` · ${overview.backgroundJobs.stale_running} sin heartbeat` : ""}`
+              ? `${overview.backgroundJobs.running} ejecutando · ${overview.backgroundJobs.queued} en espera · ${overview.backgroundJobs.failed} fallidos históricos / mes${overview.backgroundJobs.stale_running ? ` · ${overview.backgroundJobs.stale_running} sin heartbeat` : ""}`
               : "Jobs persistidos con lease y reintentos"
           }
         />
@@ -3361,9 +3361,14 @@ function AdminAuditModule({
           detail="Persistidos para reglas y agregados"
         />
         <MetricCard
-          label="Episodios visibles"
+          label="Visibles en cliente"
+          value={activeWindowMetrics ? String(activeWindowMetrics.visible_raw_events) : loading ? "..." : "0"}
+          detail="Mismo total de Semana o Mes (30 dias) del dashboard cliente"
+        />
+        <MetricCard
+          label="Tarjetas visibles"
           value={activeWindowMetrics ? String(activeWindowMetrics.visible_episodes) : loading ? "..." : "0"}
-          detail="Tarjetas que recibe el dashboard cliente"
+          detail="Episodios agrupados que recibe el cliente"
         />
         <MetricCard
           label="Detecciones fusionadas"

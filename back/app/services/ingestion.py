@@ -2867,7 +2867,8 @@ class IngestionService:
                         "longitude": alarm.longitude,
                         "total_mileage_km": alarm.total_mileage_km,
                         "source": source,
-                        "raw_payload": row.payload_json,
+                        # The complete provider payload lives only in howen_alarm_raw.
+                        "raw_payload": None,
                     }
                     event_mappings.append(event_mapping)
                 elif not row.temporal_valid:
@@ -2950,6 +2951,7 @@ class IngestionService:
         alarm = row.alarm
         base = {
             "guid": alarm.guid,
+            "provider_event_key": row.provider_event_key,
             "company_slug": row.company_slug,
             "device_id": alarm.device_id,
             "fleet_id": row.fleet_id,
@@ -2959,16 +2961,17 @@ class IngestionService:
             "raw_alarm_type": alarm.raw_alarm_type,
             "raw_tp": alarm.raw_tp,
             "raw_event_code": alarm.raw_event_code,
-            "payload_json": row.payload_json,
+            "payload_json": "{}",
         }
-        output = [
-            {**base, "stage": f"classification_{source}", "reason": alarm.classification_status or "unknown"},
-            {**base, "stage": f"ingest_result_{source}", "reason": ingest_result},
-        ]
+        output: list[dict[str, Any]] = []
+        if alarm.classification_status == "unmapped" or (
+            alarm.classification_status == "classified_dms"
+            and (alarm.mapping_source or "unknown") == "unknown"
+        ):
+            output.append({**base, "stage": f"mapping_review_{source}", "reason": alarm.classification_status or "unknown"})
         if row.temporal_resolution:
-            output.insert(
-                1,
-                {**base, "stage": f"temporal_resolution_{source}", "reason": row.temporal_resolution},
+            output.append(
+                {**base, "stage": f"temporal_resolution_{source}", "reason": row.temporal_resolution}
             )
         if not row.temporal_valid:
             output.append({**base, "stage": f"{source}_alarm", "reason": "future_timestamp"})
@@ -3246,7 +3249,9 @@ class IngestionService:
                 existing_event.longitude = alarm.longitude
                 existing_event.total_mileage_km = alarm.total_mileage_km
                 existing_event.source = source if source == "harvest" or existing_event.source != "harvest" else existing_event.source
-                existing_event.raw_payload = json.dumps(alarm.raw, ensure_ascii=True)
+                # Keep only the normalized analytic columns here. The raw payload is
+                # retained once in HowenAlarmRaw and linked by provider_event_key.
+                existing_event.raw_payload = None
                 session.add(existing_event)
                 raw_ingest_result = "inserted_alarm_event" if inserted_alarm_event else "updated_alarm_event"
             elif not temporal_valid:
@@ -3259,22 +3264,27 @@ class IngestionService:
                 raw_ingest_result = "kept_raw_only"
 
             raw_row.ingest_result = raw_ingest_result
-            self._append_alarm_audit(
-                session,
-                guid=alarm.guid,
-                company_slug=company_slug,
-                device_id=alarm.device_id,
-                fleet_id=fleet_id,
-                plate_no=plate_no,
-                observed_at=occurred_at,
-                received_at=received_at,
-                raw_alarm_type=alarm.raw_alarm_type,
-                raw_tp=alarm.raw_tp,
-                raw_event_code=alarm.raw_event_code,
-                stage=f"classification_{source}",
-                reason=alarm.classification_status or "unknown",
-                payload=alarm.raw,
-            )
+            if alarm.classification_status == "unmapped" or (
+                alarm.classification_status == "classified_dms"
+                and (alarm.mapping_source or "unknown") == "unknown"
+            ):
+                self._append_alarm_audit(
+                    session,
+                    guid=alarm.guid,
+                    company_slug=company_slug,
+                    device_id=alarm.device_id,
+                    fleet_id=fleet_id,
+                    plate_no=plate_no,
+                    observed_at=occurred_at,
+                    received_at=received_at,
+                    raw_alarm_type=alarm.raw_alarm_type,
+                    raw_tp=alarm.raw_tp,
+                    raw_event_code=alarm.raw_event_code,
+                    stage=f"mapping_review_{source}",
+                    reason=alarm.classification_status or "unknown",
+                    payload=alarm.raw,
+                    provider_event_key=provider_event_key,
+                )
             if temporal_resolution:
                 self._append_alarm_audit(
                     session,
@@ -3291,23 +3301,26 @@ class IngestionService:
                     stage=f"temporal_resolution_{source}",
                     reason=temporal_resolution,
                     payload=alarm.raw,
+                    provider_event_key=provider_event_key,
                 )
-            self._append_alarm_audit(
-                session,
-                guid=alarm.guid,
-                company_slug=company_slug,
-                device_id=alarm.device_id,
-                fleet_id=fleet_id,
-                plate_no=plate_no,
-                observed_at=occurred_at,
-                received_at=received_at,
-                raw_alarm_type=alarm.raw_alarm_type,
-                raw_tp=alarm.raw_tp,
-                raw_event_code=alarm.raw_event_code,
-                stage=f"ingest_result_{source}",
-                reason=raw_ingest_result,
-                payload=alarm.raw,
-            )
+            if not temporal_valid:
+                self._append_alarm_audit(
+                    session,
+                    guid=alarm.guid,
+                    company_slug=company_slug,
+                    device_id=alarm.device_id,
+                    fleet_id=fleet_id,
+                    plate_no=plate_no,
+                    observed_at=occurred_at,
+                    received_at=received_at,
+                    raw_alarm_type=alarm.raw_alarm_type,
+                    raw_tp=alarm.raw_tp,
+                    raw_event_code=alarm.raw_event_code,
+                    stage=f"{source}_alarm",
+                    reason="future_timestamp",
+                    payload=alarm.raw,
+                    provider_event_key=provider_event_key,
+                )
 
             if inserted_alarm_event and alarm.total_mileage_km is not None:
                 snapshot = session.scalar(
@@ -3585,6 +3598,7 @@ class IngestionService:
         stage: str,
         reason: str,
         payload: dict[str, Any],
+        provider_event_key: str | None = None,
     ) -> None:
         if guid:
             existing = session.scalar(
@@ -3600,6 +3614,7 @@ class IngestionService:
         audit_payload = {
             "id": self._next_serial_id(session, "alarm_event_audit"),
             "guid": guid,
+            "provider_event_key": provider_event_key,
             "company_slug": company_slug,
             "device_id": device_id,
             "fleet_id": fleet_id,
@@ -3611,7 +3626,7 @@ class IngestionService:
             "raw_event_code": raw_event_code,
             "stage": stage,
             "reason": reason,
-            "payload_json": json.dumps(payload, ensure_ascii=True),
+            "payload_json": "{}",
         }
         if bind is not None and bind.dialect.name.startswith("postgres"):
             session.execute(
@@ -3620,6 +3635,7 @@ class IngestionService:
                     INSERT INTO alarm_event_audit (
                         id,
                         guid,
+                        provider_event_key,
                         company_slug,
                         device_id,
                         fleet_id,
@@ -3635,6 +3651,7 @@ class IngestionService:
                     ) VALUES (
                         :id,
                         :guid,
+                        :provider_event_key,
                         :company_slug,
                         :device_id,
                         :fleet_id,
@@ -3665,21 +3682,85 @@ class IngestionService:
             {"table_name": table_name},
         ).scalar_one()
 
-    async def _purge_if_needed(self) -> None:
+    def purge_retention(self, *, force: bool = False) -> dict[str, int]:
         now = utc_now()
-        if self._last_purge_at and now - self._last_purge_at < timedelta(hours=1):
-            return
+        if not force and getattr(self, "_last_purge_at", None) and now - self._last_purge_at < timedelta(hours=1):
+            return {"skipped": 1}
         live_cutoff = now - timedelta(days=self.settings.live_retention_days)
         anomaly_cutoff = now - timedelta(days=self.settings.anomaly_retention_days)
+        counts: dict[str, int] = {}
         with self.session_factory() as session:
-            session.execute(delete(AlarmEvent).where(AlarmEvent.occurred_at < live_cutoff))
-            session.execute(delete(HowenAlarmRaw).where(HowenAlarmRaw.received_at < live_cutoff))
-            session.execute(delete(MileageReading).where(MileageReading.recorded_at < live_cutoff))
-            session.execute(delete(DailyMileageSnapshot).where(DailyMileageSnapshot.observed_at < live_cutoff))
-            session.execute(delete(IngestionAnomaly).where(IngestionAnomaly.received_at < anomaly_cutoff))
-            session.execute(delete(AlarmEventAudit).where(AlarmEventAudit.received_at < anomaly_cutoff))
+            raw_key = (
+                select(HowenAlarmRaw.provider_event_key)
+                .where(HowenAlarmRaw.guid == AlarmEventAudit.guid)
+                .limit(1)
+                .scalar_subquery()
+            )
+            linked_audits = session.execute(
+                update(AlarmEventAudit)
+                .where(
+                    AlarmEventAudit.provider_event_key.is_(None),
+                    AlarmEventAudit.guid.is_not(None),
+                )
+                .values(provider_event_key=raw_key)
+            )
+            counts["audits_linked"] = max(int(linked_audits.rowcount or 0), 0)
+
+            compacted_audits = session.execute(
+                update(AlarmEventAudit)
+                .where(AlarmEventAudit.payload_json != "{}")
+                .values(payload_json="{}")
+            )
+            counts["audits_compacted"] = max(int(compacted_audits.rowcount or 0), 0)
+
+            raw_exists = (
+                select(HowenAlarmRaw.guid)
+                .where(
+                    or_(
+                        HowenAlarmRaw.guid == AlarmEvent.guid,
+                        and_(
+                            AlarmEvent.provider_event_key.is_not(None),
+                            HowenAlarmRaw.provider_event_key == AlarmEvent.provider_event_key,
+                        ),
+                    )
+                )
+                .exists()
+            )
+            compacted_events = session.execute(
+                update(AlarmEvent)
+                .where(AlarmEvent.raw_payload.is_not(None), raw_exists)
+                .values(raw_payload=None)
+            )
+            counts["analytic_payloads_compacted"] = max(int(compacted_events.rowcount or 0), 0)
+
+            delete_statements = {
+                "alarm_events_deleted": delete(AlarmEvent).where(AlarmEvent.occurred_at < live_cutoff),
+                "raw_events_deleted": delete(HowenAlarmRaw).where(HowenAlarmRaw.received_at < live_cutoff),
+                "mileage_readings_deleted": delete(MileageReading).where(MileageReading.recorded_at < live_cutoff),
+                "daily_snapshots_deleted": delete(DailyMileageSnapshot).where(DailyMileageSnapshot.observed_at < live_cutoff),
+                "anomalies_deleted": delete(IngestionAnomaly).where(IngestionAnomaly.received_at < anomaly_cutoff),
+                "audits_deleted": delete(AlarmEventAudit).where(AlarmEventAudit.received_at < anomaly_cutoff),
+                "decisions_deleted": delete(ReconciliationReview).where(
+                    ReconciliationReview.review_status.in_(("approved", "discarded")),
+                    ReconciliationReview.decided_at.is_not(None),
+                    ReconciliationReview.decided_at < anomaly_cutoff,
+                ),
+            }
+            for key, statement in delete_statements.items():
+                result = session.execute(statement)
+                counts[key] = max(int(result.rowcount or 0), 0)
             session.commit()
         self._last_purge_at = now
+        logger.info(
+            "retention_completed live_days=%s decision_days=%s counts=%s",
+            self.settings.live_retention_days,
+            self.settings.anomaly_retention_days,
+            counts,
+        )
+        return counts
+
+    async def _purge_if_needed(self) -> None:
+        await asyncio.to_thread(self.purge_retention)
 
     def _should_sync_devices(self) -> bool:
         if not self._last_device_sync_at:
