@@ -950,6 +950,11 @@ class IngestionService:
                             result.review_cases += 1
                         continue
 
+                    self._resolve_obsolete_km_reviews(
+                        session,
+                        device_id=device_id,
+                        snapshot_date=snapshot_date,
+                    )
                     if snapshot and snapshot.excluded_at is not None:
                         continue
                     if snapshot and snapshot.source == "manual_repair":
@@ -1089,6 +1094,32 @@ class IngestionService:
             )
         )
         return True
+
+    def _resolve_obsolete_km_reviews(
+        self,
+        session: Any,
+        *,
+        device_id: str,
+        snapshot_date: date,
+    ) -> None:
+        prefix = f"km:{device_id}:{snapshot_date.isoformat()}:%"
+        reviews = session.scalars(
+            select(ReconciliationReview).where(
+                ReconciliationReview.review_key.like(prefix),
+                ReconciliationReview.review_status == "pending",
+            )
+        )
+        resolved_at = utc_now()
+        for review in reviews:
+            review.review_status = "resolved"
+            review.decision_note = (
+                "La reconstruccion autoritativa posterior obtuvo kilometraje valido; "
+                "la excepcion anterior quedo obsoleta."
+            )
+            review.decided_by = "system"
+            review.decided_at = resolved_at
+            review.applied_at = resolved_at
+            session.add(review)
 
     async def rebuild_historical_window(
         self,

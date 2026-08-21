@@ -123,6 +123,36 @@ class AuthoritativeMileageTests(unittest.TestCase):
         self.assertEqual(values[date(2026, 8, 20)][0], 243.41)
         self.assertEqual(values[date(2026, 8, 21)][0], 3.03)
 
+    def test_valid_rebuild_resolves_an_obsolete_pending_km_review(self) -> None:
+        with self.session_factory() as session:
+            session.add(
+                ReconciliationReview(
+                    review_key="km:867869064064439:2026-08-20:impossible_day_distance",
+                    company_slug="comerpolsas",
+                    device_id="867869064064439",
+                    reason="impossible_day_distance",
+                    portal_payload_json="{}",
+                )
+            )
+            session.commit()
+
+        asyncio.run(
+            self.service.rebuild_authoritative_mileage(
+                company_slug="comerpolsas",
+                start_date_local=date(2026, 8, 20),
+                end_date_local=date(2026, 8, 20),
+                company_tz=ZoneInfo("America/Bogota"),
+                device_ids=["867869064064439"],
+                rebuild_job_id=None,
+            )
+        )
+
+        with self.session_factory() as session:
+            review = session.scalar(select(ReconciliationReview))
+
+        self.assertEqual(review.review_status, "resolved")
+        self.assertEqual(review.decided_by, "system")
+
 
 if __name__ == "__main__":
     unittest.main()
