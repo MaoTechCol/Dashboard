@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone as datetime_timezone
 import json
 from pathlib import Path
+import re
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -55,7 +56,33 @@ def _utc_second(value: datetime | None, timezone: ZoneInfo) -> datetime | None:
         return None
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone)
-    return ensure_utc(value).replace(microsecond=0)
+    return value.astimezone(datetime_timezone.utc).replace(microsecond=0)
+
+
+def _as_km(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return round(float(value), 3)
+    raw = _text(value).lower().replace("km", "").replace(" ", "")
+    if not raw:
+        return None
+    if "," in raw and "." in raw:
+        raw = raw.replace(",", "")
+    elif "," in raw:
+        raw = raw.replace(",", ".")
+    try:
+        return round(float(raw), 3)
+    except ValueError:
+        return None
+
+
+def _export_date_from_filename(path: Path) -> date | None:
+    match = re.search(r"(20\d{6})", path.stem)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
 
 
 def _event_key(device_id: Any, category: Any, occurred_at: datetime | None) -> tuple[str, str, str] | None:
@@ -96,6 +123,7 @@ def read_alarm_export(path: Path, *, fleet_name: str | None, timezone: ZoneInfo)
     categories: Counter[str] = Counter()
     observed: list[datetime] = []
     fleet_values: Counter[str] = Counter()
+    records_by_primary: dict[tuple[str, str, str], set[tuple[str, str, str]]] = {}
     for row in rows:
         fleet = _text(row[positions["Fleet"]]) if "Fleet" in positions else ""
         if fleet_name and fleet.lower() != fleet_name.strip().lower():
@@ -113,6 +141,20 @@ def read_alarm_export(path: Path, *, fleet_name: str | None, timezone: ZoneInfo)
             continue
         dms_rows += 1
         counter[key] += 1
+        candidate_keys = records_by_primary.setdefault(key, {key})
+        for column_name, candidate_timezone in (
+            ("End Time", timezone),
+            ("Reporting time", ZoneInfo("UTC")),
+            ("Reporting Time", ZoneInfo("UTC")),
+            ("Reporting time", timezone),
+            ("Reporting Time", timezone),
+        ):
+            if column_name not in positions:
+                continue
+            candidate_at = _utc_second(_as_datetime(row[positions[column_name]]), candidate_timezone)
+            candidate_key = _event_key(row[positions["Device ID"]], category, candidate_at)
+            if candidate_key is not None:
+                candidate_keys.add(candidate_key)
         categories[category] += 1
         observed.append(occurred_at)
     workbook.close()
@@ -127,6 +169,10 @@ def read_alarm_export(path: Path, *, fleet_name: str | None, timezone: ZoneInfo)
         "range_start": min(observed),
         "range_end": max(observed) + timedelta(seconds=1),
         "counter": counter,
+        "records": [
+            {"primary_key": primary, "candidate_keys": tuple(sorted(candidates))}
+            for primary, candidates in records_by_primary.items()
+        ],
         "categories": dict(categories),
         "fleets": dict(fleet_values),
     }
@@ -139,13 +185,20 @@ def read_mileage_export(path: Path, *, fleet_name: str | None) -> dict[str, Any]
     headers = list(next(rows))
     names = [_text(value) for value in headers]
     positions = {name: index for index, name in enumerate(names)}
+    if {"Device No.", "Begin Time", "End Time"}.issubset(positions):
+        return _read_mileage_record_rows(workbook, rows, positions, path=path, fleet_name=fleet_name)
     required = {"Device ID", "Total"}
     missing = sorted(required - positions.keys())
     if missing:
+        workbook.close()
         raise ValueError(f"Mileage export is missing columns: {', '.join(missing)}")
     date_columns: list[tuple[int, date]] = []
+    has_monthly_column = False
     for index, value in enumerate(headers):
         parsed = _as_datetime(value)
+        if parsed is None and re.fullmatch(r"20\d{2}-\d{2}", _text(value)):
+            parsed = datetime.strptime(_text(value), "%Y-%m")
+            has_monthly_column = True
         if parsed is not None and index > positions["Total"]:
             date_columns.append((index, parsed.date()))
     if not date_columns:
@@ -160,30 +213,113 @@ def read_mileage_export(path: Path, *, fleet_name: str | None) -> dict[str, Any]
         device_id = _text(row[positions["Device ID"]])
         if not device_id:
             continue
-        total_value = row[positions["Total"]]
-        try:
-            total_km = float(total_value)
-        except (TypeError, ValueError):
+        total_km = _as_km(row[positions["Total"]])
+        if total_km is None:
             continue
         by_device[device_id] = round(total_km, 3)
         daily_by_device[device_id] = {}
         for index, day in date_columns:
             raw = row[index]
-            try:
-                value = round(float(raw), 3) if raw is not None else None
-            except (TypeError, ValueError):
-                value = None
+            value = _as_km(raw)
             daily_by_device[device_id][day.isoformat()] = value
     workbook.close()
+    range_end = max(day for _, day in date_columns)
+    export_date = _export_date_from_filename(path)
+    if has_monthly_column and export_date is not None and export_date >= range_end:
+        range_end = export_date
     return {
         "path": str(path),
         "range_start": min(day for _, day in date_columns),
-        "range_end": max(day for _, day in date_columns),
+        "range_end": range_end,
         "device_count": len(by_device),
         "total_km": round(sum(by_device.values()), 3),
         "by_device": by_device,
         "daily_by_device": daily_by_device,
+        "format": "monthly_summary" if has_monthly_column else "daily_summary",
     }
+
+
+def _read_mileage_record_rows(
+    workbook,
+    rows,
+    positions: dict[str, int],
+    *,
+    path: Path,
+    fleet_name: str | None,
+) -> dict[str, Any]:
+    by_device: Counter[str] = Counter()
+    daily_by_device: dict[str, dict[str, float | None]] = {}
+    observed_days: list[date] = []
+    negative_rows: list[dict[str, Any]] = []
+    for row in rows:
+        fleet = _text(row[positions["Fleet"]]) if "Fleet" in positions else ""
+        if fleet_name and fleet.lower() != fleet_name.strip().lower():
+            continue
+        device_id = _text(row[positions["Device No."]])
+        begin_at = _as_datetime(row[positions["Begin Time"]])
+        end_at = _as_datetime(row[positions["End Time"]])
+        if not device_id or (begin_at is None and end_at is None):
+            continue
+        start_km = _as_km(row[positions["Start mileage"]]) if "Start mileage" in positions else None
+        end_km = _as_km(row[positions["End mileage"]]) if "End mileage" in positions else None
+        reported_km = _as_km(row[positions["Driving distance"]]) if "Driving distance" in positions else None
+        distance_km = round(end_km - start_km, 3) if start_km is not None and end_km is not None else reported_km
+        if distance_km is None:
+            continue
+        day = (end_at or begin_at).date()
+        if distance_km < 0:
+            negative_rows.append(
+                {
+                    "device_id": device_id,
+                    "day": day.isoformat(),
+                    "start_km": start_km,
+                    "end_km": end_km,
+                    "distance_km": distance_km,
+                }
+            )
+        observed_days.append(day)
+        by_device[device_id] += distance_km
+        device_days = daily_by_device.setdefault(device_id, {})
+        device_days[day.isoformat()] = round(float(device_days.get(day.isoformat()) or 0.0) + distance_km, 3)
+    workbook.close()
+    if not observed_days:
+        raise ValueError("Mileage record export does not contain rows for the selected fleet")
+    return {
+        "path": str(path),
+        "range_start": min(observed_days),
+        "range_end": max(observed_days),
+        "device_count": len(by_device),
+        "total_km": round(sum(by_device.values()), 3),
+        "by_device": {device_id: round(value, 3) for device_id, value in by_device.items()},
+        "daily_by_device": daily_by_device,
+        "format": "mileage_record_odometer_delta",
+        "negative_rows": negative_rows,
+    }
+
+
+def _match_provider_records(
+    records: list[dict[str, Any]],
+    local_counter: Counter[tuple[str, str, str]],
+) -> tuple[list[dict[str, Any]], Counter[tuple[str, str, str]], int]:
+    remaining = local_counter.copy()
+    missing: Counter[tuple[str, str, str]] = Counter()
+    alternate_matches = 0
+    for record in records:
+        primary = record["primary_key"]
+        matched = None
+        for candidate in record["candidate_keys"]:
+            if remaining[candidate] > 0:
+                matched = candidate
+                break
+        if matched is None:
+            missing[primary] += 1
+            continue
+        remaining[matched] -= 1
+        if remaining[matched] <= 0:
+            del remaining[matched]
+        if matched != primary:
+            alternate_matches += 1
+    return _counter_difference(missing, Counter()), remaining, alternate_matches
 
 
 def certify(
@@ -245,10 +381,14 @@ def certify(
             if key is not None:
                 analytic_counter[key] += 1
 
-        provider_counter = alarm_export["counter"]
-        missing_raw = _counter_difference(provider_counter, raw_counter)
-        extra_raw = _counter_difference(raw_counter, provider_counter)
-        missing_analytic = _counter_difference(provider_counter, analytic_counter)
+        provider_records = alarm_export["records"]
+        missing_raw, remaining_raw, alternate_raw_matches = _match_provider_records(provider_records, raw_counter)
+        missing_analytic, remaining_analytic, alternate_analytic_matches = _match_provider_records(
+            provider_records,
+            analytic_counter,
+        )
+        extra_raw = _counter_difference(remaining_raw, Counter())
+        extra_analytic = _counter_difference(remaining_analytic, Counter())
         status_counts = Counter(review.review_status for review in reviews)
         result["alarms"] = {
             "source_file": alarm_export["path"],
@@ -268,7 +408,10 @@ def certify(
             "missing_from_local_raw": missing_raw,
             "extra_in_local_raw": extra_raw,
             "missing_from_analytic": missing_analytic,
-            "unexplained_alarm_count": sum(item["count"] for item in missing_raw),
+            "extra_in_analytic": extra_analytic,
+            "provider_time_normalized_raw_matches": alternate_raw_matches,
+            "provider_time_normalized_analytic_matches": alternate_analytic_matches,
+            "unexplained_alarm_count": sum(item["count"] for item in missing_raw + extra_raw),
         }
 
     if mileage_export:
@@ -321,6 +464,7 @@ def certify(
         difference_pct = round(abs(local_total - provider_total) / provider_total * 100, 4) if provider_total else None
         result["mileage"] = {
             "source_file": mileage_export["path"],
+            "source_format": mileage_export["format"],
             "range_start": start_date.isoformat(),
             "range_end": end_date.isoformat(),
             "provider_device_count": mileage_export["device_count"],
@@ -360,7 +504,21 @@ def main() -> None:
         seed_path=settings.company_seed_config_path,
         session_factory=SessionLocal,
     )
-    company = registry.get(args.company)
+    try:
+        company = registry.get(args.company)
+    except KeyError as exc:
+        result = {
+            "company_slug": args.company,
+            "generated_at": utc_now().isoformat(),
+            "status": "blocked",
+            "reason": "company_not_registered",
+            "message": str(exc),
+        }
+        output = args.output or Path("storage") / "certifications" / f"{args.company}-blocked.json"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(json.dumps({"status": "blocked", "output": str(output)}, ensure_ascii=False))
+        return
     timezone = ZoneInfo(company.timezone or settings.default_timezone)
     alarm_export = (
         read_alarm_export(args.alarm_file, fleet_name=args.fleet_name, timezone=timezone)
