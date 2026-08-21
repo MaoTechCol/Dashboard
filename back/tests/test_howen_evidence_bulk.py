@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -116,7 +117,7 @@ class HowenEvidenceBulkTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EvidencePartitionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_partitions_company_result_by_device(self) -> None:
+    def _service(self) -> IngestionService:
         service = IngestionService.__new__(IngestionService)
         service.howen = SimpleNamespace(
             fetch_evidence_alarms_authorized=AsyncMock(
@@ -127,11 +128,25 @@ class EvidencePartitionTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
         )
+        companies = [
+            SimpleNamespace(slug="alpha"),
+            SimpleNamespace(slug="beta"),
+        ]
+        service.registry = SimpleNamespace(
+            all=lambda: companies,
+            is_operational=lambda company: True,
+        )
+        service._list_company_device_ids = lambda slug: ["1"] if slug == "alpha" else ["2"]
+        service._evidence_fetch_tasks = {}
         service._historical_window_for_device = lambda **kwargs: (
             kwargs["start_at"],
             kwargs["end_at"],
         )
         service._record_normalization_failure = AsyncMock()
+        return service
+
+    async def test_partitions_company_result_by_device(self) -> None:
+        service = self._service()
 
         grouped = await service._fetch_evidence_harvest_rows(
             device_ids=["1", "2"],
@@ -141,6 +156,28 @@ class EvidencePartitionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([row["alarmGuid"] for row in grouped["1"]], ["a", "c"])
         self.assertEqual([row["alarmGuid"] for row in grouped["2"]], ["b"])
+
+    async def test_companies_share_one_account_fetch_for_the_same_cut(self) -> None:
+        service = self._service()
+        start_at = datetime(2026, 8, 21, 10, 0, tzinfo=ZoneInfo("UTC"))
+        end_at = datetime(2026, 8, 21, 10, 30, tzinfo=ZoneInfo("UTC"))
+
+        alpha, beta = await asyncio.gather(
+            service._fetch_evidence_harvest_rows(
+                device_ids=["1"],
+                start_at=start_at,
+                end_at=end_at,
+            ),
+            service._fetch_evidence_harvest_rows(
+                device_ids=["2"],
+                start_at=start_at,
+                end_at=end_at,
+            ),
+        )
+
+        self.assertEqual(service.howen.fetch_evidence_alarms_authorized.await_count, 1)
+        self.assertEqual([row["alarmGuid"] for row in alpha["1"]], ["a", "c"])
+        self.assertEqual([row["alarmGuid"] for row in beta["2"]], ["b"])
 
 
 if __name__ == "__main__":

@@ -157,6 +157,7 @@ class IngestionService:
         self._harvest_locks: dict[str, asyncio.Lock] = {}
         self._cut_publish_locks: dict[datetime, asyncio.Lock] = {}
         self._historical_rebuild_tasks: dict[int, asyncio.Task[Any]] = {}
+        self._evidence_fetch_tasks: dict[tuple[str, str], asyncio.Task[list[dict[str, Any]]]] = {}
 
     def _historical_rebuild_max_concurrency(self) -> int:
         return max(int(getattr(self.settings, "historical_rebuild_max_concurrency", 1) or 1), 1)
@@ -237,6 +238,7 @@ class IngestionService:
                 self._publisher_task,
                 self._harvest_task,
                 *self._historical_rebuild_tasks.values(),
+                *self._evidence_fetch_tasks.values(),
             )
             if task
         ]
@@ -253,6 +255,7 @@ class IngestionService:
             self._publisher_task = None
             self._harvest_task = None
             self._historical_rebuild_tasks.clear()
+            self._evidence_fetch_tasks.clear()
 
     def critical_runtime_tasks(self) -> tuple[asyncio.Task[None], ...]:
         return tuple(
@@ -1615,17 +1618,52 @@ class IngestionService:
     ) -> dict[str, list[dict[str, Any]]]:
         if not device_ids:
             return {}
+        account_device_ids = sorted(
+            {
+                device_id
+                for company in self.registry.all()
+                if self.registry.is_operational(company)
+                for device_id in self._list_company_device_ids(company.slug)
+            }
+        )
+        if not account_device_ids:
+            account_device_ids = list(device_ids)
         local_start_at, local_end_at = self._historical_window_for_device(
-            device_id=device_ids[0],
+            device_id=account_device_ids[0],
             start_at=start_at,
             end_at=end_at,
         )
-        rows = await self.howen.fetch_evidence_alarms_authorized(
-            device_ids=device_ids,
-            start_at=local_start_at,
-            end_at=local_end_at,
-            force_login=False,
-        )
+        cache_key = (local_start_at.isoformat(), local_end_at.isoformat())
+        fetch_task = self._evidence_fetch_tasks.get(cache_key)
+        if fetch_task is None:
+            fetch_task = asyncio.create_task(
+                self.howen.fetch_evidence_alarms_authorized(
+                    device_ids=account_device_ids,
+                    start_at=local_start_at,
+                    end_at=local_end_at,
+                    force_login=False,
+                ),
+                name=f"howen-evidence-{local_end_at.isoformat()}",
+            )
+            self._evidence_fetch_tasks[cache_key] = fetch_task
+            logger.info(
+                "harvest_evidence_account_fetch window_end=%s devices=%s",
+                local_end_at.isoformat(),
+                len(account_device_ids),
+            )
+            completed_keys = [
+                key
+                for key, task in self._evidence_fetch_tasks.items()
+                if key != cache_key and task.done()
+            ]
+            for stale_key in completed_keys[:-7]:
+                self._evidence_fetch_tasks.pop(stale_key, None)
+        try:
+            rows = await asyncio.shield(fetch_task)
+        except Exception:
+            if self._evidence_fetch_tasks.get(cache_key) is fetch_task:
+                self._evidence_fetch_tasks.pop(cache_key, None)
+            raise
         expected_ids = set(device_ids)
         grouped: dict[str, list[dict[str, Any]]] = {device_id: [] for device_id in device_ids}
         for row in rows:
