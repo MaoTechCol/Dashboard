@@ -3131,15 +3131,21 @@ function AdminAuditModule({
 
   const refreshDiagnostic = useCallback(
     async (syncQueue = true) => {
-      await Promise.all([
+      const loadCurrentAudit = () =>
         loadAudit({
           windowMode: selectedWindowMode,
           background: false,
           includeKm: true,
           applyCurrent: true,
-        }),
-        loadReviewPage({ syncQueue }),
-      ]);
+        });
+
+      if (syncQueue) {
+        // The funnel must be calculated after the manual review queue is current.
+        await loadReviewPage({ syncQueue: true });
+        await loadCurrentAudit();
+      } else {
+        await Promise.all([loadCurrentAudit(), loadReviewPage()]);
+      }
       if (detailOpen) {
         setLoadedDetailKey(null);
         await loadAuditDetails();
