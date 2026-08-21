@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import shutil
 from contextlib import suppress
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.time import as_timezone, ensure_utc, parse_timestamp, to_local_date, utc_now
-from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestDevice, AlarmHarvestRun, BackgroundJob, CatchupCursor, CompanyHistoricalRebuildJob, CompanyLifecycleAudit, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, MileageObservation, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset
+from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestDevice, AlarmHarvestRun, BackgroundJob, CatchupCursor, CompanyHistoricalRebuildJob, CompanyLifecycleAudit, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, ManagedCompany, MileageObservation, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset, UserAccount
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, NormalizedAlarm, NormalizedStatus
 from app.services.company_registry import CompanyRegistry
 from app.services.dashboard import DashboardService
@@ -1536,6 +1537,8 @@ class IngestionService:
             audit_id = audit.id
 
         model_filters: list[tuple[str, Any, Any]] = [
+            ("managed_companies", ManagedCompany, ManagedCompany.slug == company_slug),
+            ("user_accounts", UserAccount, UserAccount.company_slug == company_slug),
             ("devices", DeviceRecord, self._build_company_scope_filter(
                 company_slug=company_slug,
                 company_column=DeviceRecord.company_slug,
@@ -1583,6 +1586,7 @@ class IngestionService:
                                 "data": payload,
                             }, ensure_ascii=True, default=str) + "\n")
                             row_count += 1
+            os.chmod(backup_path, 0o600)
             company_upload_dir = self.settings.upload_dir / company_slug
             if company_upload_dir.exists():
                 files_archive_base = backup_dir / (
@@ -1593,6 +1597,7 @@ class IngestionService:
                     "gztar",
                     root_dir=company_upload_dir,
                 )
+                os.chmod(files_backup_path, 0o600)
             digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
             with self.session_factory() as session:
                 audit = session.get(CompanyLifecycleAudit, audit_id)
