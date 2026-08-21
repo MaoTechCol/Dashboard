@@ -237,6 +237,7 @@ class DashboardService:
                     .options(
                         load_only(
                             AlarmEvent.guid,
+                            AlarmEvent.provider_event_key,
                             AlarmEvent.device_id,
                             AlarmEvent.plate_no,
                             AlarmEvent.company_slug,
@@ -245,6 +246,10 @@ class DashboardService:
                             AlarmEvent.category,
                             AlarmEvent.subtype,
                             AlarmEvent.classification_status,
+                            AlarmEvent.raw_alarm_type,
+                            AlarmEvent.raw_tp,
+                            AlarmEvent.raw_event_code,
+                            AlarmEvent.raw_event_time,
                             AlarmEvent.occurred_at,
                             AlarmEvent.start_at,
                             AlarmEvent.end_at,
@@ -2470,7 +2475,16 @@ class DashboardService:
                 review.suggested_action = "review_visibility"
                 review.source_job_id = None
                 review.source_window_type = "calendar_month_local"
-                review.portal_payload_json = event.raw_payload or "{}"
+                review.portal_payload_json = json.dumps(
+                    {
+                        "provider_event_key": event.provider_event_key,
+                        "guid": event.guid,
+                        "device_id": event.device_id,
+                        "category": event.category,
+                        "subtype": event.subtype,
+                    },
+                    ensure_ascii=True,
+                )
                 session.add(review)
             session.commit()
 

@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from zoneinfo import ZoneInfo
 
-from app.models import AlarmEvent
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.core.database import Base
+from app.core.settings import Settings
+from app.models import AlarmEvent, ReconciliationReview
 from app.schemas import CompanyBrand, CompanyConfig, DashboardRules
-from app.services.dashboard import _build_recent_episode_analysis
+from app.services.company_registry import CompanyRegistry
+from app.services.dashboard import DashboardService, _build_recent_episode_analysis
 
 
 TZ = ZoneInfo("America/Bogota")
@@ -127,6 +137,67 @@ class DashboardN2RuleTests(unittest.TestCase):
         self.assertEqual(len(result["episodes"]), 1)
         self.assertEqual(result["episodes"][0]["category"], "Fatiga en progresion")
         self.assertEqual(result["episodes"][0]["guid_count"], 2)
+
+    def test_materialized_snapshot_persists_suppressed_review_after_session_closes(self) -> None:
+        engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+            future=True,
+        )
+        Base.metadata.create_all(engine)
+        sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=True, future=True)
+        reference_at = datetime(2026, 8, 20, 18, 0, tzinfo=timezone.utc)
+
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "companies.json"
+            config_path.write_text(
+                json.dumps([company().model_dump(mode="json")]),
+                encoding="utf-8",
+            )
+            registry = CompanyRegistry(config_path)
+            service = DashboardService(
+                session_factory=sessions,
+                registry=registry,
+                settings=Settings(_env_file=None),
+            )
+            with sessions() as session:
+                session.add(
+                    AlarmEvent(
+                        guid="detached-review",
+                        provider_event_key="provider-detached-review",
+                        device_id="device-1",
+                        plate_no="ABC123",
+                        company_slug="ismocol",
+                        category="Distraccion",
+                        subtype="Distraccion",
+                        classification_status="classified_dms",
+                        raw_alarm_type="Distracted Driving",
+                        raw_tp="65",
+                        raw_event_code="130",
+                        raw_event_time="2026-08-20 13:00:00",
+                        occurred_at=reference_at - timedelta(hours=1),
+                        received_at=reference_at - timedelta(hours=1),
+                        source="harvest",
+                    )
+                )
+                session.commit()
+
+            service.build_snapshot(
+                "ismocol",
+                force_recompute=True,
+                published_cut_at=reference_at,
+            )
+
+            with sessions() as session:
+                review = session.scalar(
+                    select(ReconciliationReview).where(
+                        ReconciliationReview.review_key == "suppressed:detached-review"
+                    )
+                )
+                self.assertIsNotNone(review)
+                self.assertEqual(review.reason, "distraction_below_3x_fleet_average")
+                self.assertIn("provider-detached-review", review.portal_payload_json)
 
 
 if __name__ == "__main__":
