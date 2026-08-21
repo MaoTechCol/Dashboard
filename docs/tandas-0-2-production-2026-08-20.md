@@ -28,6 +28,9 @@
 - Successful devices are retained across retries.
 - Provider throttling schedules a retry and releases the worker for another company.
 - Manual refreshes are coalesced with the active cut whenever possible.
+- A newer operational cut supersedes older queued manual refreshes. The worker also
+  rejects stale refreshes at execution time, and publication metadata is monotonic,
+  so an old request can never move the visible cut backwards.
 - `/api/healthz` is DB-free. `/api/readyz` uses a short PostgreSQL statement timeout.
 - API and worker use systemd readiness notifications, watchdogs, restart throttling,
   memory limits and the existing 2 GB swap file.
@@ -84,7 +87,8 @@ application data or code.
 - Baseline tag: `v1-pre-batch`.
 - API/worker baseline tag: `v1-api-worker-20260820.1`.
 - Tandas 0-2 code tag: `v1-tanda-0-2`.
-- Certified backup/restore marker: `v1-tanda-0-2-certified`.
+- Certified backup/restore and monotonic-cut marker:
+  `v1-tanda-0-2-certified.1`.
 - Restore source: the off-host and Droplet copies of `20260820T171446Z`.
 - Immediate application rollback: deploy the desired tag and restart
   `dashboard-api.service` and `dashboard-worker.service`.
