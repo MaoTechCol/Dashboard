@@ -253,6 +253,29 @@ def test_manual_refresh_reuses_covering_harvest() -> None:
     assert refresh["reused_for_refresh"] is True
 
 
+def test_newer_harvest_supersedes_older_queued_refresh() -> None:
+    queue, session_factory = _queue()
+    old_cut = utc_now().replace(second=0, microsecond=0)
+    refresh = queue.enqueue_latest_refresh(
+        company_slug="demo",
+        cut_at=old_cut,
+        payload={"company_slug": "demo", "cut_at": old_cut.isoformat()},
+    )
+    new_cut = old_cut + timedelta(minutes=15)
+    harvest = queue.enqueue_latest_harvest(
+        company_slug="demo",
+        cut_at=new_cut,
+        payload={"company_slug": "demo", "cut_at": new_cut.isoformat()},
+    )
+
+    with session_factory() as session:
+        stale = session.get(BackgroundJob, refresh["job_id"])
+        assert stale is not None
+        assert stale.status == "succeeded"
+        assert "superseded" in (stale.result_json or "")
+    assert harvest["created"] is True
+
+
 def test_worker_uses_provider_retry_timestamp() -> None:
     retry_at = utc_now() + timedelta(minutes=2)
     with pytest.raises(RetryJob) as exc_info:

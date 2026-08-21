@@ -156,6 +156,23 @@ class JobQueue:
                 superseded_by=job.id,
                 now=now,
             )
+            stale_refreshes = [
+                row
+                for row in session.scalars(
+                    select(BackgroundJob).where(
+                        BackgroundJob.company_slug == company_slug,
+                        BackgroundJob.job_type == "refresh_snapshot",
+                        BackgroundJob.status == "queued",
+                    )
+                )
+                if (self._payload_cut(row) or requested_cut) <= requested_cut
+            ]
+            self._supersede_queued(
+                session,
+                stale_refreshes,
+                superseded_by=job.id,
+                now=now,
+            )
             session.add(job)
             try:
                 session.commit()

@@ -68,6 +68,24 @@ class IngestionSafePublishTests(unittest.TestCase):
 
         self.assertEqual(resolved_cut, current_cut)
 
+    def test_old_refresh_cut_is_superseded_by_current_publication(self) -> None:
+        current_cut = datetime(2026, 8, 16, 17, 45, tzinfo=self.utc)
+        publication = PublishedDashboardSnapshot(company_slug="ismocol", published_cut_at=current_cut)
+        self.service.session_factory = lambda: _DummySession(publication)
+
+        self.assertTrue(
+            self.service.is_cut_superseded(
+                company_slug="ismocol",
+                cut_at=datetime(2026, 8, 16, 17, 30, tzinfo=self.utc),
+            )
+        )
+        self.assertFalse(
+            self.service.is_cut_superseded(
+                company_slug="ismocol",
+                cut_at=current_cut,
+            )
+        )
+
     def test_harvest_window_absorbs_gap_from_last_publication(self) -> None:
         published_cut = datetime(2026, 8, 16, 12, 0, tzinfo=self.utc)
         cut_at = datetime(2026, 8, 16, 13, 0, tzinfo=self.utc)

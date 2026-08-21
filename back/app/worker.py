@@ -267,9 +267,21 @@ class DashboardWorker:
             return self._require_completed_harvest(result)
         if job_type == "refresh_snapshot":
             company_slug = str(payload["company_slug"])
+            cut_at = _parse_datetime(payload.get("cut_at"))
+            if await asyncio.to_thread(
+                self.context.ingestion.is_cut_superseded,
+                company_slug=company_slug,
+                cut_at=cut_at,
+            ):
+                return {
+                    "status": "superseded",
+                    "company_slug": company_slug,
+                    "cut_at": cut_at.isoformat(),
+                    "reason": "A newer cut is already published",
+                }
             result = await self.context.ingestion.run_harvest_cut(
                 company_slug=company_slug,
-                cut_at=_parse_datetime(payload.get("cut_at")),
+                cut_at=cut_at,
                 force=True,
             )
             return self._require_completed_harvest(result)

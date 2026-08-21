@@ -215,6 +215,19 @@ class IngestionService:
         self.registry.reload()
         return await self._run_harvest_for_cut(company_slug=company_slug, cut_at=cut_at, force=force)
 
+    def is_cut_superseded(self, *, company_slug: str, cut_at: datetime) -> bool:
+        requested_cut = ensure_utc(cut_at)
+        if requested_cut is None:
+            return False
+        with self.session_factory() as session:
+            publication = session.get(PublishedDashboardSnapshot, company_slug)
+            published_cut = (
+                ensure_utc(publication.published_cut_at)
+                if publication and publication.published_cut_at
+                else None
+            )
+        return published_cut is not None and published_cut > requested_cut
+
     async def stop(self) -> None:
         tasks = [
             task
@@ -1585,6 +1598,9 @@ class IngestionService:
         with self.session_factory() as session:
             ingest_state = session.get(IngestState, "global")
             publication = session.get(PublishedDashboardSnapshot, company_slug) or PublishedDashboardSnapshot(company_slug=company_slug)
+            published_cut = ensure_utc(publication.published_cut_at) if publication.published_cut_at else None
+            if published_cut is not None and published_cut > cut_at:
+                return
             publication.next_cut_at = next_cut_at
             publication.window_start = cut_at - self._harvest_interval()
             publication.window_end = cut_at
