@@ -120,6 +120,7 @@ class AlarmEvent(Base):
         UniqueConstraint("provider_event_key", name="uq_alarm_events_provider_event_key"),
         Index("ix_alarm_events_company_device_occurred", "company_slug", "device_id", "occurred_at"),
         Index("ix_alarm_events_company_occurred", "company_slug", "occurred_at"),
+        Index("ix_alarm_events_company_visibility_occurred", "company_slug", "visibility_status", "occurred_at"),
     )
 
     guid: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -181,6 +182,12 @@ class HowenAlarmRaw(Base):
         Index("ix_howen_alarm_raw_company_device_occurred", "company_slug", "device_id", "occurred_at"),
         Index("ix_howen_alarm_raw_company_occurred", "company_slug", "occurred_at"),
         Index("ix_howen_alarm_raw_company_received", "company_slug", "received_at"),
+        Index(
+            "ix_howen_alarm_raw_company_classification_occurred",
+            "company_slug",
+            "classification_status",
+            "occurred_at",
+        ),
     )
 
     guid: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -215,6 +222,8 @@ class ReportAsset(Base):
     original_name: Mapped[str] = mapped_column(String(255))
     stored_name: Mapped[str] = mapped_column(String(255), unique=True)
     file_path: Mapped[str] = mapped_column(String(512))
+    storage_backend: Mapped[str] = mapped_column(String(32), default="local")
+    storage_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     size_bytes: Mapped[int] = mapped_column(Integer)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -240,6 +249,84 @@ class ManagedCompany(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class CompanyDailyAggregate(Base):
+    __tablename__ = "company_daily_aggregates"
+    __table_args__ = (
+        UniqueConstraint("company_slug", "aggregate_date", name="uq_company_daily_aggregate"),
+        Index("ix_company_daily_aggregates_company_date", "company_slug", "aggregate_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    company_slug: Mapped[str] = mapped_column(String(64), index=True)
+    aggregate_date: Mapped[date] = mapped_column(Date, index=True)
+    snapshot_version: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class CompanyWindowAggregate(Base):
+    __tablename__ = "company_window_aggregates"
+    __table_args__ = (
+        UniqueConstraint(
+            "company_slug",
+            "window_type",
+            "range_start",
+            "range_end",
+            "snapshot_version",
+            name="uq_company_window_aggregate_version",
+        ),
+        Index(
+            "ix_company_window_aggregates_lookup",
+            "company_slug",
+            "window_type",
+            "range_start",
+            "range_end",
+            "snapshot_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    company_slug: Mapped[str] = mapped_column(String(64), index=True)
+    window_type: Mapped[str] = mapped_column(String(32), index=True)
+    range_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    range_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    snapshot_version: Mapped[str] = mapped_column(String(128), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class DataCertificationRun(Base):
+    __tablename__ = "data_certification_runs"
+    __table_args__ = (
+        Index("ix_data_certification_company_range", "company_slug", "range_start", "range_end"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    company_slug: Mapped[str] = mapped_column(String(64), index=True)
+    source_name: Mapped[str] = mapped_column(String(255))
+    range_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    range_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    provider_alarm_count: Mapped[int] = mapped_column(Integer, default=0)
+    local_raw_count: Mapped[int] = mapped_column(Integer, default=0)
+    local_analytic_count: Mapped[int] = mapped_column(Integer, default=0)
+    unexplained_alarm_count: Mapped[int] = mapped_column(Integer, default=0)
+    provider_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    local_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    km_difference_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    result_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class IngestionAnomaly(Base):
@@ -492,6 +579,12 @@ class ReconciliationReview(Base):
     __table_args__ = (
         Index("ix_reconciliation_reviews_company_observed", "company_slug", "observed_at"),
         Index("ix_reconciliation_reviews_company_created", "company_slug", "created_at"),
+        Index(
+            "ix_reconciliation_reviews_company_status_observed",
+            "company_slug",
+            "review_status",
+            "observed_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

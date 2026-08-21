@@ -23,6 +23,7 @@ class CompanyRegistry:
         self._seed_path = seed_path
         self._session_factory = session_factory
         self._ensure_config_exists()
+        self._seed_managed_companies_once()
         self._companies = self._load()
 
     def _ensure_config_exists(self) -> None:
@@ -39,6 +40,8 @@ class CompanyRegistry:
         return [item for item in payload if isinstance(item, dict)]
 
     def _write_payload(self, payload: list[dict[str, Any]]) -> None:
+        if self._session_factory:
+            return
         payload.sort(
             key=lambda item: (
                 item.get("slug") != "ismocol",
@@ -49,6 +52,35 @@ class CompanyRegistry:
             json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
             encoding="utf-8",
         )
+
+    def _seed_managed_companies_once(self) -> None:
+        """Use JSON once as a seed; the database is authoritative afterwards."""
+        if not self._session_factory:
+            return
+        from app.models import ManagedCompany, SystemSetting
+
+        marker_key = "managed_companies_seeded_v1"
+        with self._session_factory() as session:
+            if session.get(SystemSetting, marker_key):
+                return
+            if session.query(ManagedCompany).count() == 0:
+                for item in self._load_payload():
+                    slug = str(item.get("slug") or "").strip()
+                    if slug:
+                        session.add(
+                            ManagedCompany(
+                                slug=slug,
+                                config_json=json.dumps(item, ensure_ascii=True),
+                                is_active=True,
+                            )
+                        )
+            session.add(SystemSetting(key=marker_key, value_json=json.dumps({"seeded": True})))
+            session.commit()
+
+    def _mutable_payload(self) -> list[dict[str, Any]]:
+        if not self._session_factory:
+            return self._load_payload()
+        return [company.model_dump(mode="json") for company in self._companies.values()]
 
     def _load_managed_payload(self) -> list[dict[str, Any]]:
         if not self._session_factory:
@@ -179,7 +211,7 @@ class CompanyRegistry:
             "quality_notes": [],
             "brand": _default_company_brand(restored_name),
         }
-        payload = self._load_payload()
+        payload = self._mutable_payload()
         payload = [item for item in payload if item.get("slug") != normalized_slug]
         payload.append(restored_item)
         self._write_payload(payload)
@@ -189,10 +221,8 @@ class CompanyRegistry:
 
     def _load(self) -> dict[str, CompanyConfig]:
         merged: dict[str, CompanyConfig] = {}
-        for item in self._load_payload():
-            company = CompanyConfig.model_validate(item)
-            merged[company.slug] = company
-        for item in self._load_managed_payload():
+        source = self._load_managed_payload() if self._session_factory else self._load_payload()
+        for item in source:
             company = CompanyConfig.model_validate(item)
             merged[company.slug] = company
         return merged
@@ -211,7 +241,7 @@ class CompanyRegistry:
             raise KeyError(f"Unknown company slug: {normalized_slug}") from exc
 
     def update_assignment(self, *, slug: str, fleet_ids: list[str], device_ids: list[str]) -> CompanyConfig:
-        payload = self._load_payload()
+        payload = self._mutable_payload()
         updated = False
         persisted_item: dict[str, Any] | None = None
         for item in payload:
@@ -231,7 +261,7 @@ class CompanyRegistry:
         return self.get(slug)
 
     def deactivate_company(self, *, slug: str) -> CompanyConfig:
-        payload = self._load_payload()
+        payload = self._mutable_payload()
         updated = False
         persisted_item: dict[str, Any] | None = None
         for item in payload:
@@ -251,7 +281,7 @@ class CompanyRegistry:
         return self.get(slug)
 
     def delete_company(self, *, slug: str) -> None:
-        payload = self._load_payload()
+        payload = self._mutable_payload()
         filtered = [item for item in payload if item.get("slug") != slug]
         if len(filtered) == len(payload):
             raise KeyError(f"Unknown company slug: {slug}")
@@ -287,7 +317,7 @@ class CompanyRegistry:
         if not normalized_fleet_ids and not normalized_device_ids:
             raise ValueError("Debes indicar al menos un fleet_id o device_id para activar la empresa")
 
-        payload = self._load_payload()
+        payload = self._mutable_payload()
         updated = False
         persisted_item: dict[str, Any] | None = None
         for item in payload:

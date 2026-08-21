@@ -94,6 +94,30 @@ DATABASE_URL=postgresql+psycopg://postgres:***@db.<project-ref>.supabase.co:5432
 SESSION_COOKIE_SECURE=true
 ```
 
+Aplicar el esquema versionado antes de iniciar los servicios:
+
+```bash
+uv run alembic upgrade head
+uv run alembic current --check-heads
+```
+
+El arranque de PostgreSQL no ejecuta `create_all`, reparaciones ni backfills. `ManagedCompany` es la fuente durable de empresas y el JSON de `storage/companies.json` se usa solo como seed inicial.
+
+Para almacenar los informes en un bucket privado de Supabase:
+
+```env
+REPORT_STORAGE_BACKEND=supabase
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=...
+SUPABASE_REPORTS_BUCKET=dms-reports
+```
+
+Los PDF locales existentes se migran una sola vez con:
+
+```bash
+uv run python scripts/migrate_reports_to_object_storage.py
+```
+
 ## Credenciales semilla
 
 - Admin local: `admin / Admin123!`

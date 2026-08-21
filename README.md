@@ -95,3 +95,8 @@ Notas:
 - En local abre dos terminales dentro de `back`: `PROCESS_ROLE=api uv run uvicorn app.main:app --host 127.0.0.1 --port 8000` y `PROCESS_ROLE=worker uv run python -m app.worker`.
 - Reverse proxy `nginx`: [deploy/nginx.dashboard.monitoreocotaba.conf.example](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/deploy/nginx.dashboard.monitoreocotaba.conf.example)
 - Smoke test: [scripts/smoke_test.py](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/scripts/smoke_test.py)
+- Migraciones versionadas: ejecutar `deploy/migrate-production.sh` despues del backup y antes de reiniciar API/worker.
+- Certificacion contra exportes Howen: [docs/data-certification.md](/Users/andrescarvajal/Documents/Maotech%202/Dashboard/docs/data-certification.md).
+- En PostgreSQL, API y worker no crean tablas ni ejecutan saneamientos al arrancar. El esquema cambia exclusivamente mediante Alembic.
+- `ManagedCompany` en Supabase es la fuente autoritativa; el JSON solo se importa una vez cuando la tabla esta vacia.
+- Los PDF usan Supabase Storage cuando `SUPABASE_SERVICE_ROLE_KEY` esta configurada; `REPORT_STORAGE_BACKEND=local` queda como fallback local explicito.

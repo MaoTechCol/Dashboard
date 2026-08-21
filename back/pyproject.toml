@@ -5,9 +5,11 @@ description = "FastAPI backend for the local DMS dashboard"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+  "alembic>=1.16.5",
   "eval_type_backport>=0.2.2",
   "fastapi>=0.116.1",
   "httpx>=0.28.1",
+  "openpyxl>=3.1.5",
   "psycopg[binary]>=3.2.9",
   "pydantic-settings>=2.10.1",
   "python-multipart>=0.0.20",

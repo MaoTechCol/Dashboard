@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base
 from app.core.settings import Settings
-from app.models import AlarmEvent, HowenAlarmRaw, PublishedDashboardSnapshot, ReconciliationReview
+from app.models import AlarmEvent, CompanyWindowAggregate, HowenAlarmRaw, PublishedDashboardSnapshot, ReconciliationReview
 from app.schemas import CompanyBrand, CompanyConfig, DashboardRules
 from app.services.company_registry import CompanyRegistry
 from app.services.dashboard import DashboardService
@@ -237,6 +237,29 @@ class AdminDiagnosticFunnelTests(unittest.TestCase):
             )
 
         self.assertEqual(recency["last_visible_dms_at"], "2026-08-21T17:45:00Z")
+
+    def test_audit_is_persisted_by_snapshot_version_and_can_be_invalidated(self) -> None:
+        end_at = datetime(2026, 8, 21, 18, 0, tzinfo=timezone.utc)
+        start_at = end_at - timedelta(hours=24)
+        event_at = end_at - timedelta(hours=1)
+        with self.sessions() as session:
+            session.add(self._raw("cached", event_at, received_at=event_at))
+            session.add(self._event("cached", event_at))
+            session.commit()
+
+        first = self.service.build_admin_audit("ismocol", start_at, end_at)
+        with self.sessions() as session:
+            persisted = session.query(CompanyWindowAggregate).count()
+        self.assertEqual(persisted, 1)
+        self.assertEqual(first["requested_window"]["received_dms"], 1)
+
+        self.service.clear_runtime_caches()
+        second = self.service.build_admin_audit("ismocol", start_at, end_at)
+        self.assertEqual(second, first)
+
+        self.service.invalidate_company_aggregates("ismocol")
+        with self.sessions() as session:
+            self.assertEqual(session.query(CompanyWindowAggregate).count(), 0)
 
 
 if __name__ == "__main__":

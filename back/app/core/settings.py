@@ -99,6 +99,15 @@ class Settings(BaseSettings):
     worker_database_statement_timeout_ms: int = 300_000
     api_database_pool_timeout_seconds: int = 5
     worker_database_pool_timeout_seconds: int = 30
+    api_database_pool_size: int = 5
+    api_database_max_overflow: int = 5
+    worker_database_pool_size: int = 3
+    worker_database_max_overflow: int = 2
+    diagnostic_cache_ttl_hours: int = 48
+    report_storage_backend: str = "auto"
+    supabase_url: str | None = None
+    supabase_service_role_key: str | None = None
+    supabase_reports_bucket: str = "dms-reports"
     memory_monitor_interval_seconds: int = 15
     api_memory_warning_mb: int = 450
     api_memory_critical_mb: int = 750
@@ -184,6 +193,18 @@ class Settings(BaseSettings):
         if self.process_role == "worker":
             return self.worker_database_pool_timeout_seconds
         return self.api_database_pool_timeout_seconds
+
+    @property
+    def database_pool_size(self) -> int:
+        if self.process_role == "worker":
+            return self.worker_database_pool_size
+        return self.api_database_pool_size
+
+    @property
+    def database_max_overflow(self) -> int:
+        if self.process_role == "worker":
+            return self.worker_database_max_overflow
+        return self.api_database_max_overflow
 
     @property
     def memory_warning_mb(self) -> int:

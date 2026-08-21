@@ -13,12 +13,12 @@ from urllib.parse import urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.orm import load_only
 
 from app.core.catalog import CATEGORY_META, CATEGORY_ORDER
 from app.core.time import as_timezone, ensure_utc, parse_timestamp, utc_now
-from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestRun, CatchupCursor, CompanyHistoricalRebuildJob, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset
+from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestRun, CatchupCursor, CompanyDailyAggregate, CompanyHistoricalRebuildJob, CompanyWindowAggregate, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset
 from app.schemas import (
     AdminLiveSetupView,
     AdminAuditView,
@@ -1893,11 +1893,53 @@ class DashboardService:
         ).model_dump(mode="json")
 
     def build_admin_audit(self, company_slug: str, start_at: datetime, end_at: datetime) -> dict[str, Any]:
-        cache_key = f"{company_slug}:{ensure_utc(start_at).isoformat()}:{ensure_utc(end_at).isoformat()}"
+        start_at = _normalize_aggregate_boundary(start_at)
+        end_at = _normalize_aggregate_boundary(end_at)
+        snapshot_version = self._snapshot_version(company_slug)
+        cache_key = f"{company_slug}:{start_at.isoformat()}:{end_at.isoformat()}:{snapshot_version}"
         cached = self._admin_audit_cache.get(cache_key)
         now_monotonic = monotonic()
         if cached and now_monotonic - cached[0] < ADMIN_AUDIT_CACHE_SECONDS:
             return cached[1]
+
+        with self.session_factory() as session:
+            persisted = session.scalar(
+                select(CompanyWindowAggregate)
+                .where(
+                    CompanyWindowAggregate.company_slug == company_slug,
+                    CompanyWindowAggregate.range_start == start_at,
+                    CompanyWindowAggregate.range_end == end_at,
+                    CompanyWindowAggregate.snapshot_version == snapshot_version,
+                )
+                .order_by(CompanyWindowAggregate.generated_at.desc())
+            )
+            if persisted:
+                try:
+                    payload = json.loads(persisted.payload_json)
+                except (TypeError, json.JSONDecodeError):
+                    payload = None
+                if isinstance(payload, dict):
+                    self._admin_audit_cache[cache_key] = (now_monotonic, payload)
+                    return payload
+
+        payload = self._build_admin_audit_uncached(company_slug, start_at=start_at, end_at=end_at)
+        self._persist_window_aggregate(
+            company_slug=company_slug,
+            start_at=start_at,
+            end_at=end_at,
+            snapshot_version=snapshot_version,
+            payload=payload,
+        )
+        self._admin_audit_cache[cache_key] = (now_monotonic, payload)
+        return payload
+
+    def _build_admin_audit_uncached(
+        self,
+        company_slug: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> dict[str, Any]:
         company = self.registry.get(company_slug)
         tz = ZoneInfo(company.timezone or self.settings.default_timezone)
         baseline_start = ensure_utc(end_at).astimezone(tz).date() - timedelta(days=30)
@@ -2136,8 +2178,258 @@ class DashboardService:
             recent_7d=RecentAuditView(**recent_7d_metrics),
             recent_24h=RecentAuditView(**recent_metrics),
         ).model_dump(mode="json")
-        self._admin_audit_cache[cache_key] = (now_monotonic, payload)
         return payload
+
+    def refresh_operational_aggregates(
+        self,
+        company_slug: str,
+        *,
+        reference_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Precompute the three diagnostic windows outside interactive API requests."""
+        company = self.registry.get(company_slug)
+        timezone = ZoneInfo(company.timezone or self.settings.default_timezone)
+        with self.session_factory() as session:
+            publication = session.get(PublishedDashboardSnapshot, company_slug)
+            snapshot_payload = _parse_json(publication.snapshot_json) if publication and publication.snapshot_json else {}
+            published_cut_at = ensure_utc(publication.published_cut_at) if publication else None
+        reference = _normalize_aggregate_boundary(reference_at or published_cut_at or utc_now())
+        meta = snapshot_payload.get("meta") if isinstance(snapshot_payload, dict) else {}
+        meta = meta if isinstance(meta, dict) else {}
+        local_reference = reference.astimezone(timezone)
+
+        week_start_value = meta.get("weekWindowStart")
+        range_start_value = meta.get("rangeStart")
+        week_start_local = _parse_local_aggregate_date(
+            week_start_value,
+            timezone,
+            fallback=local_reference.date() - timedelta(days=6),
+        )
+        month_start_local = _parse_local_aggregate_date(
+            range_start_value,
+            timezone,
+            fallback=local_reference.date() - timedelta(days=29),
+        )
+        windows = {
+            "24h": (reference - timedelta(hours=24), reference),
+            "7d": (week_start_local, reference),
+            "30d": (month_start_local, reference),
+        }
+        snapshot_version = self._snapshot_version(company_slug)
+        results: dict[str, Any] = {}
+        for window_type, (start_at, end_at) in windows.items():
+            normalized_start = _normalize_aggregate_boundary(start_at)
+            normalized_end = _normalize_aggregate_boundary(end_at)
+            payload = self._build_admin_audit_uncached(
+                company_slug,
+                start_at=normalized_start,
+                end_at=normalized_end,
+            )
+            self._persist_window_aggregate(
+                company_slug=company_slug,
+                start_at=normalized_start,
+                end_at=normalized_end,
+                snapshot_version=snapshot_version,
+                payload=payload,
+                window_type=window_type,
+            )
+            results[window_type] = {
+                "range_start": normalized_start.isoformat(),
+                "range_end": normalized_end.isoformat(),
+                "received_dms": int(payload["requested_window"]["received_dms"]),
+                "visible_episodes": int(payload["requested_window"]["visible_episodes"]),
+            }
+        daily_rows = self._refresh_daily_aggregates(
+            company_slug=company_slug,
+            start_date=month_start_local.astimezone(timezone).date(),
+            end_date=local_reference.date(),
+            snapshot_version=snapshot_version,
+            timezone=timezone,
+        )
+        self.clear_runtime_caches()
+        return {
+            "company_slug": company_slug,
+            "snapshot_version": snapshot_version,
+            "windows": results,
+            "daily_rows": daily_rows,
+        }
+
+    def invalidate_company_aggregates(self, company_slug: str) -> None:
+        with self.session_factory() as session:
+            session.execute(
+                delete(CompanyWindowAggregate).where(CompanyWindowAggregate.company_slug == company_slug)
+            )
+            session.execute(
+                delete(CompanyDailyAggregate).where(CompanyDailyAggregate.company_slug == company_slug)
+            )
+            session.commit()
+        self.clear_runtime_caches()
+
+    def _snapshot_version(self, company_slug: str) -> str:
+        with self.session_factory() as session:
+            publication = session.get(PublishedDashboardSnapshot, company_slug)
+            if not publication:
+                return "unpublished"
+            published_cut_at = ensure_utc(publication.published_cut_at)
+            updated_at = ensure_utc(publication.updated_at)
+        return (published_cut_at or updated_at or utc_now()).isoformat()
+
+    def _persist_window_aggregate(
+        self,
+        *,
+        company_slug: str,
+        start_at: datetime,
+        end_at: datetime,
+        snapshot_version: str,
+        payload: dict[str, Any],
+        window_type: str | None = None,
+    ) -> None:
+        effective_window_type = window_type or _aggregate_window_type(start_at, end_at)
+        with self.session_factory() as session:
+            row = session.scalar(
+                select(CompanyWindowAggregate).where(
+                    CompanyWindowAggregate.company_slug == company_slug,
+                    CompanyWindowAggregate.window_type == effective_window_type,
+                    CompanyWindowAggregate.range_start == start_at,
+                    CompanyWindowAggregate.range_end == end_at,
+                    CompanyWindowAggregate.snapshot_version == snapshot_version,
+                )
+            )
+            if not row:
+                row = CompanyWindowAggregate(
+                    company_slug=company_slug,
+                    window_type=effective_window_type,
+                    range_start=start_at,
+                    range_end=end_at,
+                    snapshot_version=snapshot_version,
+                )
+            row.payload_json = json.dumps(payload, ensure_ascii=True, default=str)
+            row.generated_at = utc_now()
+            session.add(row)
+            session.execute(
+                delete(CompanyWindowAggregate).where(
+                    CompanyWindowAggregate.company_slug == company_slug,
+                    CompanyWindowAggregate.snapshot_version != snapshot_version,
+                )
+            )
+            session.commit()
+
+    def _refresh_daily_aggregates(
+        self,
+        *,
+        company_slug: str,
+        start_date: date,
+        end_date: date,
+        snapshot_version: str,
+        timezone: ZoneInfo,
+    ) -> int:
+        start_at = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone).astimezone(ZoneInfo("UTC"))
+        end_at = (
+            datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone)
+            .astimezone(ZoneInfo("UTC"))
+        )
+        counters: dict[date, Counter[str]] = defaultdict(Counter)
+        with self.session_factory() as session:
+            raw_rows = session.execute(
+                select(
+                    HowenAlarmRaw.occurred_at,
+                    HowenAlarmRaw.received_at,
+                    HowenAlarmRaw.classification_status,
+                    HowenAlarmRaw.temporal_status,
+                ).where(
+                    HowenAlarmRaw.company_slug == company_slug,
+                    or_(
+                        HowenAlarmRaw.occurred_at.between(start_at, end_at),
+                        and_(
+                            HowenAlarmRaw.occurred_at.is_(None),
+                            HowenAlarmRaw.received_at.between(start_at, end_at),
+                        ),
+                    ),
+                )
+            )
+            for occurred_at, received_at, classification_status, temporal_status in raw_rows:
+                event_at = ensure_utc(occurred_at) or ensure_utc(received_at)
+                if not event_at:
+                    continue
+                bucket = event_at.astimezone(timezone).date()
+                counters[bucket]["raw_total"] += 1
+                counters[bucket][str(classification_status or "unknown")] += 1
+                if temporal_status == "future_rejected":
+                    counters[bucket]["future_rejected"] += 1
+
+            for occurred_at, category in session.execute(
+                select(AlarmEvent.occurred_at, AlarmEvent.category).where(
+                    AlarmEvent.company_slug == company_slug,
+                    AlarmEvent.source.in_(ACTIVE_EVENT_SOURCES),
+                    AlarmEvent.occurred_at >= start_at,
+                    AlarmEvent.occurred_at < end_at,
+                )
+            ):
+                event_at = ensure_utc(occurred_at)
+                if not event_at:
+                    continue
+                bucket = event_at.astimezone(timezone).date()
+                counters[bucket]["analytic_dms"] += 1
+                counters[bucket][f"category:{category}"] += 1
+
+            for observed_at, created_at, review_status in session.execute(
+                select(
+                    ReconciliationReview.observed_at,
+                    ReconciliationReview.created_at,
+                    ReconciliationReview.review_status,
+                ).where(
+                    ReconciliationReview.company_slug == company_slug,
+                    or_(
+                        ReconciliationReview.observed_at.between(start_at, end_at),
+                        and_(
+                            ReconciliationReview.observed_at.is_(None),
+                            ReconciliationReview.created_at.between(start_at, end_at),
+                        ),
+                    ),
+                )
+            ):
+                event_at = ensure_utc(observed_at) or ensure_utc(created_at)
+                if event_at:
+                    counters[event_at.astimezone(timezone).date()][f"review:{review_status}"] += 1
+
+            km_rows = dict(
+                session.execute(
+                    select(
+                        DailyMileageSnapshot.snapshot_date,
+                        func.sum(DailyMileageSnapshot.day_km),
+                    )
+                    .where(
+                        DailyMileageSnapshot.company_slug == company_slug,
+                        DailyMileageSnapshot.snapshot_date >= start_date,
+                        DailyMileageSnapshot.snapshot_date <= end_date,
+                        DailyMileageSnapshot.excluded_at.is_(None),
+                        DailyMileageSnapshot.km_validation_status == "valid",
+                    )
+                    .group_by(DailyMileageSnapshot.snapshot_date)
+                ).all()
+            )
+
+            day_cursor = start_date
+            rows_written = 0
+            while day_cursor <= end_date:
+                row = session.scalar(
+                    select(CompanyDailyAggregate).where(
+                        CompanyDailyAggregate.company_slug == company_slug,
+                        CompanyDailyAggregate.aggregate_date == day_cursor,
+                    )
+                )
+                if not row:
+                    row = CompanyDailyAggregate(company_slug=company_slug, aggregate_date=day_cursor)
+                metrics = dict(counters.get(day_cursor, Counter()))
+                metrics["km_total"] = round(float(km_rows.get(day_cursor) or 0.0), 3)
+                row.snapshot_version = snapshot_version
+                row.metrics_json = json.dumps(metrics, ensure_ascii=True)
+                row.generated_at = utc_now()
+                session.add(row)
+                rows_written += 1
+                day_cursor += timedelta(days=1)
+            session.commit()
+        return rows_written
 
     async def run_reconciliation(
         self,
@@ -2915,7 +3207,10 @@ class DashboardService:
                     session.add(review)
                     session.commit()
 
-        self.clear_runtime_caches()
+        if company_slug:
+            self.invalidate_company_aggregates(company_slug)
+        else:
+            self.clear_runtime_caches()
         with self.session_factory() as session:
             review = session.get(ReconciliationReview, review_id)
             return _serialize_reconciliation_review(review) if review else {}
@@ -5433,3 +5728,41 @@ def _current_harvest_cut(*, interval_minutes: int, lag_seconds: int) -> datetime
     interval_seconds = safe_interval * 60
     aligned_seconds = int(now_utc.timestamp()) // interval_seconds * interval_seconds
     return datetime.fromtimestamp(aligned_seconds, tz=ZoneInfo("UTC"))
+
+
+def _normalize_aggregate_boundary(value: datetime) -> datetime:
+    normalized = ensure_utc(value)
+    if normalized is None:
+        raise ValueError("Aggregate boundary requires a timezone-aware datetime")
+    return normalized.replace(second=0, microsecond=0)
+
+
+def _parse_local_aggregate_date(
+    value: Any,
+    timezone: ZoneInfo,
+    *,
+    fallback: date,
+) -> datetime:
+    parsed_date = fallback
+    if isinstance(value, date) and not isinstance(value, datetime):
+        parsed_date = value
+    elif value:
+        raw_value = str(value).strip()
+        try:
+            parsed_date = date.fromisoformat(raw_value[:10])
+        except ValueError:
+            parsed = parse_timestamp(raw_value, assume_timezone=timezone)
+            if parsed:
+                parsed_date = parsed.astimezone(timezone).date()
+    return datetime.combine(parsed_date, datetime.min.time(), tzinfo=timezone).astimezone(ZoneInfo("UTC"))
+
+
+def _aggregate_window_type(start_at: datetime, end_at: datetime) -> str:
+    duration = max((end_at - start_at).total_seconds(), 0.0)
+    if duration <= 25 * 60 * 60:
+        return "24h"
+    if duration <= 8 * 24 * 60 * 60:
+        return "7d"
+    if duration <= 32 * 24 * 60 * 60:
+        return "30d"
+    return "custom"

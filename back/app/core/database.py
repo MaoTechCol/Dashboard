@@ -43,6 +43,8 @@ def _engine_configuration() -> tuple[dict[str, object], dict[str, object]]:
         engine_options.update(
             {
                 "pool_timeout": max(int(settings.database_pool_timeout_seconds), 1),
+                "pool_size": max(int(settings.database_pool_size), 1),
+                "max_overflow": max(int(settings.database_max_overflow), 0),
                 "pool_recycle": 900,
             }
         )
@@ -64,8 +66,10 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 def init_db() -> None:
     from app import models  # noqa: F401
 
-    Base.metadata.create_all(bind=engine)
-    _run_compat_migrations()
+    # SQLite remains convenient for local tests. PostgreSQL schema changes are
+    # versioned with Alembic and must never trigger historical repairs at boot.
+    if engine.dialect.name == "sqlite":
+        Base.metadata.create_all(bind=engine)
 
 
 def get_session() -> Iterator[Session]:

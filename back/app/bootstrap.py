@@ -10,6 +10,7 @@ from app.services.dashboard import DashboardService
 from app.services.ingestion import IngestionService
 from app.services.job_queue import JobQueue
 from app.services.realtime_hub import RealtimeHub
+from app.services.report_storage import ReportStorage
 
 
 @dataclass
@@ -22,6 +23,7 @@ class AppContext:
     ingestion: IngestionService
     jobs: JobQueue
     auth: AuthService
+    report_storage: ReportStorage
 
 
 def build_context(*, seed_users: bool) -> AppContext:
@@ -37,6 +39,7 @@ def build_context(*, seed_users: bool) -> AppContext:
     )
     hub = RealtimeHub()
     auth = AuthService(session_factory=SessionLocal, settings=settings, registry=registry)
+    report_storage = ReportStorage(settings)
     dashboard = DashboardService(session_factory=SessionLocal, registry=registry, settings=settings)
     ingestion = IngestionService(
         settings=settings,
@@ -57,4 +60,5 @@ def build_context(*, seed_users: bool) -> AppContext:
         ingestion=ingestion,
         jobs=jobs,
         auth=auth,
+        report_storage=report_storage,
     )

@@ -5,7 +5,6 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import FileResponse
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -51,6 +50,16 @@ def _enqueue_snapshot_refresh(context: object, company_slug: str) -> dict[str, o
         company_slug=company_slug,
         cut_at=cut_at,
         payload={"company_slug": company_slug, "cut_at": cut_at.isoformat()},
+    )
+
+
+def _enqueue_aggregate_refresh(context: object, company_slug: str, version_hint: str) -> dict[str, object]:
+    return context.jobs.enqueue(
+        job_type="refresh_aggregates",
+        payload={"company_slug": company_slug},
+        priority=PRIORITY_DATA_MAINTENANCE,
+        idempotency_key=f"aggregates:{company_slug}:{version_hint}",
+        company_slug=company_slug,
     )
 
 
@@ -268,10 +277,19 @@ def download_report(
         )
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reporte no encontrado")
-    report_path = Path(report.file_path)
-    if not report_path.exists():
+    try:
+        payload = context.report_storage.read(
+            backend=report.storage_backend,
+            key=report.storage_key,
+            file_path=report.file_path,
+        )
+    except FileNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El archivo del reporte no existe")
-    return FileResponse(report_path, media_type="application/pdf", filename=report.original_name)
+    return Response(
+        content=payload,
+        media_type="application/pdf",
+        headers={"Content-Disposition": context.report_storage.content_disposition(report.original_name)},
+    )
 
 
 @router.post("/admin/reports")
@@ -299,12 +317,15 @@ async def upload_report(
     if (year, month) >= (current_year, current_month):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Solo se permiten meses cerrados")
 
-    target_dir = context.settings.upload_dir / company_slug / str(year)
-    target_dir.mkdir(parents=True, exist_ok=True)
     stored_name = f"{month:02d}.pdf"
-    target_path = target_dir / stored_name
     payload = await file.read()
-    target_path.write_bytes(payload)
+    stored = context.report_storage.store(
+        company_slug=company_slug,
+        year=year,
+        month=month,
+        payload=payload,
+        content_type="application/pdf",
+    )
 
     with context.session_factory() as session:
         report = session.scalar(
@@ -321,19 +342,23 @@ async def upload_report(
                 month=month,
                 original_name=file.filename,
                 stored_name=stored_name,
-                file_path=str(target_path),
+                file_path=stored.file_path,
+                storage_backend=stored.backend,
+                storage_key=stored.key,
                 size_bytes=len(payload),
             )
         else:
             report.original_name = file.filename
             report.stored_name = stored_name
-            report.file_path = str(target_path)
+            report.file_path = stored.file_path
+            report.storage_backend = stored.backend
+            report.storage_key = stored.key
             report.size_bytes = len(payload)
         session.add(report)
         session.commit()
 
     context.ingestion.mark_dirty()
-    return {"ok": True, "path": str(target_path)}
+    return {"ok": True, "storage": stored.backend, "key": stored.key}
 
 
 @router.get("/admin/ingestion/status")
@@ -810,6 +835,7 @@ def admin_reconciliation_review_approve(
     )
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision no encontrada")
+    _enqueue_aggregate_refresh(context, str(result["company_slug"]), f"review:{review_id}:approve")
     return result
 
 
@@ -830,6 +856,7 @@ def admin_reconciliation_review_discard(
     )
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision no encontrada")
+    _enqueue_aggregate_refresh(context, str(result["company_slug"]), f"review:{review_id}:discard")
     return result
 
 

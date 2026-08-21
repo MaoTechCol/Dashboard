@@ -31,6 +31,8 @@ export function buildApiUrl(path: string): string {
 
 type ApiRequestInit = RequestInit & { timeoutMs?: number };
 
+const pendingJsonGets = new Map<string, Promise<unknown>>();
+
 export async function apiFetch(path: string, init: ApiRequestInit = {}) {
   const { timeoutMs = API_REQUEST_TIMEOUT_MS, signal: callerSignal, ...requestInit } = init;
   const controller = new AbortController();
@@ -62,12 +64,26 @@ export async function apiFetch(path: string, init: ApiRequestInit = {}) {
 }
 
 export async function apiJson<T>(path: string, init: ApiRequestInit = {}) {
-  const response = await apiFetch(path, init);
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new ApiError(payload.detail || `Request failed (${response.status})`, response.status);
+  const method = String(init.method || "GET").toUpperCase();
+  const canShareRequest = method === "GET" && !init.signal && init.body == null;
+  const key = canShareRequest ? `${method}:${buildApiUrl(path)}` : "";
+  const existing = key ? pendingJsonGets.get(key) : undefined;
+  if (existing) return existing as Promise<T>;
+
+  const request = (async () => {
+    const response = await apiFetch(path, init);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new ApiError(payload.detail || `Request failed (${response.status})`, response.status);
+    }
+    return (await response.json()) as T;
+  })();
+  if (key) pendingJsonGets.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (key && pendingJsonGets.get(key) === request) pendingJsonGets.delete(key);
   }
-  return (await response.json()) as T;
 }
 
 export async function waitForBackgroundJob<T extends { status: string; last_error?: string | null }>(

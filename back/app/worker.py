@@ -15,7 +15,7 @@ from sqlalchemy import select
 
 from app.bootstrap import AppContext, build_context
 from app.core.systemd import memory_monitor_loop, notify_systemd, watchdog_loop
-from app.core.time import ensure_utc
+from app.core.time import ensure_utc, utc_now
 from app.models import CompanyHistoricalRebuildJob, IngestState, PublishedDashboardSnapshot
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, KmRepairRequest
 from app.services.job_queue import (
@@ -40,6 +40,7 @@ MAINTENANCE_JOB_TYPES = {
     "mileage_daily_close",
     "review_bulk_decision",
     "purge_mock",
+    "refresh_aggregates",
 }
 
 
@@ -366,7 +367,13 @@ class DashboardWorker:
                 cut_at=cut_at,
                 force=bool(payload.get("force", False)),
             )
-            return self._require_completed_harvest(result)
+            completed = self._require_completed_harvest(result)
+            await asyncio.to_thread(
+                self._enqueue_aggregate_refresh,
+                company_slug=str(payload["company_slug"]),
+                version_hint=str(completed.get("cut_at") or cut_at.isoformat()),
+            )
+            return completed
         if job_type == "refresh_snapshot":
             company_slug = str(payload["company_slug"])
             cut_at = _parse_datetime(payload.get("cut_at"))
@@ -386,7 +393,13 @@ class DashboardWorker:
                 cut_at=cut_at,
                 force=True,
             )
-            return self._require_completed_harvest(result)
+            completed = self._require_completed_harvest(result)
+            await asyncio.to_thread(
+                self._enqueue_aggregate_refresh,
+                company_slug=company_slug,
+                version_hint=str(completed.get("cut_at") or cut_at.isoformat()),
+            )
+            return completed
         if job_type == "historical_rebuild":
             request = HistoricalRebuildRequest.model_validate(payload["request"])
             result = await self.context.ingestion.rebuild_historical_window(
@@ -397,6 +410,12 @@ class DashboardWorker:
                 raise RetryJob(
                     str(result.get("message") or "Reconstruccion diferida por el proveedor"),
                     _parse_optional_datetime(result.get("next_retry_at")),
+                )
+            if result.get("status") in {"completed", "succeeded"}:
+                await asyncio.to_thread(
+                    self._enqueue_aggregate_refresh,
+                    company_slug=request.company_slug,
+                    version_hint=str(result.get("finished_at") or result.get("updated_at") or utc_now().isoformat()),
                 )
             return result
         if job_type == "backfill":
@@ -464,7 +483,21 @@ class DashboardWorker:
             result = await asyncio.to_thread(self.context.dashboard.purge_mock_legacy)
             self.context.ingestion.mark_dirty()
             return result
+        if job_type == "refresh_aggregates":
+            return await asyncio.to_thread(
+                self.context.dashboard.refresh_operational_aggregates,
+                str(payload["company_slug"]),
+            )
         raise ValueError(f"Unsupported background job type: {job_type}")
+
+    def _enqueue_aggregate_refresh(self, *, company_slug: str, version_hint: str) -> dict[str, Any]:
+        return self.queue.enqueue(
+            job_type="refresh_aggregates",
+            payload={"company_slug": company_slug},
+            priority=PRIORITY_DATA_MAINTENANCE,
+            idempotency_key=f"aggregates:{company_slug}:{version_hint}",
+            company_slug=company_slug,
+        )
 
     @staticmethod
     def _require_completed_harvest(result: dict[str, Any]) -> dict[str, Any]:
