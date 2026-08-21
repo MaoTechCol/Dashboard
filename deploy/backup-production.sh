@@ -12,7 +12,14 @@ mkdir -p "$DESTINATION/data" "$DESTINATION/config"
 
 DATABASE_URL="${DATABASE_URL:-$(
   cd "$APP_DIR/back"
-  uv run python -c 'from app.core.settings import get_settings; print(get_settings().database_url)'
+  uv run --no-sync python -c '
+from sqlalchemy.engine import make_url
+from app.core.settings import get_settings
+
+url = make_url(get_settings().database_url)
+driver = "postgresql" if url.drivername.startswith("postgresql") else url.drivername
+print(url.set(drivername=driver).render_as_string(hide_password=False))
+'
 )}"
 
 pg_dump --format=custom --no-owner --no-acl \
