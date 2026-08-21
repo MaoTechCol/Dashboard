@@ -4695,8 +4695,19 @@ def _parse_report_km(value: Any) -> float | None:
         value = value.get("mileage") or value.get("dayMileage") or value.get("value")
     if value in (None, "", "-"):
         return None
+    if isinstance(value, bool):
+        return None
     try:
-        return round(float(str(value).replace(",", "").replace(" km", "").strip()), 3)
+        normalized = str(value).replace(",", "").replace(" km", "").strip()
+        parsed = float(normalized)
+        # Howen serializes report cells without a decimal point in meters.
+        # Explicit decimal values are already expressed in kilometres.
+        if isinstance(value, int) or (
+            isinstance(value, str)
+            and normalized.lstrip("+-").isdigit()
+        ):
+            parsed /= 1_000.0
+        return round(parsed, 3)
     except (TypeError, ValueError):
         return None
 

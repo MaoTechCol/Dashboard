@@ -110,6 +110,19 @@ class AuthoritativeMileageTests(unittest.TestCase):
         self.assertEqual(values[date(2026, 8, 20)][0], 0.0)
         self.assertEqual(values[date(2026, 8, 21)][0], 17.25)
 
+    def test_daily_report_parser_converts_integer_meter_cells_to_km(self) -> None:
+        values = _mileage_report_daily_values(
+            {
+                "2026-08-20": 243410,
+                "2026-08-21": "3030",
+            },
+            start_date=date(2026, 8, 20),
+            end_date=date(2026, 8, 21),
+        )
+
+        self.assertEqual(values[date(2026, 8, 20)][0], 243.41)
+        self.assertEqual(values[date(2026, 8, 21)][0], 3.03)
+
 
 if __name__ == "__main__":
     unittest.main()
