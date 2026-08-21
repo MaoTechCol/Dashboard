@@ -60,3 +60,57 @@ con el mismo `publishedCutAt`. Un corte parcial nunca reemplaza el anterior.
 
 La certificacion se considera cerrada solo despues de registrar los tiempos y
 resultados reales de los pasos anteriores.
+
+## Evidencia de produccion
+
+La version `ca053ec` se desplego antes del corte UTC de las `04:00` del 21 de
+agosto de 2026. El ajuste posterior `f778e4b` solo corrige la portabilidad del
+respaldo en despliegues sin directorio `.git`.
+
+### Corte multiempresa 04:00 UTC
+
+- ISMOCOL fue reclamado a las `04:00:56`, gayco a las `04:00:57` y HM-HOLDING
+  a las `04:00:58`. Los tres jobs comenzaron en carriles distintos.
+- Howen limito dos intentos iniciales. Ambos quedaron como reintentos durables
+  con espera de 20 segundos; no hubo fallos terminales ni trabajo duplicado.
+- gayco termino `1/1` dispositivos a las `04:01:20`.
+- HM-HOLDING termino `39/39` dispositivos a las `04:09:11`.
+- ISMOCOL termino `45/45` dispositivos a las `04:09:34`.
+- Los tres snapshots se publicaron entre `04:09:34` y `04:09:41`, todos con
+  `publishedCutAt = 2026-08-21T04:00:00Z` y `cutStatus = succeeded`.
+- La cola activa y la cola de harvest quedaron en cero. No hubo jobs fallidos
+  desde el inicio del corte.
+- Duracion desde el primer claim hasta la publicacion final: `8 min 45 s`.
+  Margen real hasta el siguiente cuarto: `5 min 19 s`.
+
+Durante el corte, `healthz` respondio en `0,096 s` y `readyz` en `0,058 s`.
+La API uso aproximadamente 68 MB, el worker 73 MB, quedaron 3,3 GB de RAM
+disponible y no se uso swap.
+
+### Capacidad y limite del proveedor
+
+La cohorte certificada contiene 85 dispositivos. La capacidad medida permite
+proyectar una empresa adicional de aproximadamente 35-40 dispositivos dentro
+del cuarto, aunque con menor margen. No se deben abrir mas solicitudes HTTP en
+paralelo contra la misma cuenta: el manual de Howen exige una consulta por
+vehiculo y advierte que este endpoint consume recursos y puede causar errores
+si se consulta a alta frecuencia. El crecimiento por encima de esa capacidad
+requiere otra cuenta/canal Howen o una ampliacion de arquitectura del proveedor.
+
+### Respaldo final de Tanda 0
+
+- Respaldo en VPS: `/root/dashboard-backups/20260821T041300Z`.
+- Copia fuera del host:
+  `/Users/andrescarvajal/Documents/Maotech 2/Production Backups/Dashboard/20260821T041300Z`.
+- Tamano: 65 MB.
+- Catalogo del dump: 590 entradas.
+- Todos los SHA-256 pasaron tanto en el VPS como en la copia local.
+- Version registrada: `f778e4b`.
+- Servicios registrados: API, worker y Nginx activos.
+- El dump aislado anterior `20260820T171446Z` ya habia sido restaurado y
+  validado en PostgreSQL 17. El respaldo final conserva el mismo esquema y
+  agrega la verificacion reproducible mediante scripts.
+
+Con esta evidencia, las Tandas 0-5 quedan certificadas para la capacidad actual:
+rescate y retorno, API/worker separados, cortes dentro del cuarto, recursos y
+watchdog, reglas N2 y presentacion N2.
