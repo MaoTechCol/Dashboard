@@ -327,26 +327,46 @@ class JobQueue:
             session.commit()
         return compacted
 
-    def claim(self, *, worker_id: str) -> BackgroundJob | None:
+    def claim(
+        self,
+        *,
+        worker_id: str,
+        job_types: set[str] | None = None,
+        defer_while_job_types_active: set[str] | None = None,
+    ) -> BackgroundJob | None:
         now = utc_now()
         lease_expires_at = now + timedelta(seconds=max(int(self.settings.worker_lease_seconds), 30))
         with self.session_factory() as session:
-            job = session.scalar(
-                select(BackgroundJob)
-                .where(
-                    BackgroundJob.attempts < BackgroundJob.max_attempts,
-                    or_(
-                        and_(
-                            BackgroundJob.status == "queued",
-                            BackgroundJob.next_attempt_at <= now,
-                        ),
-                        and_(
-                            BackgroundJob.status == "running",
-                            BackgroundJob.lease_expires_at.is_not(None),
-                            BackgroundJob.lease_expires_at < now,
-                        ),
-                    ),
+            if defer_while_job_types_active:
+                blocking_job = session.scalar(
+                    select(BackgroundJob.id)
+                    .where(
+                        BackgroundJob.job_type.in_(defer_while_job_types_active),
+                        BackgroundJob.status.in_(("queued", "running")),
+                    )
+                    .limit(1)
                 )
+                if blocking_job is not None:
+                    return None
+
+            query = select(BackgroundJob).where(
+                BackgroundJob.attempts < BackgroundJob.max_attempts,
+                or_(
+                    and_(
+                        BackgroundJob.status == "queued",
+                        BackgroundJob.next_attempt_at <= now,
+                    ),
+                    and_(
+                        BackgroundJob.status == "running",
+                        BackgroundJob.lease_expires_at.is_not(None),
+                        BackgroundJob.lease_expires_at < now,
+                    ),
+                ),
+            )
+            if job_types:
+                query = query.where(BackgroundJob.job_type.in_(job_types))
+            job = session.scalar(
+                query
                 .order_by(BackgroundJob.priority.desc(), BackgroundJob.created_at.asc())
                 .with_for_update(skip_locked=True)
                 .limit(1)
@@ -367,6 +387,19 @@ class JobQueue:
             session.refresh(job)
             session.expunge(job)
             return job
+
+    def has_active_jobs(self, *, job_types: set[str]) -> bool:
+        if not job_types:
+            return False
+        with self.session_factory() as session:
+            return session.scalar(
+                select(BackgroundJob.id)
+                .where(
+                    BackgroundJob.job_type.in_(job_types),
+                    BackgroundJob.status.in_(("queued", "running")),
+                )
+                .limit(1)
+            ) is not None
 
     def heartbeat(self, *, job_id: str, worker_id: str) -> bool:
         now = utc_now()

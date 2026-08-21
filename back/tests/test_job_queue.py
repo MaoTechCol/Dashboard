@@ -75,6 +75,69 @@ def test_harvest_priority_wins_over_rebuild() -> None:
     assert claimed.priority == 100
 
 
+def test_claim_can_reserve_a_lane_for_harvest_jobs() -> None:
+    queue, _ = _queue()
+    queue.enqueue(
+        job_type="historical_rebuild",
+        payload={},
+        priority=10,
+        idempotency_key="rebuild:demo:lane",
+        company_slug="demo",
+    )
+    harvest = queue.enqueue(
+        job_type="harvest_cut",
+        payload={},
+        priority=100,
+        idempotency_key="harvest:demo:lane",
+        company_slug="demo",
+    )
+
+    claimed = queue.claim(worker_id="harvest-lane", job_types={"harvest_cut", "refresh_snapshot"})
+
+    assert claimed is not None
+    assert claimed.id == harvest["job_id"]
+    assert queue.has_active_jobs(job_types={"harvest_cut"}) is True
+
+
+def test_maintenance_lane_waits_while_a_harvest_is_active() -> None:
+    queue, _ = _queue()
+    queue.enqueue(
+        job_type="historical_rebuild",
+        payload={},
+        priority=10,
+        idempotency_key="rebuild:demo:deferred",
+        company_slug="demo",
+    )
+    harvest = queue.enqueue(
+        job_type="harvest_cut",
+        payload={},
+        priority=100,
+        idempotency_key="harvest:demo:blocker",
+        company_slug="demo",
+    )
+    claimed_harvest = queue.claim(
+        worker_id="harvest-lane",
+        job_types={"harvest_cut", "refresh_snapshot"},
+    )
+    assert claimed_harvest is not None
+
+    deferred = queue.claim(
+        worker_id="maintenance-lane",
+        job_types={"historical_rebuild"},
+        defer_while_job_types_active={"harvest_cut", "refresh_snapshot"},
+    )
+    assert deferred is None
+
+    queue.complete(job_id=harvest["job_id"], worker_id="harvest-lane", result={"status": "succeeded"})
+    claimed_rebuild = queue.claim(
+        worker_id="maintenance-lane",
+        job_types={"historical_rebuild"},
+        defer_while_job_types_active={"harvest_cut", "refresh_snapshot"},
+    )
+    assert claimed_rebuild is not None
+    assert claimed_rebuild.job_type == "historical_rebuild"
+
+
 def test_expired_lease_is_recovered_by_another_worker() -> None:
     queue, session_factory = _queue()
     created = queue.enqueue(

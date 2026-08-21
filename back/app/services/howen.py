@@ -101,6 +101,8 @@ class HowenClient:
     _last_login_at: ClassVar[dict[str, float]] = {}
     _login_cooldown_until: ClassVar[dict[str, float]] = {}
     _next_request_at: ClassVar[dict[str, float]] = {}
+    _adaptive_request_spacing: ClassVar[dict[str, float]] = {}
+    _successful_request_streak: ClassVar[dict[str, int]] = {}
 
     def __init__(
         self,
@@ -138,6 +140,36 @@ class HowenClient:
             lock = asyncio.Lock()
             self._request_locks[self._account_key] = lock
         return lock
+
+    def _current_request_spacing(self) -> float:
+        base = max(float(self.settings.howen_request_spacing_seconds), 0.0)
+        return max(self._adaptive_request_spacing.get(self._account_key, base), base)
+
+    def _register_request_success(self) -> None:
+        streak = self._successful_request_streak.get(self._account_key, 0) + 1
+        recovery_successes = max(int(self.settings.howen_request_recovery_successes), 1)
+        if streak < recovery_successes:
+            self._successful_request_streak[self._account_key] = streak
+            return
+        base = max(float(self.settings.howen_request_spacing_seconds), 0.0)
+        current = self._current_request_spacing()
+        self._adaptive_request_spacing[self._account_key] = max(base, current - 0.5)
+        self._successful_request_streak[self._account_key] = 0
+
+    def _register_rate_limit(self) -> None:
+        base = max(float(self.settings.howen_request_spacing_seconds), 0.0)
+        maximum = max(float(self.settings.howen_request_spacing_max_seconds), base)
+        current = self._current_request_spacing()
+        self._adaptive_request_spacing[self._account_key] = min(
+            maximum,
+            max(current * 1.5, base + 0.5),
+        )
+        self._successful_request_streak[self._account_key] = 0
+        cooldown = max(float(self.settings.backfill_rate_limit_cooldown_seconds), 0.0)
+        self._next_request_at[self._account_key] = max(
+            self._next_request_at.get(self._account_key, 0.0),
+            monotonic() + max(cooldown, self._current_request_spacing()),
+        )
 
     def is_auth_error(self, error: object) -> bool:
         message = str(error).lower()
@@ -222,10 +254,20 @@ class HowenClient:
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     response = await client.post(url, json=body)
+                    if response.status_code == 429:
+                        self._register_rate_limit()
                     response.raise_for_status()
-                    return response.json()
+                    payload = response.json()
+                    if self.is_rate_limited(payload.get("msg") or ""):
+                        self._register_rate_limit()
+                    elif payload.get("status") == 10000:
+                        self._register_request_success()
+                    return payload
             finally:
-                self._next_request_at[self._account_key] = monotonic() + float(self.settings.howen_request_spacing_seconds)
+                self._next_request_at[self._account_key] = max(
+                    self._next_request_at.get(self._account_key, 0.0),
+                    monotonic() + self._current_request_spacing(),
+                )
 
     async def login(self) -> HowenSession:
         if not self.settings.howen_username:

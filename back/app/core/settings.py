@@ -47,7 +47,9 @@ class Settings(BaseSettings):
     anomaly_retention_days: int = 90
     howen_login_min_interval_seconds: int = 20
     howen_login_rate_limit_cooldown_seconds: int = 75
-    howen_request_spacing_seconds: float = 5.0
+    howen_request_spacing_seconds: float = 2.5
+    howen_request_spacing_max_seconds: float = 8.0
+    howen_request_recovery_successes: int = 20
     harvest_cut_interval_minutes: int = 15
     harvest_overlap_minutes: int = 30
     harvest_check_interval_seconds: int = 20
@@ -75,6 +77,7 @@ class Settings(BaseSettings):
     process_role: str = "api"
     worker_poll_interval_seconds: float = 1.0
     worker_scheduler_interval_seconds: int = 15
+    worker_harvest_concurrency: int = 4
     worker_lease_seconds: int = 90
     worker_heartbeat_seconds: int = 20
     worker_retry_base_seconds: int = 30

@@ -27,6 +27,19 @@ from app.services.job_queue import (
 logger = logging.getLogger("dashboard.worker")
 
 
+HARVEST_JOB_TYPES = {"harvest_cut", "refresh_snapshot"}
+MAINTENANCE_JOB_TYPES = {
+    "historical_rebuild",
+    "backfill",
+    "company_purge",
+    "reconciliation",
+    "replay_status_anomalies",
+    "km_repair",
+    "review_bulk_decision",
+    "purge_mock",
+}
+
+
 class DashboardWorker:
     def __init__(self, *, context: AppContext) -> None:
         self.context = context
@@ -62,11 +75,29 @@ class DashboardWorker:
         )
         notify_systemd("READY=1\nSTATUS=Worker disponible")
         scheduler_task = asyncio.create_task(self._scheduler_loop(), name="worker-scheduler")
-        consumer_task = asyncio.create_task(self._consumer_loop(), name="worker-consumer")
+        harvest_consumer_tasks = tuple(
+            asyncio.create_task(
+                self._consumer_loop(
+                    name=f"harvest-{index + 1}",
+                    job_types=HARVEST_JOB_TYPES,
+                ),
+                name=f"worker-harvest-{index + 1}",
+            )
+            for index in range(max(int(self.context.settings.worker_harvest_concurrency), 1))
+        )
+        maintenance_consumer_task = asyncio.create_task(
+            self._consumer_loop(
+                name="maintenance",
+                job_types=MAINTENANCE_JOB_TYPES,
+                defer_while_job_types_active=HARVEST_JOB_TYPES,
+            ),
+            name="worker-maintenance",
+        )
         stop_task = asyncio.create_task(self._stop.wait(), name="worker-stop")
         critical_tasks = (
             scheduler_task,
-            consumer_task,
+            *harvest_consumer_tasks,
+            maintenance_consumer_task,
             *self.context.ingestion.critical_runtime_tasks(),
         )
         try:
@@ -197,10 +228,22 @@ class DashboardWorker:
                 company_slug=str(row["company_slug"]),
             )
 
-    async def _consumer_loop(self) -> None:
+    async def _consumer_loop(
+        self,
+        *,
+        name: str,
+        job_types: set[str],
+        defer_while_job_types_active: set[str] | None = None,
+    ) -> None:
         poll_seconds = max(float(self.context.settings.worker_poll_interval_seconds), 0.25)
+        consumer_worker_id = f"{self.worker_id}:{name}"
         while not self._stop.is_set():
-            job = await asyncio.to_thread(self.queue.claim, worker_id=self.worker_id)
+            job = await asyncio.to_thread(
+                self.queue.claim,
+                worker_id=consumer_worker_id,
+                job_types=job_types,
+                defer_while_job_types_active=defer_while_job_types_active,
+            )
             if not job:
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=poll_seconds)
@@ -208,9 +251,13 @@ class DashboardWorker:
                     continue
                 continue
 
-            heartbeat_task = asyncio.create_task(self._heartbeat_loop(job.id), name=f"heartbeat-{job.id}")
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(job.id, worker_id=consumer_worker_id),
+                name=f"heartbeat-{job.id}",
+            )
             logger.info(
-                "worker_job_claimed job_id=%s job_type=%s company=%s priority=%s attempt=%s",
+                "worker_job_claimed lane=%s job_id=%s job_type=%s company=%s priority=%s attempt=%s",
+                name,
                 job.id,
                 job.job_type,
                 job.company_slug,
@@ -225,7 +272,7 @@ class DashboardWorker:
                 await asyncio.to_thread(
                     self.queue.fail,
                     job_id=job.id,
-                    worker_id=self.worker_id,
+                    worker_id=consumer_worker_id,
                     error=exc.message,
                     retry_at=exc.retry_at,
                 )
@@ -239,7 +286,7 @@ class DashboardWorker:
                 await asyncio.to_thread(
                     self.queue.fail,
                     job_id=job.id,
-                    worker_id=self.worker_id,
+                    worker_id=consumer_worker_id,
                     error=str(exc),
                 )
                 logger.exception(
@@ -251,7 +298,7 @@ class DashboardWorker:
                 await asyncio.to_thread(
                     self.queue.complete,
                     job_id=job.id,
-                    worker_id=self.worker_id,
+                    worker_id=consumer_worker_id,
                     result=result,
                 )
                 logger.info("worker_job_succeeded job_id=%s job_type=%s", job.id, job.job_type)
@@ -260,14 +307,14 @@ class DashboardWorker:
                 with suppress(asyncio.CancelledError):
                     await heartbeat_task
 
-    async def _heartbeat_loop(self, job_id: str) -> None:
+    async def _heartbeat_loop(self, job_id: str, *, worker_id: str) -> None:
         interval = max(int(self.context.settings.worker_heartbeat_seconds), 5)
         while True:
             await asyncio.sleep(interval)
             owned = await asyncio.to_thread(
                 self.queue.heartbeat,
                 job_id=job_id,
-                worker_id=self.worker_id,
+                worker_id=worker_id,
             )
             if not owned:
                 return

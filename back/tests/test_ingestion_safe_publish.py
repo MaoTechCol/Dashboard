@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 from zoneinfo import ZoneInfo
 
-from app.models import PublishedDashboardSnapshot
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.core.database import Base
+from app.models import AlarmHarvestRun, PublishedDashboardSnapshot
 from app.services.ingestion import IngestionService
 
 
@@ -114,6 +120,104 @@ class IngestionSafePublishTests(unittest.TestCase):
         self.assertEqual(window_start, datetime(2026, 8, 16, 12, 15, tzinfo=self.utc))
         self.assertEqual(window_end, cut_at)
 
+
+class _CohortRegistry:
+    def __init__(self) -> None:
+        self.companies = [
+            SimpleNamespace(slug="alpha", timezone="America/Bogota", device_ids=["a"], fleet_ids=[]),
+            SimpleNamespace(slug="beta", timezone="America/Bogota", device_ids=["b"], fleet_ids=[]),
+        ]
+
+    def reload(self) -> None:
+        return None
+
+    def all(self):
+        return self.companies
+
+    @staticmethod
+    def is_operational(company) -> bool:
+        return bool(company.device_ids or company.fleet_ids)
+
+
+class _CohortHub:
+    def __init__(self) -> None:
+        self.published: list[str] = []
+
+    async def publish(self, company_slug: str, payload: dict) -> None:
+        self.published.append(company_slug)
+
+
+class CohortPublicationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+            future=True,
+        )
+        Base.metadata.create_all(engine)
+        self.session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=True, future=True)
+        self.cut_at = datetime(2026, 8, 21, 3, 15, tzinfo=ZoneInfo("UTC"))
+        self.service = IngestionService.__new__(IngestionService)
+        self.service.session_factory = self.session_factory
+        self.service.registry = _CohortRegistry()
+        self.service._cut_publish_locks = {}
+        self.service._dirty = asyncio.Event()
+        self.service.hub = _CohortHub()
+
+        service = self.service
+
+        class Dashboard:
+            def clear_runtime_caches(self) -> None:
+                return None
+
+            def materialize_snapshot(self, company_slug: str, *, cut_at: datetime, cut_status: str):
+                with service.session_factory() as session:
+                    publication = session.get(PublishedDashboardSnapshot, company_slug)
+                    if publication is None:
+                        publication = PublishedDashboardSnapshot(company_slug=company_slug)
+                    publication.published_cut_at = cut_at
+                    publication.cut_status = cut_status
+                    session.add(publication)
+                    session.commit()
+                return {"meta": {"publishedCutAt": cut_at.isoformat()}}
+
+        self.service.dashboard = Dashboard()
+
+    def _add_successful_run(self, company_slug: str) -> None:
+        with self.session_factory() as session:
+            session.add(
+                AlarmHarvestRun(
+                    company_slug=company_slug,
+                    cut_at=self.cut_at,
+                    window_start=self.cut_at,
+                    window_end=self.cut_at,
+                    status="succeeded",
+                )
+            )
+            session.commit()
+
+    async def test_cohort_waits_for_every_operational_company(self) -> None:
+        self._add_successful_run("alpha")
+
+        result = await self.service._publish_harvest_cohort_if_ready(cut_at=self.cut_at)
+
+        self.assertFalse(result["cohort_ready"])
+        self.assertEqual(result["cohort_waiting_for"], ["beta"])
+        self.assertEqual(self.service.hub.published, [])
+
+    async def test_last_company_publishes_the_same_cut_for_the_whole_cohort(self) -> None:
+        self._add_successful_run("alpha")
+        self._add_successful_run("beta")
+
+        result = await self.service._publish_harvest_cohort_if_ready(cut_at=self.cut_at)
+
+        self.assertTrue(result["cohort_ready"])
+        self.assertEqual(result["cohort_published_companies"], ["alpha", "beta"])
+        with self.session_factory() as session:
+            alpha = session.get(PublishedDashboardSnapshot, "alpha")
+            beta = session.get(PublishedDashboardSnapshot, "beta")
+            self.assertEqual(alpha.published_cut_at, beta.published_cut_at)
 
 if __name__ == "__main__":
     unittest.main()

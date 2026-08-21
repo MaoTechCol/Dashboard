@@ -17,7 +17,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.time import as_timezone, ensure_utc, parse_timestamp, to_local_date, utc_now
-from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestDevice, AlarmHarvestRun, CatchupCursor, CompanyHistoricalRebuildJob, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset
+from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestDevice, AlarmHarvestRun, BackgroundJob, CatchupCursor, CompanyHistoricalRebuildJob, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, NormalizedAlarm, NormalizedStatus
 from app.services.company_registry import CompanyRegistry
 from app.services.dashboard import DashboardService
@@ -155,6 +155,7 @@ class IngestionService:
         self._last_device_sync_at = None
         self._catchup_locks: dict[str, asyncio.Lock] = {}
         self._harvest_locks: dict[str, asyncio.Lock] = {}
+        self._cut_publish_locks: dict[datetime, asyncio.Lock] = {}
         self._historical_rebuild_tasks: dict[int, asyncio.Task[Any]] = {}
 
     def _historical_rebuild_max_concurrency(self) -> int:
@@ -580,14 +581,98 @@ class IngestionService:
     async def _yield_to_ready_harvests(self) -> None:
         if self._maintenance_active():
             return
-        await self._run_due_harvests()
         await asyncio.sleep(0)
-        while any(
-            lock.locked()
-            for slug, lock in self._harvest_locks.items()
-            if not self._activation_bootstrap_running(slug)
-        ):
+        while True:
+            with self.session_factory() as session:
+                active_harvest = session.scalar(
+                    select(BackgroundJob.id)
+                    .where(
+                        BackgroundJob.job_type.in_(("harvest_cut", "refresh_snapshot")),
+                        BackgroundJob.status.in_(("queued", "running")),
+                    )
+                    .limit(1)
+                )
+            if active_harvest is None:
+                return
             await asyncio.sleep(0.5)
+
+    def _official_harvest_cohort(self) -> list[str]:
+        self.registry.reload()
+        return sorted(
+            company.slug
+            for company in self.registry.all()
+            if self.registry.is_operational(company)
+            and not self._activation_bootstrap_running(company.slug)
+        )
+
+    async def _publish_harvest_cohort_if_ready(self, *, cut_at: datetime) -> dict[str, Any]:
+        cut_at = ensure_utc(cut_at) or self._latest_due_cut()
+        lock = self._cut_publish_locks.setdefault(cut_at, asyncio.Lock())
+        async with lock:
+            cohort = self._official_harvest_cohort()
+            ready: list[str] = []
+            missing: list[str] = []
+            with self.session_factory() as session:
+                for company_slug in cohort:
+                    publication = session.get(PublishedDashboardSnapshot, company_slug)
+                    published_cut = (
+                        ensure_utc(publication.published_cut_at)
+                        if publication and publication.published_cut_at
+                        else None
+                    )
+                    if published_cut is not None and published_cut >= cut_at:
+                        ready.append(company_slug)
+                        continue
+                    succeeded_run = session.scalar(
+                        select(AlarmHarvestRun.id)
+                        .where(
+                            AlarmHarvestRun.company_slug == company_slug,
+                            AlarmHarvestRun.cut_at == cut_at,
+                            AlarmHarvestRun.status == "succeeded",
+                        )
+                        .limit(1)
+                    )
+                    if succeeded_run is None:
+                        missing.append(company_slug)
+                    else:
+                        ready.append(company_slug)
+
+            if missing:
+                return {
+                    "cohort_ready": False,
+                    "cohort_published": False,
+                    "cohort_companies": cohort,
+                    "cohort_waiting_for": missing,
+                }
+
+            published: list[str] = []
+            for company_slug in cohort:
+                with self.session_factory() as session:
+                    publication = session.get(PublishedDashboardSnapshot, company_slug)
+                    published_cut = (
+                        ensure_utc(publication.published_cut_at)
+                        if publication and publication.published_cut_at
+                        else None
+                    )
+                if published_cut is not None and published_cut >= cut_at:
+                    continue
+                payload = await asyncio.to_thread(
+                    self.dashboard.materialize_snapshot,
+                    company_slug,
+                    cut_at=cut_at,
+                    cut_status="succeeded",
+                )
+                await self.hub.publish(company_slug, payload)
+                published.append(company_slug)
+            if published:
+                self.mark_dirty()
+            return {
+                "cohort_ready": True,
+                "cohort_published": bool(published),
+                "cohort_companies": cohort,
+                "cohort_published_companies": published,
+                "cohort_waiting_for": [],
+            }
 
     async def _update_rebuild_progress(
         self,
@@ -1447,12 +1532,16 @@ class IngestionService:
                     session.commit()
                     run_status = run_row.status
 
-            if run_status == "succeeded":
+            cohort_result: dict[str, Any] = {}
+            if run_status == "succeeded" and not force:
+                cohort_result = await self._publish_harvest_cohort_if_ready(cut_at=cut_at)
+            elif run_status == "succeeded":
                 publish_cut_at = self._resolve_safe_publish_cut_for_harvest(
                     company_slug=company.slug,
                     harvested_cut_at=cut_at,
                 )
-                payload = self.dashboard.materialize_snapshot(
+                payload = await asyncio.to_thread(
+                    self.dashboard.materialize_snapshot,
                     company.slug,
                     cut_at=publish_cut_at,
                     cut_status="succeeded",
@@ -1467,6 +1556,7 @@ class IngestionService:
                     last_error=self._harvest_run_error(run_id),
                 )
             serialized = self._serialize_harvest_run(run_id)
+            serialized.update(cohort_result)
             if next_retry_at is not None:
                 serialized["next_retry_at"] = next_retry_at.isoformat()
             return serialized
