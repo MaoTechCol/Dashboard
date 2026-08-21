@@ -3466,9 +3466,6 @@ function AdminAuditModule({
         <div className="panel-copy" style={{ marginBottom: "1rem" }}>
           Filtro activo: {activeReviewFilterLabel}. Toda la bandeja respeta {range.label.toLowerCase()}.
         </div>
-        <div className="panel-copy" style={{ marginBottom: "1rem" }}>
-          Si apruebas un caso, quedara listo para entrar en el siguiente corte o con refresh manual. Si lo descartas, saldra de la bandeja y seguira fuera del dashboard cliente.
-        </div>
         <div className="toolbar admin-toolbar" style={{ marginBottom: "1rem" }}>
           <span className="chip">{selectedVisibleCount} seleccionados en el filtro actual</span>
           <button
@@ -3627,7 +3624,6 @@ function AdminAuditModule({
                     <strong>{review.visibility_status ?? "-"}</strong>
                   </div>
                 </div>
-                {review.diagnostic_note ? <div className="panel-copy review-note">{review.diagnostic_note}</div> : null}
                 <div className="review-card-actions">
                   <button className="primary-btn" type="button" onClick={() => void decideReviews([review.id], "approve")} disabled={actionLoading}>
                     <Shield size={16} />
