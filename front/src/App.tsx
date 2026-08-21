@@ -1670,6 +1670,9 @@ function AdminOperationsModule({
     if (item.rebuild_status === "failed") {
       return "Reconstruccion con fallo";
     }
+    if (item.rebuild_status === "awaiting_approval") {
+      return "Pendiente de aprobacion por cobertura km";
+    }
     if (item.rebuild_status === "running") {
       return "Reconstruyendo historico";
     }
@@ -1677,6 +1680,24 @@ function AdminOperationsModule({
       return "En cola de reconstruccion";
     }
     return "Pendiente de publicacion";
+  }, []);
+
+  const formatRebuildPhase = useCallback((phase?: string | null) => {
+    const labels: Record<string, string> = {
+      alarm_provider: "Consultando alarmas del proveedor",
+      alarm_normalization: "Normalizando alarmas",
+      alarm_raw: "Guardando evidencia de alarmas",
+      alarm_dms: "Guardando DMS analitico",
+      km_provider: "Consultando kilometraje diario",
+      km_validation: "Validando y guardando kilometraje",
+      km_persistence: "Guardando kilometraje validado",
+      awaiting_mileage_approval: "Esperando decision por cobertura de kilometraje",
+      snapshot: "Construyendo primer snapshot",
+      publication: "Publicando empresa",
+      succeeded: "Publicacion terminada",
+      waiting_retry: "Esperando reintento del proveedor",
+    };
+    return phase ? labels[phase] ?? phase.replaceAll("_", " ") : "Preparando reconstruccion";
   }, []);
 
   const loadAdmin = useCallback(async (background = false) => {
@@ -1926,23 +1947,60 @@ function AdminOperationsModule({
       if (!confirmed) {
         return;
       }
+      const confirmation = window.prompt(
+        `Se creara un respaldo antes de borrar. Para confirmar definitivamente escribe: ELIMINAR ${companyToDeactivate.slug}`,
+      );
+      if (confirmation !== `ELIMINAR ${companyToDeactivate.slug}`) {
+        setError("La desactivacion fue cancelada porque la confirmacion no coincide.");
+        return;
+      }
+      try {
+        setCompanySaving(true);
+        setError(null);
+        setSuccess(null);
+        const nextCatalog = await apiJson<AdminCompanyCatalog>(
+          `/admin/companies/${encodeURIComponent(companyToDeactivate.slug)}/deactivate`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ confirmation, backup_confirmed: true }),
+          },
+        );
+        setCompanyCatalog(nextCatalog);
+        setSuccess(
+          `La desactivacion de ${companyToDeactivate.name} quedo encolada. El worker creara el respaldo y luego retirara datos, usuario y selector.`,
+        );
+      } catch (nextError) {
+        setError(nextError instanceof Error ? nextError.message : "No se pudo desactivar la empresa");
+      } finally {
+        setCompanySaving(false);
+      }
+      return;
     }
+  };
+
+  const approveDegradedPublication = async (item: AdminCompanyCatalogItem) => {
+    const expected = `PUBLICAR ${item.slug}`;
+    const confirmation = window.prompt(
+      `La cobertura de kilometraje es ${item.mileage_coverage_pct?.toFixed(1) ?? "0"}%. La empresa se publicara con las excepciones visibles en Diagnostico. Escribe: ${expected}`,
+    );
+    if (confirmation !== expected) return;
     try {
       setCompanySaving(true);
       setError(null);
       setSuccess(null);
       const nextCatalog = await apiJson<AdminCompanyCatalog>(
-        `/admin/companies/${encodeURIComponent(companyToDeactivate.slug)}/deactivate`,
+        `/admin/companies/${encodeURIComponent(item.slug)}/approve-degraded-publication`,
         {
           method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmation }),
         },
       );
       setCompanyCatalog(nextCatalog);
-      setSuccess(
-        `La desactivacion de ${companyToDeactivate.name} quedo encolada. El worker retirara datos, usuario y selector de forma auditada sin bloquear la consola.`,
-      );
+      setSuccess(`La publicacion degradada de ${item.name} quedo aprobada y el worker terminara el snapshot inicial.`);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "No se pudo desactivar la empresa");
+      setError(nextError instanceof Error ? nextError.message : "No se pudo aprobar la publicacion degradada");
     } finally {
       setCompanySaving(false);
     }
@@ -2294,11 +2352,14 @@ function AdminOperationsModule({
             <div className="stack" style={{ marginTop: "0.85rem" }}>
               {activationJobs.map((item) => {
                 const hasRowProgress = (item.rebuild_rows_total ?? 0) > 0;
-                const progressLabel = hasRowProgress
+                const alarmProgressLabel = hasRowProgress
                   ? `${item.rebuild_rows_processed ?? 0}/${item.rebuild_rows_total ?? 0} eventos`
                   : item.rebuild_days_total > 0
                     ? `${item.rebuild_days_done}/${item.rebuild_days_total} dias`
                     : "preparando reconstruccion";
+                const mileageProgressLabel = (item.mileage_rows_total ?? 0) > 0
+                  ? `${item.mileage_valid_days ?? 0}/${item.mileage_rows_total ?? 0} dias/vehiculo validos`
+                  : `${item.mileage_devices_done ?? 0}/${item.mileage_devices_total ?? 0} vehiculos de kilometraje`;
                 return (
                   <div key={item.slug} className="panel compact" style={{ padding: "0.95rem 1rem" }}>
                     <div className="panel-head">
@@ -2318,10 +2379,21 @@ function AdminOperationsModule({
                             Desactivar
                           </button>
                         ) : null}
+                        {item.degraded_publication_required ? (
+                          <button
+                            className="primary-btn"
+                            type="button"
+                            onClick={() => void approveDegradedPublication(item)}
+                            disabled={companySaving}
+                          >
+                            <Shield size={16} />
+                            Aprobar publicacion degradada
+                          </button>
+                        ) : null}
                       </div>
                     </div>
                     <div className="panel-copy" style={{ marginTop: "0.7rem" }}>
-                      {progressLabel}
+                      {formatRebuildPhase(item.rebuild_phase)} · Alarmas: {alarmProgressLabel}
                       {item.rebuild_progress_pct !== null ? ` · ${item.rebuild_progress_pct}%` : ""} · aun no aparece en el selector superior.
                     </div>
                     {item.rebuild_progress_pct !== null ? (
@@ -2336,6 +2408,11 @@ function AdminOperationsModule({
                         />
                       </div>
                     ) : null}
+                    <div className="panel-copy" style={{ marginTop: "0.7rem" }}>
+                      Kilometraje: {mileageProgressLabel}
+                      {item.mileage_coverage_pct != null ? ` · cobertura ${item.mileage_coverage_pct.toFixed(1)}%` : ""}
+                      {(item.mileage_missing_days ?? 0) > 0 ? ` · ${item.mileage_missing_days} faltantes` : ""}
+                    </div>
                     <div className="panel-copy" style={{ marginTop: "0.7rem" }}>
                       {item.rebuild_next_retry_at
                         ? `Reintento programado: ${formatDateTime(item.rebuild_next_retry_at, item.timezone)}`
@@ -3248,10 +3325,38 @@ function AdminAuditModule({
 
   const decideReviews = async (reviewIds: number[], action: "approve" | "discard") => {
     if (reviewIds.length === 0) return;
+    const kmReviews = reviewQueue.filter(
+      (review) => reviewIds.includes(review.id) && review.suggested_action === "review_km",
+    );
+    if (action === "approve" && kmReviews.length > 1) {
+      setError("Las reparaciones de kilometraje deben aprobarse una por una para registrar el valor corregido de cada vehiculo y dia.");
+      return;
+    }
     try {
       setActionLoading(true);
       setError(null);
       setSuccess(null);
+      if (action === "approve" && kmReviews.length === 1) {
+        const review = kmReviews[0];
+        const rawValue = window.prompt(
+          `Escribe el kilometraje diario corregido para ${review.plate_no ?? review.device_id ?? "este vehiculo"}. Usa kilometros, por ejemplo 125.4.`,
+        );
+        if (rawValue === null) return;
+        const replacementDayKm = Number(rawValue.replace(",", "."));
+        if (!Number.isFinite(replacementDayKm) || replacementDayKm < 0) {
+          setError("El kilometraje corregido debe ser un numero mayor o igual a cero.");
+          return;
+        }
+        await apiJson(`/admin/reconciliation/reviews/${review.id}/approve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ replacement_day_km: replacementDayKm, note: "Reparacion aprobada manualmente" }),
+        });
+        setSuccess("Kilometraje corregido y aprobado. Se publicara en el siguiente corte o refresh manual.");
+        setSelectedReviewIds([]);
+        await refreshDiagnostic(true);
+        return;
+      }
       const queuedJob = await apiJson<BackgroundJobStatus>(`/admin/reconciliation/reviews/bulk/${action}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

@@ -447,6 +447,155 @@ class HowenClient:
                 end_at=end_at,
             )
 
+    async def fetch_track_mileage(
+        self,
+        token: str,
+        *,
+        device_id: str,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[dict[str, Any]]:
+        """Read the documented VSS track feed used by Mileage Record.
+
+        The API reports mileage fields in units of ten metres. Conversion is
+        intentionally deferred to ingestion so the original values remain
+        available for audit and future reprocessing.
+        """
+        url = f"{self.settings.howen_http_base.rstrip('/')}/track/getTrackList.action"
+        page_size = max(int(getattr(self.settings, "mileage_track_page_size", 500)), 1)
+        rows: list[dict[str, Any]] = []
+        page_num = 1
+        previous_fingerprint: tuple[str, ...] | None = None
+
+        while True:
+            body = {
+                "token": token,
+                "deviceID": device_id,
+                "deviceId": device_id,
+                "deviceid": device_id,
+                "beginTime": start_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "endTime": end_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "pageNum": str(page_num),
+                "pageCount": str(page_size),
+            }
+            payload = await self._post_json(url, body, timeout=60.0)
+            if payload.get("status") != 10000:
+                message = payload.get("msg") or "Unable to fetch historical mileage"
+                if self.is_no_data_error(message):
+                    return rows
+                if self.is_rate_limited(message):
+                    raise HowenRateLimitError(message)
+                raise RuntimeError(message)
+
+            page_rows = _extract_rows(payload)
+            if not page_rows:
+                break
+            fingerprint = tuple(
+                str(row.get("guid") or row.get("id") or row.get("dtu") or row.get("time") or index)
+                for index, row in enumerate(page_rows[:5])
+            )
+            if fingerprint == previous_fingerprint:
+                break
+            previous_fingerprint = fingerprint
+            rows.extend(page_rows)
+            if len(page_rows) < page_size:
+                break
+            page_num += 1
+
+        return rows
+
+    async def fetch_track_mileage_authorized(
+        self,
+        *,
+        device_id: str,
+        start_at: datetime,
+        end_at: datetime,
+        force_login: bool = False,
+    ) -> list[dict[str, Any]]:
+        session = await self.resolve_session(force_login=force_login)
+        try:
+            return await self.fetch_track_mileage(
+                session.token,
+                device_id=device_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
+        except Exception as exc:
+            if not self.is_auth_error(exc):
+                raise
+            await self.invalidate_session()
+            session = await self.resolve_session(force_login=True)
+            return await self.fetch_track_mileage(
+                session.token,
+                device_id=device_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
+
+    async def fetch_daily_mileage_report(
+        self,
+        token: str,
+        *,
+        device_ids: list[str],
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[dict[str, Any]]:
+        """Use the same aggregate endpoint as VSS Daily Mileage Report."""
+        normalized_ids = sorted({str(value).strip() for value in device_ids if str(value).strip()})
+        if not normalized_ids:
+            return []
+        url = f"{self.settings.howen_http_base.rstrip('/')}/mileage/mileageStatDY.action"
+        payload = await self._post_json(
+            url,
+            {
+                "token": token,
+                "startDate": start_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "endDate": end_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "deviceIdList": normalized_ids,
+                "dimen": "DAY",
+            },
+            timeout=90.0,
+        )
+        if payload.get("status") != 10000:
+            message = payload.get("msg") or "Unable to fetch daily mileage report"
+            if self.is_no_data_error(message):
+                return []
+            if self.is_rate_limited(message):
+                raise HowenRateLimitError(message)
+            raise RuntimeError(message)
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+        return _extract_rows(payload)
+
+    async def fetch_daily_mileage_report_authorized(
+        self,
+        *,
+        device_ids: list[str],
+        start_at: datetime,
+        end_at: datetime,
+        force_login: bool = False,
+    ) -> list[dict[str, Any]]:
+        session = await self.resolve_session(force_login=force_login)
+        try:
+            return await self.fetch_daily_mileage_report(
+                session.token,
+                device_ids=device_ids,
+                start_at=start_at,
+                end_at=end_at,
+            )
+        except Exception as exc:
+            if not self.is_auth_error(exc):
+                raise
+            await self.invalidate_session()
+            session = await self.resolve_session(force_login=True)
+            return await self.fetch_daily_mileage_report(
+                session.token,
+                device_ids=device_ids,
+                start_at=start_at,
+                end_at=end_at,
+            )
+
     async def fetch_evidence_alarms(
         self,
         token: str,

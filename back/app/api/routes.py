@@ -20,7 +20,9 @@ from app.schemas import (
     BackfillRequest,
     CompanyActivationRequest,
     CompanyAssignmentRequest,
+    CompanyDeactivationRequest,
     CompanyPasswordChangeRequest,
+    DegradedPublicationApprovalRequest,
     HarvestRerunRequest,
     HistoricalRebuildRequest,
     KmRepairRequest,
@@ -428,17 +430,32 @@ async def admin_activate_company(request: Request, payload: CompanyActivationReq
 
 
 @router.post("/admin/companies/{company_slug}/deactivate", status_code=status.HTTP_202_ACCEPTED)
-async def admin_deactivate_company(company_slug: str, request: Request) -> dict[str, object]:
-    require_admin(request)
+async def admin_deactivate_company(
+    company_slug: str,
+    request: Request,
+    payload: CompanyDeactivationRequest,
+) -> dict[str, object]:
+    user = require_admin(request)
     context = get_context(request)
     try:
         context.registry.get(company_slug)
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
+    expected_confirmation = f"ELIMINAR {company_slug}"
+    if payload.confirmation.strip() != expected_confirmation or not payload.backup_confirmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Confirma el respaldo y escribe exactamente: {expected_confirmation}",
+        )
+
     queued_job = context.jobs.enqueue(
         job_type="company_purge",
-        payload={"company_slug": company_slug},
+        payload={
+            "company_slug": company_slug,
+            "requested_by": user.username,
+            "backup_confirmed": True,
+        },
         priority=PRIORITY_COMPANY_PURGE,
         idempotency_key=f"company_purge:{company_slug}:{uuid4().hex}",
         company_slug=company_slug,
@@ -447,6 +464,46 @@ async def admin_deactivate_company(company_slug: str, request: Request) -> dict[
         "job_id": queued_job["job_id"],
         "job_type": queued_job["job_type"],
         "status": queued_job["status"],
+    }
+
+
+@router.post(
+    "/admin/companies/{company_slug}/approve-degraded-publication",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def admin_approve_degraded_publication(
+    company_slug: str,
+    request: Request,
+    payload: DegradedPublicationApprovalRequest,
+) -> dict[str, object]:
+    user = require_admin(request)
+    context = get_context(request)
+    expected_confirmation = f"PUBLICAR {company_slug}"
+    if payload.confirmation.strip() != expected_confirmation:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Escribe exactamente: {expected_confirmation}",
+        )
+    try:
+        queued = context.ingestion.approve_degraded_company_publication(
+            company_slug=company_slug,
+            approved_by=user.username,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    context.jobs.enqueue(
+        job_type="historical_rebuild",
+        payload={
+            "request": queued["request"],
+            "rebuild_job_id": queued["rebuild_job_id"],
+        },
+        priority=PRIORITY_HISTORICAL_REBUILD,
+        idempotency_key=f"historical_rebuild:degraded:{queued['rebuild_job_id']}",
+        company_slug=company_slug,
+    )
+    return admin_companies(request) | {
+        "job_type": "historical_rebuild",
+        "status": "queued",
     }
 
 
@@ -749,6 +806,7 @@ def admin_reconciliation_review_approve(
         action="approve",
         decided_by=user.username,
         note=payload.note if payload else None,
+        replacement_day_km=payload.replacement_day_km if payload else None,
     )
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision no encontrada")
@@ -768,6 +826,7 @@ def admin_reconciliation_review_discard(
         action="discard",
         decided_by=user.username,
         note=payload.note if payload else None,
+        replacement_day_km=payload.replacement_day_km if payload else None,
     )
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision no encontrada")

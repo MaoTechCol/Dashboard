@@ -6,18 +6,20 @@ import os
 import signal
 import socket
 from contextlib import suppress
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
 from app.bootstrap import AppContext, build_context
 from app.core.systemd import memory_monitor_loop, notify_systemd, watchdog_loop
 from app.core.time import ensure_utc
-from app.models import CompanyHistoricalRebuildJob, IngestState
+from app.models import CompanyHistoricalRebuildJob, IngestState, PublishedDashboardSnapshot
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, KmRepairRequest
 from app.services.job_queue import (
+    PRIORITY_DATA_MAINTENANCE,
     PRIORITY_HISTORICAL_REBUILD,
     JobQueue,
     RetryJob,
@@ -35,6 +37,7 @@ MAINTENANCE_JOB_TYPES = {
     "reconciliation",
     "replay_status_anomalies",
     "km_repair",
+    "mileage_daily_close",
     "review_bulk_decision",
     "purge_mock",
 }
@@ -183,6 +186,39 @@ class DashboardWorker:
                 queued_count += 1
         if queued_count:
             logger.info("worker_harvests_enqueued count=%s due=%s", queued_count, len(due_cuts))
+        await asyncio.to_thread(self._enqueue_daily_mileage_closures)
+
+    def _enqueue_daily_mileage_closures(self) -> None:
+        """Close yesterday and perform one late-data verification for D-2."""
+        self.context.registry.reload()
+        with self.context.session_factory() as session:
+            published_companies = set(
+                session.scalars(
+                    select(PublishedDashboardSnapshot.company_slug).where(
+                        PublishedDashboardSnapshot.snapshot_json.is_not(None)
+                    )
+                )
+            )
+        for company in self.context.registry.all():
+            if (
+                not self.context.registry.is_operational(company)
+                or company.slug not in published_companies
+            ):
+                continue
+            local_today = datetime.now(ZoneInfo(company.timezone)).date()
+            for offset, run_kind in ((1, "close"), (2, "late_verify")):
+                target_date = local_today - timedelta(days=offset)
+                self.queue.enqueue(
+                    job_type="mileage_daily_close",
+                    payload={
+                        "company_slug": company.slug,
+                        "target_date": target_date.isoformat(),
+                        "run_kind": run_kind,
+                    },
+                    priority=PRIORITY_DATA_MAINTENANCE,
+                    idempotency_key=f"mileage:{run_kind}:{company.slug}:{target_date.isoformat()}",
+                    company_slug=company.slug,
+                )
 
     def _enqueue_orphaned_rebuilds(self) -> None:
         """Move rebuilds left by the pre-worker process into the durable queue."""
@@ -370,11 +406,35 @@ class DashboardWorker:
             return result
         if job_type == "company_purge":
             company_slug = str(payload["company_slug"])
-            result = await self.context.ingestion.purge_company_operational_data(company_slug=company_slug)
-            self.context.auth.delete_company_users(company_slug=company_slug)
-            self.context.registry.delete_company(slug=company_slug)
-            self.context.ingestion.mark_dirty()
-            return result
+            requested_by = str(payload.get("requested_by") or "admin")
+            backup = await asyncio.to_thread(
+                self.context.ingestion.backup_company_operational_data,
+                company_slug=company_slug,
+                requested_by=requested_by,
+            )
+            try:
+                result = await self.context.ingestion.purge_company_operational_data(company_slug=company_slug)
+                self.context.auth.delete_company_users(company_slug=company_slug)
+                self.context.registry.delete_company(slug=company_slug)
+                self.context.ingestion.finish_company_lifecycle_audit(
+                    audit_id=int(backup["audit_id"]),
+                    status="completed",
+                    detail=result,
+                )
+                self.context.ingestion.mark_dirty()
+                return result | {"backup": backup}
+            except Exception as exc:
+                self.context.ingestion.finish_company_lifecycle_audit(
+                    audit_id=int(backup["audit_id"]),
+                    status="purge_failed",
+                    error=str(exc),
+                )
+                raise
+        if job_type == "mileage_daily_close":
+            return await self.context.ingestion.rebuild_daily_mileage(
+                company_slug=str(payload["company_slug"]),
+                target_date=date.fromisoformat(str(payload["target_date"])),
+            )
         if job_type == "reconciliation":
             return await self.context.dashboard.process_reconciliation_job(str(payload["reconciliation_job_id"]))
         if job_type == "replay_status_anomalies":
@@ -382,12 +442,14 @@ class DashboardWorker:
             self.context.ingestion.mark_dirty()
             return result
         if job_type == "km_repair":
-            result = await asyncio.to_thread(
-                self.context.dashboard.repair_km,
-                KmRepairRequest.model_validate(payload["request"]),
-            )
-            self.context.ingestion.mark_dirty()
-            return result
+            request = KmRepairRequest.model_validate(payload["request"])
+            try:
+                return await self.context.ingestion.rebuild_mileage_window(request)
+            except Exception as exc:
+                next_retry_at = getattr(exc, "next_retry_at", None)
+                if next_retry_at is not None:
+                    raise RetryJob(str(exc), next_retry_at) from exc
+                raise
         if job_type == "review_bulk_decision":
             result = await asyncio.to_thread(
                 self.context.dashboard.decide_reconciliation_reviews_bulk,

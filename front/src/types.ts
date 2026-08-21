@@ -28,7 +28,7 @@ export interface AdminCompanyCatalogItem {
   device_ids: string[];
   operational: boolean;
   ready_in_selector: boolean;
-  rebuild_status: "idle" | "queued" | "running" | "succeeded" | "ready" | "failed";
+  rebuild_status: "idle" | "queued" | "running" | "succeeded" | "ready" | "failed" | "awaiting_approval";
   rebuild_progress_pct: number | null;
   rebuild_days_done: number;
   rebuild_days_total: number;
@@ -37,6 +37,17 @@ export interface AdminCompanyCatalogItem {
   rebuild_rows_processed?: number;
   rebuild_current_device_id?: string | null;
   rebuild_last_heartbeat_at?: string | null;
+  mileage_days_total: number;
+  mileage_days_done: number;
+  mileage_devices_total: number;
+  mileage_devices_done: number;
+  mileage_rows_total: number;
+  mileage_rows_processed: number;
+  mileage_valid_days: number;
+  mileage_missing_days: number;
+  mileage_coverage_pct: number | null;
+  degraded_publication_approved: boolean;
+  degraded_publication_required: boolean;
   rebuild_started_at: string | null;
   rebuild_finished_at: string | null;
   rebuild_next_retry_at: string | null;

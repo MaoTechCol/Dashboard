@@ -13,6 +13,8 @@ Las reconstrucciones iniciales de empresas usan escritura masiva sin cambiar los
 - `HOWEN_ALARM_SOURCE=evidence_bulk` usa la misma consulta agrupada de Alarm Clips para los cortes de 15 minutos.
 - `HOWEN_ALARM_SOURCE=official_device` restaura inmediatamente la consulta historica por vehiculo.
 
+La activacion reconstruye tambien el kilometraje con el reporte diario oficial de Howen. Los huecos no se convierten en cero: quedan como revisiones manuales. La empresa solo se publica al superar `MILEAGE_REBUILD_MIN_COVERAGE_PCT`, salvo aprobacion degradada explicita del administrador. La desactivacion exige doble confirmacion y genera un backup JSONL junto con un archivo de los PDF cargados.
+
 El benchmark reproducible no toca datos productivos. En PostgreSQL usa un esquema temporal que elimina al terminar:
 
 ```bash

@@ -138,6 +138,22 @@ class AdminCompanyCatalogItemView(BaseModel):
     rebuild_next_retry_at: datetime | None = None
     rebuild_published_cut_at: datetime | None = None
     rebuild_error_message: str | None = None
+    rebuild_phase: str | None = None
+    rebuild_rows_total: int = 0
+    rebuild_rows_processed: int = 0
+    rebuild_current_device_id: str | None = None
+    rebuild_last_heartbeat_at: datetime | None = None
+    mileage_days_total: int = 0
+    mileage_days_done: int = 0
+    mileage_devices_total: int = 0
+    mileage_devices_done: int = 0
+    mileage_rows_total: int = 0
+    mileage_rows_processed: int = 0
+    mileage_valid_days: int = 0
+    mileage_missing_days: int = 0
+    mileage_coverage_pct: float | None = None
+    degraded_publication_approved: bool = False
+    degraded_publication_required: bool = False
     can_deactivate: bool = True
 
 
@@ -445,6 +461,7 @@ class ReconciliationDrilldownRow(BaseModel):
 
 class ReconciliationReviewDecisionRequest(BaseModel):
     note: str | None = None
+    replacement_day_km: float | None = Field(default=None, ge=0)
 
 
 class ReconciliationReviewBulkDecisionRequest(BaseModel):
@@ -566,6 +583,15 @@ class CompanyActivationRequest(BaseModel):
     device_ids: list[str] = Field(default_factory=list)
     notes: str | None = None
     client_password: str = Field(min_length=1)
+
+
+class CompanyDeactivationRequest(BaseModel):
+    confirmation: str
+    backup_confirmed: bool = False
+
+
+class DegradedPublicationApprovalRequest(BaseModel):
+    confirmation: str
 
 
 class AdminPasswordChangeRequest(BaseModel):

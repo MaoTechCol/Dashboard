@@ -45,6 +45,38 @@ class MileageReading(Base):
     source: Mapped[str] = mapped_column(String(32), default="status")
 
 
+class MileageObservation(Base):
+    __tablename__ = "mileage_observations"
+    __table_args__ = (
+        UniqueConstraint("observation_key", name="uq_mileage_observations_key"),
+        Index("ix_mileage_observations_company_observed", "company_slug", "observed_at"),
+        Index(
+            "ix_mileage_observations_company_device_observed",
+            "company_slug",
+            "device_id",
+            "observed_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    observation_key: Mapped[str] = mapped_column(String(255), index=True)
+    company_slug: Mapped[str] = mapped_column(String(64), index=True)
+    device_id: Mapped[str] = mapped_column(String(128), index=True)
+    fleet_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    plate_no: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source: Mapped[str] = mapped_column(String(32), index=True)
+    total_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    day_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    raw_total_value: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    raw_day_value: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    validation_status: Mapped[str] = mapped_column(String(32), index=True, default="valid")
+    validation_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class DailyMileageSnapshot(Base):
     __tablename__ = "daily_mileage_snapshots"
     __table_args__ = (
@@ -67,6 +99,17 @@ class DailyMileageSnapshot(Base):
     repair_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     repaired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     source: Mapped[str] = mapped_column(String(32), default="live")
+    closure_status: Mapped[str] = mapped_column(String(32), index=True, default="provisional")
+    coverage_status: Mapped[str] = mapped_column(String(32), index=True, default="covered")
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_observed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_observed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    late_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    excluded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    excluded_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
@@ -288,6 +331,20 @@ class CompanyHistoricalRebuildJob(Base):
     rows_total: Mapped[int] = mapped_column(Integer, default=0)
     rows_processed: Mapped[int] = mapped_column(Integer, default=0)
     current_device_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    current_device_offset: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_days_total: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_days_done: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_devices_total: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_devices_done: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_rows_total: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_rows_processed: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_valid_days: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_missing_days: Mapped[int] = mapped_column(Integer, default=0)
+    mileage_coverage_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_mileage_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    degraded_publication_approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    degraded_publication_approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    degraded_publication_approved_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     last_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     inserted: Mapped[int] = mapped_column(Integer, default=0)
     anomalies: Mapped[int] = mapped_column(Integer, default=0)
@@ -319,6 +376,23 @@ class ReconciliationJob(Base):
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     result_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class CompanyLifecycleAudit(Base):
+    __tablename__ = "company_lifecycle_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    company_slug: Mapped[str] = mapped_column(String(64), index=True)
+    action: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    requested_by: Mapped[str] = mapped_column(String(128), index=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    backup_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    backup_sha256: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    detail_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class AlarmHarvestRun(Base):

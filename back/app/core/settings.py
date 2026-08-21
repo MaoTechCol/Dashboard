@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     historical_rebuild_max_concurrency: int = 1
     historical_batch_mode: str = "activation_only"
     historical_batch_size: int = 500
+    mileage_track_page_size: int = 500
+    mileage_rebuild_min_coverage_pct: float = 85.0
+    mileage_max_daily_km: float = 1_500.0
+    mileage_source_disagreement_tolerance_km: float = 5.0
+    mileage_close_grace_minutes: int = 90
+    company_backup_dir_name: str = "company_backups"
     reconciliation_cache_ttl_minutes: int = 120
     process_role: str = "api"
     worker_poll_interval_seconds: float = 1.0
@@ -158,6 +164,10 @@ class Settings(BaseSettings):
     @property
     def upload_dir(self) -> Path:
         return self.root_dir / "storage" / "uploads"
+
+    @property
+    def company_backup_dir(self) -> Path:
+        return self.root_dir / "storage" / self.company_backup_dir_name
 
     @property
     def session_cache_path(self) -> Path:

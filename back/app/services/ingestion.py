@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.time import as_timezone, ensure_utc, parse_timestamp, to_local_date, utc_now
-from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestDevice, AlarmHarvestRun, BackgroundJob, CatchupCursor, CompanyHistoricalRebuildJob, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset
+from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestDevice, AlarmHarvestRun, BackgroundJob, CatchupCursor, CompanyHistoricalRebuildJob, CompanyLifecycleAudit, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, MileageObservation, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, NormalizedAlarm, NormalizedStatus
 from app.services.company_registry import CompanyRegistry
 from app.services.dashboard import DashboardService
@@ -121,6 +122,32 @@ class AlarmBatchResult:
             "latest_observed_at": (
                 ensure_utc(self.latest_observed_at).isoformat() if self.latest_observed_at else None
             ),
+        }
+
+
+@dataclass
+class MileageRebuildResult:
+    provider_rows: int = 0
+    observations_written: int = 0
+    snapshots_written: int = 0
+    expected_device_days: int = 0
+    valid_device_days: int = 0
+    missing_device_days: int = 0
+    review_cases: int = 0
+    coverage_pct: float = 0.0
+    publication_allowed: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider_rows": self.provider_rows,
+            "observations_written": self.observations_written,
+            "snapshots_written": self.snapshots_written,
+            "expected_device_days": self.expected_device_days,
+            "valid_device_days": self.valid_device_days,
+            "missing_device_days": self.missing_device_days,
+            "review_cases": self.review_cases,
+            "coverage_pct": self.coverage_pct,
+            "publication_allowed": self.publication_allowed,
         }
 
 
@@ -508,7 +535,7 @@ class IngestionService:
                 .where(
                     CompanyHistoricalRebuildJob.company_slug == company_slug,
                     CompanyHistoricalRebuildJob.purpose == "activation_bootstrap",
-                    CompanyHistoricalRebuildJob.status.in_(("queued", "running")),
+                    CompanyHistoricalRebuildJob.status.in_(("queued", "running", "awaiting_approval")),
                 )
                 .order_by(CompanyHistoricalRebuildJob.created_at.desc(), CompanyHistoricalRebuildJob.id.desc())
             ).first()
@@ -708,6 +735,360 @@ class IngestionService:
             session.add(rebuild_job)
             session.commit()
 
+    async def rebuild_authoritative_mileage(
+        self,
+        *,
+        company_slug: str,
+        start_date_local: date,
+        end_date_local: date,
+        company_tz: ZoneInfo,
+        device_ids: list[str],
+        rebuild_job_id: int | None,
+    ) -> MileageRebuildResult:
+        """Rebuild daily mileage from the same aggregate report used by VSS."""
+        result = MileageRebuildResult()
+        now_utc = utc_now()
+        today_local = now_utc.astimezone(company_tz).date()
+        effective_end_date = min(end_date_local, today_local)
+        if effective_end_date < start_date_local or not device_ids:
+            result.publication_allowed = True
+            return result
+
+        report_start = datetime.combine(start_date_local, time.min, company_tz)
+        report_end = (
+            now_utc.astimezone(company_tz).replace(microsecond=0)
+            if effective_end_date == today_local
+            else datetime.combine(effective_end_date, time.max.replace(microsecond=0), company_tz)
+        )
+        if rebuild_job_id is not None:
+            self._set_rebuild_phase(
+                rebuild_job_id,
+                phase="km_provider",
+                mileage_days_total=(effective_end_date - start_date_local).days + 1,
+                mileage_devices_total=len(device_ids),
+            )
+
+        try:
+            rows = await self.howen.fetch_daily_mileage_report_authorized(
+                device_ids=device_ids,
+                start_at=report_start,
+                end_at=report_end,
+            )
+        except HowenRateLimitError as exc:
+            cooldown = max(float(self.settings.backfill_rate_limit_cooldown_seconds), 5.0)
+            raise HistoricalBackfillDeferred(
+                next_retry_at=now_utc + timedelta(seconds=cooldown),
+                message=f"Proveedor limitando la reconstruccion de kilometraje: {exc}",
+            ) from exc
+
+        result.provider_rows = len(rows)
+        all_dates = list(_date_range(start_date_local, effective_end_date))
+        result.expected_device_days = len(device_ids) * len(all_dates)
+
+        if rebuild_job_id is not None:
+            self._set_rebuild_phase(
+                rebuild_job_id,
+                phase="km_validation",
+                mileage_rows_total=result.expected_device_days,
+            )
+
+        with self.session_factory() as session:
+            devices = list(
+                session.scalars(select(DeviceRecord).where(DeviceRecord.device_id.in_(device_ids)))
+            )
+            devices_by_id = {device.device_id: device for device in devices}
+            device_by_plate = {
+                str(device.plate_no or "").strip().upper(): device
+                for device in devices
+                if str(device.plate_no or "").strip()
+            }
+            report_by_device: dict[str, dict[date, tuple[float, Any, dict[str, Any]]]] = {}
+            for row in rows:
+                device_id = _mileage_report_device_id(row)
+                if not device_id:
+                    plate_candidate = _mileage_report_plate(row)
+                    matched = device_by_plate.get(plate_candidate.upper()) if plate_candidate else None
+                    device_id = matched.device_id if matched else None
+                if not device_id or device_id not in devices_by_id:
+                    continue
+                values = _mileage_report_daily_values(
+                    row,
+                    start_date=start_date_local,
+                    end_date=effective_end_date,
+                )
+                if values:
+                    report_by_device.setdefault(device_id, {}).update(
+                        {day: (value, raw_value, row) for day, (value, raw_value) in values.items()}
+                    )
+
+            existing_snapshots = {
+                (snapshot.device_id, snapshot.snapshot_date): snapshot
+                for snapshot in session.scalars(
+                    select(DailyMileageSnapshot).where(
+                        DailyMileageSnapshot.device_id.in_(device_ids),
+                        DailyMileageSnapshot.snapshot_date >= start_date_local,
+                        DailyMileageSnapshot.snapshot_date <= effective_end_date,
+                    )
+                )
+            }
+            existing_observations = {
+                observation.observation_key: observation
+                for observation in session.scalars(
+                    select(MileageObservation).where(
+                        MileageObservation.company_slug == company_slug,
+                        MileageObservation.source == "howen_daily_report",
+                        MileageObservation.observed_at >= report_start.astimezone(ZoneInfo("UTC")),
+                        MileageObservation.observed_at <= report_end.astimezone(ZoneInfo("UTC")),
+                    )
+                )
+            }
+            tolerance = max(float(self.settings.mileage_source_disagreement_tolerance_km), 0.0)
+            max_daily_km = max(float(self.settings.mileage_max_daily_km), 1.0)
+
+            for device_id in device_ids:
+                device = devices_by_id.get(device_id)
+                plate_no = device.plate_no if device else None
+                fleet_id = device.fleet_id if device else None
+                values = report_by_device.get(device_id, {})
+                for snapshot_date in all_dates:
+                    report_value = values.get(snapshot_date)
+                    if report_value is None:
+                        result.missing_device_days += 1
+                        if self._ensure_km_review(
+                            session,
+                            company_slug=company_slug,
+                            device_id=device_id,
+                            plate_no=plate_no,
+                            snapshot_date=snapshot_date,
+                            reason="missing_day_km",
+                            diagnostic_note=(
+                                "Howen no devolvio evidencia de kilometraje diario para este vehiculo y fecha. "
+                                "No se publica como 0 km."
+                            ),
+                            payload={"source": "howen_daily_report", "status": "missing"},
+                        ):
+                            result.review_cases += 1
+                        continue
+
+                    day_km, raw_value, source_row = report_value
+                    observed_local = (
+                        now_utc.astimezone(company_tz)
+                        if snapshot_date == today_local
+                        else datetime.combine(snapshot_date, time.max.replace(microsecond=0), company_tz)
+                    )
+                    observed_at = observed_local.astimezone(ZoneInfo("UTC"))
+                    validation_status = "valid"
+                    validation_reason: str | None = None
+                    if day_km < 0:
+                        validation_status = "invalid"
+                        validation_reason = "negative_day_km"
+                    elif day_km > max_daily_km:
+                        validation_status = "invalid"
+                        validation_reason = "impossible_day_distance"
+
+                    snapshot = existing_snapshots.get((device_id, snapshot_date))
+                    if (
+                        validation_status == "valid"
+                        and snapshot
+                        and snapshot.source in {"howen_daily_report", "manual_repair"}
+                        and snapshot.day_km is not None
+                        and abs(float(snapshot.day_km) - day_km) > tolerance
+                        and snapshot.source == "manual_repair"
+                    ):
+                        validation_status = "review"
+                        validation_reason = "source_disagreement"
+
+                    observation_key = hashlib.sha256(
+                        f"howen_daily_report|{company_slug}|{device_id}|{snapshot_date.isoformat()}".encode("utf-8")
+                    ).hexdigest()
+                    observation = existing_observations.get(observation_key)
+                    if not observation:
+                        observation = MileageObservation(
+                            observation_key=observation_key,
+                            company_slug=company_slug,
+                            device_id=device_id,
+                            observed_at=observed_at,
+                            received_at=now_utc,
+                            source="howen_daily_report",
+                        )
+                    observation.fleet_id = fleet_id
+                    observation.plate_no = plate_no
+                    observation.total_km = None
+                    observation.day_km = day_km
+                    observation.raw_total_value = None
+                    observation.raw_day_value = str(raw_value)
+                    observation.validation_status = validation_status
+                    observation.validation_reason = validation_reason
+                    observation.payload_json = json.dumps(
+                        {
+                            "device_id": device_id,
+                            "date": snapshot_date.isoformat(),
+                            "day_km": day_km,
+                            "provider_total_mileage": source_row.get("totalMileage"),
+                        },
+                        ensure_ascii=True,
+                    )
+                    session.add(observation)
+                    result.observations_written += 1
+
+                    if validation_status != "valid":
+                        if self._ensure_km_review(
+                            session,
+                            company_slug=company_slug,
+                            device_id=device_id,
+                            plate_no=plate_no,
+                            snapshot_date=snapshot_date,
+                            reason=validation_reason or "invalid_day_km",
+                            diagnostic_note=_km_review_note(validation_reason),
+                            payload={
+                                "source": "howen_daily_report",
+                                "proposed_day_km": day_km,
+                                "previous_day_km": snapshot.day_km if snapshot else None,
+                            },
+                        ):
+                            result.review_cases += 1
+                        continue
+
+                    if snapshot and snapshot.excluded_at is not None:
+                        continue
+                    if snapshot and snapshot.source == "manual_repair":
+                        result.valid_device_days += 1
+                        continue
+
+                    total_km = (
+                        device.last_total_km
+                        if device and device.last_total_km is not None
+                        else snapshot.total_km if snapshot else day_km
+                    )
+                    if not snapshot:
+                        snapshot = DailyMileageSnapshot(
+                            device_id=device_id,
+                            snapshot_date=snapshot_date,
+                            observed_at=observed_at,
+                            total_km=float(total_km),
+                        )
+                        existing_snapshots[(device_id, snapshot_date)] = snapshot
+                    elif snapshot.closure_status == "closed" and snapshot.day_km != day_km:
+                        snapshot.late_updated_at = now_utc
+                    snapshot.plate_no = plate_no or snapshot.plate_no
+                    snapshot.company_slug = company_slug
+                    snapshot.fleet_id = fleet_id or snapshot.fleet_id
+                    snapshot.day_km = day_km
+                    snapshot.total_km = float(total_km)
+                    snapshot.raw_day_value = str(raw_value)
+                    snapshot.km_validation_status = "valid"
+                    snapshot.km_validation_reason = None
+                    snapshot.source = "howen_daily_report"
+                    snapshot.coverage_status = "covered"
+                    snapshot.closure_status = "provisional" if snapshot_date == today_local else "closed"
+                    snapshot.sample_count = max(snapshot.sample_count or 0, 1)
+                    snapshot.first_observed_at = snapshot.first_observed_at or observed_at
+                    snapshot.last_observed_at = observed_at
+                    snapshot.observed_at = observed_at
+                    snapshot.closed_at = None if snapshot_date == today_local else (snapshot.closed_at or now_utc)
+                    session.add(snapshot)
+                    result.snapshots_written += 1
+                    result.valid_device_days += 1
+
+            result.coverage_pct = round(
+                (result.valid_device_days / result.expected_device_days * 100.0)
+                if result.expected_device_days
+                else 100.0,
+                2,
+            )
+            approved_degraded = False
+            if rebuild_job_id is not None:
+                rebuild_job = session.get(CompanyHistoricalRebuildJob, rebuild_job_id)
+                if rebuild_job:
+                    approved_degraded = bool(rebuild_job.degraded_publication_approved)
+                    rebuild_job.mileage_days_done = len(all_dates)
+                    rebuild_job.mileage_devices_done = len(device_ids)
+                    rebuild_job.mileage_rows_processed = result.expected_device_days
+                    rebuild_job.mileage_valid_days = result.valid_device_days
+                    rebuild_job.mileage_missing_days = result.missing_device_days
+                    rebuild_job.mileage_coverage_pct = result.coverage_pct
+                    rebuild_job.last_mileage_date = effective_end_date
+                    rebuild_job.current_device_offset = len(device_ids)
+                    rebuild_job.last_heartbeat_at = now_utc
+                    session.add(rebuild_job)
+            result.publication_allowed = bool(
+                result.coverage_pct >= float(self.settings.mileage_rebuild_min_coverage_pct)
+                or approved_degraded
+            )
+            session.commit()
+        return result
+
+    def _set_rebuild_phase(self, rebuild_job_id: int, *, phase: str, **values: Any) -> None:
+        with self.session_factory() as session:
+            rebuild_job = session.get(CompanyHistoricalRebuildJob, rebuild_job_id)
+            if not rebuild_job:
+                return
+            rebuild_job.phase = phase
+            rebuild_job.last_heartbeat_at = utc_now()
+            for key, value in values.items():
+                if hasattr(rebuild_job, key):
+                    setattr(rebuild_job, key, value)
+            session.add(rebuild_job)
+            session.commit()
+        self.mark_dirty()
+
+    def _ensure_km_review(
+        self,
+        session: Any,
+        *,
+        company_slug: str,
+        device_id: str,
+        plate_no: str | None,
+        snapshot_date: date,
+        reason: str,
+        diagnostic_note: str,
+        payload: dict[str, Any],
+    ) -> bool:
+        review_key = f"km:{device_id}:{snapshot_date.isoformat()}:{reason}"
+        existing = session.scalar(
+            select(ReconciliationReview).where(ReconciliationReview.review_key == review_key)
+        )
+        if existing:
+            return False
+        observed_at = datetime.combine(
+            snapshot_date,
+            time(hour=12),
+            ZoneInfo(self.registry.get(company_slug).timezone or self.settings.default_timezone),
+        ).astimezone(ZoneInfo("UTC"))
+        session.add(
+            ReconciliationReview(
+                review_key=review_key,
+                company_slug=company_slug,
+                device_id=device_id,
+                plate_no=plate_no,
+                observed_at=observed_at,
+                portal_begin_time=snapshot_date.isoformat(),
+                portal_reporting_time=observed_at.isoformat(),
+                raw_alarm_type="Kilometraje",
+                classification_status="km_review",
+                visibility_status="km_pending_review",
+                category="Kilometraje",
+                subtype=reason,
+                reason=reason,
+                diagnostic_note=diagnostic_note,
+                suggested_action="review_km",
+                source_window_type="calendar_month_local",
+                portal_payload_json=json.dumps(
+                    {
+                        "type": "km_review",
+                        "company_slug": company_slug,
+                        "device_id": device_id,
+                        "plate_no": plate_no,
+                        "issue_date": snapshot_date.isoformat(),
+                        "reason": reason,
+                        **payload,
+                    },
+                    ensure_ascii=True,
+                ),
+            )
+        )
+        return True
+
     async def rebuild_historical_window(
         self,
         request: HistoricalRebuildRequest,
@@ -730,6 +1111,7 @@ class IngestionService:
         total_anomalies = 0
         total_failed_count = 0
         batch_metrics = AlarmBatchResult()
+        mileage_result: MileageRebuildResult | None = None
         latest_observed_at = None
         last_window_end_local = datetime.combine(end_date_local, time.max.replace(microsecond=0), company_tz)
         days_total = 0
@@ -779,9 +1161,9 @@ class IngestionService:
                     rebuild_job = session.get(CompanyHistoricalRebuildJob, rebuild_job_id)
                     if rebuild_job:
                         if (
-                            rebuild_job.status in {"queued", "running"}
+                            rebuild_job.status in {"queued", "running", "awaiting_approval"}
                             and rebuild_job.last_processed_date is not None
-                            and start_date_local <= rebuild_job.last_processed_date < end_date_local
+                            and start_date_local <= rebuild_job.last_processed_date <= end_date_local
                         ):
                             current_local_date = rebuild_job.last_processed_date + timedelta(days=1)
                             total_inserted = rebuild_job.inserted or 0
@@ -790,7 +1172,7 @@ class IngestionService:
                             completed_days_offset = max(rebuild_job.days_done or 0, 0)
                             completed_days_total = completed_days_offset
                         rebuild_job.status = "running"
-                        rebuild_job.phase = "fetching"
+                        rebuild_job.phase = "alarm_provider"
                         rebuild_job.next_retry_at = None
                         rebuild_job.days_total = days_total
                         rebuild_job.devices_total = devices_total
@@ -802,6 +1184,8 @@ class IngestionService:
                         session.commit()
 
             while current_local_date <= end_date_local:
+                if rebuild_job_id is not None:
+                    self._set_rebuild_phase(rebuild_job_id, phase="alarm_provider")
                 chunk_end_date = min(
                     current_local_date + timedelta(days=chunk_days - 1),
                     end_date_local,
@@ -869,17 +1253,53 @@ class IngestionService:
                             session.commit()
                 current_local_date = chunk_end_date + timedelta(days=1)
 
-            payload: dict[str, Any] | None = None
-            if request.publish_snapshot:
+            mileage_result = await self.rebuild_authoritative_mileage(
+                company_slug=request.company_slug,
+                start_date_local=start_date_local,
+                end_date_local=end_date_local,
+                company_tz=company_tz,
+                device_ids=device_ids,
+                rebuild_job_id=rebuild_job_id,
+            )
+            if not mileage_result.publication_allowed:
                 if rebuild_job_id is not None:
                     with self.session_factory() as session:
                         rebuild_job = session.get(CompanyHistoricalRebuildJob, rebuild_job_id)
                         if rebuild_job:
-                            rebuild_job.phase = "publishing"
-                            rebuild_job.current_device_id = None
-                            rebuild_job.last_heartbeat_at = utc_now()
+                            rebuild_job.status = "awaiting_approval"
+                            rebuild_job.phase = "awaiting_mileage_approval"
+                            rebuild_job.error_message = (
+                                "La cobertura de kilometraje no alcanza el minimo de publicacion. "
+                                "Requiere aprobacion degradada del administrador."
+                            )
+                            rebuild_job.finished_at = utc_now()
+                            rebuild_job.last_heartbeat_at = rebuild_job.finished_at
                             session.add(rebuild_job)
                             session.commit()
+                    self.mark_dirty()
+                return {
+                    "status": "awaiting_approval",
+                    "company_slug": request.company_slug,
+                    "timezone": str(company_tz),
+                    "start_date_local": start_date_local.isoformat(),
+                    "end_date_local": end_date_local.isoformat(),
+                    "days_total": days_total,
+                    "devices_total": devices_total,
+                    "inserted": total_inserted,
+                    "anomalies": total_anomalies,
+                    "failed_count": total_failed_count,
+                    "mileage": mileage_result.as_dict(),
+                    "message": "Reconstruccion completa, pendiente de aprobacion por cobertura de kilometraje.",
+                }
+
+            payload: dict[str, Any] | None = None
+            if request.publish_snapshot:
+                if rebuild_job_id is not None:
+                    self._set_rebuild_phase(
+                        rebuild_job_id,
+                        phase="snapshot",
+                        current_device_id=None,
+                    )
                 cut_at = self._resolve_safe_publish_cut_for_range(
                     company_slug=request.company_slug,
                     range_end_at=last_window_end_local,
@@ -891,6 +1311,7 @@ class IngestionService:
                 )
                 self.mark_dirty()
                 if rebuild_job_id is not None:
+                    self._set_rebuild_phase(rebuild_job_id, phase="publication")
                     with self.session_factory() as session:
                         rebuild_job = session.get(CompanyHistoricalRebuildJob, rebuild_job_id)
                         if rebuild_job:
@@ -937,6 +1358,7 @@ class IngestionService:
                 "maintenance_mode": request.maintenance,
                 "day_results": day_results,
                 "batch": batch_metrics.as_dict() if batch_metrics.prepared_rows else None,
+                "mileage": mileage_result.as_dict() if mileage_result else None,
             }
         except HistoricalBackfillDeferred as exc:
             if rebuild_job_id is not None:
@@ -1042,6 +1464,237 @@ class IngestionService:
             self._spawn_historical_rebuild_task(request=request, rebuild_job_id=rebuild_job_id)
         return rebuild_job_id
 
+    def approve_degraded_company_publication(
+        self,
+        *,
+        company_slug: str,
+        approved_by: str,
+    ) -> dict[str, Any]:
+        self.registry.get(company_slug)
+        with self.session_factory() as session:
+            rebuild_job = session.scalars(
+                select(CompanyHistoricalRebuildJob)
+                .where(
+                    CompanyHistoricalRebuildJob.company_slug == company_slug,
+                    CompanyHistoricalRebuildJob.purpose == "activation_bootstrap",
+                )
+                .order_by(CompanyHistoricalRebuildJob.created_at.desc(), CompanyHistoricalRebuildJob.id.desc())
+            ).first()
+            if not rebuild_job or rebuild_job.status != "awaiting_approval":
+                raise ValueError("La empresa no tiene una publicacion degradada pendiente")
+            rebuild_job.degraded_publication_approved = True
+            rebuild_job.degraded_publication_approved_at = utc_now()
+            rebuild_job.degraded_publication_approved_by = approved_by
+            rebuild_job.status = "queued"
+            rebuild_job.phase = "queued_degraded_publication"
+            rebuild_job.next_retry_at = None
+            rebuild_job.finished_at = None
+            session.add(rebuild_job)
+            session.commit()
+            request = HistoricalRebuildRequest(
+                company_slug=company_slug,
+                start_date=rebuild_job.start_date,
+                end_date=rebuild_job.end_date,
+                publish_snapshot=True,
+                maintenance=False,
+            )
+            rebuild_job_id = rebuild_job.id
+        self.mark_dirty()
+        return {
+            "rebuild_job_id": rebuild_job_id,
+            "request": request.model_dump(mode="json"),
+        }
+
+    def backup_company_operational_data(
+        self,
+        *,
+        company_slug: str,
+        requested_by: str,
+    ) -> dict[str, Any]:
+        """Create a restorable JSONL backup before destructive deactivation."""
+        company = self.registry.get(company_slug)
+        device_ids = sorted({*self._list_company_device_ids(company_slug), *company.device_ids})
+        fleet_ids = sorted({fleet_id for fleet_id in company.fleet_ids if fleet_id})
+        requested_at = utc_now()
+        backup_dir = self.settings.company_backup_dir
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / (
+            f"{company_slug}-{requested_at.strftime('%Y%m%dT%H%M%SZ')}.jsonl.gz"
+        )
+
+        with self.session_factory() as session:
+            audit = CompanyLifecycleAudit(
+                company_slug=company_slug,
+                action="deactivate",
+                status="backing_up",
+                requested_by=requested_by,
+                requested_at=requested_at,
+            )
+            session.add(audit)
+            session.commit()
+            session.refresh(audit)
+            audit_id = audit.id
+
+        model_filters: list[tuple[str, Any, Any]] = [
+            ("devices", DeviceRecord, self._build_company_scope_filter(
+                company_slug=company_slug,
+                company_column=DeviceRecord.company_slug,
+                device_column=DeviceRecord.device_id,
+                fleet_column=DeviceRecord.fleet_id,
+                device_ids=device_ids,
+                fleet_ids=fleet_ids,
+            )),
+            ("howen_alarm_raw", HowenAlarmRaw, HowenAlarmRaw.company_slug == company_slug),
+            ("alarm_events", AlarmEvent, AlarmEvent.company_slug == company_slug),
+            ("alarm_event_audit", AlarmEventAudit, AlarmEventAudit.company_slug == company_slug),
+            ("daily_mileage_snapshots", DailyMileageSnapshot, DailyMileageSnapshot.company_slug == company_slug),
+            ("mileage_observations", MileageObservation, MileageObservation.company_slug == company_slug),
+            ("ingestion_anomalies", IngestionAnomaly, IngestionAnomaly.company_slug == company_slug),
+            ("reconciliation_reviews", ReconciliationReview, ReconciliationReview.company_slug == company_slug),
+            ("report_assets", ReportAsset, ReportAsset.company_slug == company_slug),
+            ("published_dashboard_snapshots", PublishedDashboardSnapshot, PublishedDashboardSnapshot.company_slug == company_slug),
+        ]
+        row_count = 0
+        files_backup_path: str | None = None
+        try:
+            with gzip.open(backup_path, "wt", encoding="utf-8") as output:
+                output.write(json.dumps({
+                    "type": "manifest",
+                    "company_slug": company_slug,
+                    "company": company.model_dump(mode="json"),
+                    "created_at": requested_at.isoformat(),
+                }, ensure_ascii=True, default=str) + "\n")
+                with self.session_factory() as session:
+                    for table_name, model, condition in model_filters:
+                        if condition is None:
+                            continue
+                        rows = session.scalars(
+                            select(model).where(condition).execution_options(yield_per=500)
+                        )
+                        columns = tuple(model.__table__.columns)
+                        for row in rows:
+                            payload = {
+                                column.name: getattr(row, column.name)
+                                for column in columns
+                            }
+                            output.write(json.dumps({
+                                "type": "row",
+                                "table": table_name,
+                                "data": payload,
+                            }, ensure_ascii=True, default=str) + "\n")
+                            row_count += 1
+            company_upload_dir = self.settings.upload_dir / company_slug
+            if company_upload_dir.exists():
+                files_archive_base = backup_dir / (
+                    f"{company_slug}-{requested_at.strftime('%Y%m%dT%H%M%SZ')}-files"
+                )
+                files_backup_path = shutil.make_archive(
+                    str(files_archive_base),
+                    "gztar",
+                    root_dir=company_upload_dir,
+                )
+            digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+            with self.session_factory() as session:
+                audit = session.get(CompanyLifecycleAudit, audit_id)
+                if audit:
+                    audit.status = "backed_up"
+                    audit.backup_path = str(backup_path)
+                    audit.backup_sha256 = digest
+                    audit.row_count = row_count
+                    audit.detail_json = json.dumps(
+                        {"files_backup_path": files_backup_path},
+                        ensure_ascii=True,
+                    )
+                    session.add(audit)
+                    session.commit()
+            return {
+                "audit_id": audit_id,
+                "backup_path": str(backup_path),
+                "backup_sha256": digest,
+                "row_count": row_count,
+                "files_backup_path": files_backup_path,
+            }
+        except Exception as exc:
+            with self.session_factory() as session:
+                audit = session.get(CompanyLifecycleAudit, audit_id)
+                if audit:
+                    audit.status = "backup_failed"
+                    audit.error_message = str(exc)
+                    session.add(audit)
+                    session.commit()
+            raise
+
+    def finish_company_lifecycle_audit(
+        self,
+        *,
+        audit_id: int,
+        status: str,
+        detail: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self.session_factory() as session:
+            audit = session.get(CompanyLifecycleAudit, audit_id)
+            if not audit:
+                return
+            audit.status = status
+            audit.completed_at = utc_now()
+            audit.detail_json = json.dumps(detail or {}, ensure_ascii=True, default=str)
+            audit.error_message = error
+            session.add(audit)
+            session.commit()
+
+    async def rebuild_daily_mileage(
+        self,
+        *,
+        company_slug: str,
+        target_date: date,
+    ) -> dict[str, Any]:
+        company = self.registry.get(company_slug)
+        company_tz = ZoneInfo(company.timezone or self.settings.default_timezone)
+        result = await self.rebuild_authoritative_mileage(
+            company_slug=company_slug,
+            start_date_local=target_date,
+            end_date_local=target_date,
+            company_tz=company_tz,
+            device_ids=self._list_company_device_ids(company_slug),
+            rebuild_job_id=None,
+        )
+        self.dashboard.clear_runtime_caches()
+        self.mark_dirty()
+        return {
+            "company_slug": company_slug,
+            "target_date": target_date.isoformat(),
+            **result.as_dict(),
+        }
+
+    async def rebuild_mileage_window(self, request: Any) -> dict[str, Any]:
+        """Rebuild an existing company's mileage from Howen's daily report."""
+        company = self.registry.get(request.company_slug)
+        company_tz = ZoneInfo(company.timezone or self.settings.default_timezone)
+        today_local = utc_now().astimezone(company_tz).date()
+        start_date_local = request.start_date or (today_local - timedelta(days=29))
+        end_date_local = request.end_date or today_local
+        if start_date_local > end_date_local:
+            raise ValueError("start_date debe ser menor o igual que end_date")
+
+        result = await self.rebuild_authoritative_mileage(
+            company_slug=company.slug,
+            start_date_local=start_date_local,
+            end_date_local=end_date_local,
+            company_tz=company_tz,
+            device_ids=self._list_company_device_ids(company.slug),
+            rebuild_job_id=None,
+        )
+        self.dashboard.clear_runtime_caches()
+        self.mark_dirty()
+        return {
+            "company_slug": company.slug,
+            "start_date": start_date_local.isoformat(),
+            "end_date": end_date_local.isoformat(),
+            "source": "howen_daily_report",
+            **result.as_dict(),
+        }
+
     async def purge_company_operational_data(self, *, company_slug: str) -> dict[str, Any]:
         company = self.registry.get(company_slug)
         device_ids = sorted({*self._list_company_device_ids(company_slug), *company.device_ids})
@@ -1084,6 +1737,7 @@ class IngestionService:
                     "report_assets": 0,
                     "daily_mileage_snapshots": 0,
                     "mileage_readings": 0,
+                    "mileage_observations": 0,
                     "alarm_events": 0,
                     "alarm_event_audit": 0,
                     "howen_alarm_raw": 0,
@@ -1145,6 +1799,9 @@ class IngestionService:
                     deleted_counts["mileage_readings"] = session.query(MileageReading).filter(
                         mileage_filter
                     ).delete(synchronize_session=False)
+                deleted_counts["mileage_observations"] = session.query(MileageObservation).filter(
+                    MileageObservation.company_slug == company_slug
+                ).delete(synchronize_session=False)
 
                 alarm_filter = self._build_company_scope_filter(
                     company_slug=company_slug,
@@ -2464,6 +3121,37 @@ class IngestionService:
                         source="status",
                     )
                 )
+            if company_slug and (validated_total_km is not None or validated_day_km is not None):
+                observation_key = hashlib.sha256(
+                    (
+                        f"status_80003|{company_slug}|{status.device_id}|"
+                        f"{observed_at.isoformat()}"
+                    ).encode("utf-8")
+                ).hexdigest()
+                observation = session.scalar(
+                    select(MileageObservation).where(
+                        MileageObservation.observation_key == observation_key
+                    )
+                )
+                if not observation:
+                    observation = MileageObservation(
+                        observation_key=observation_key,
+                        company_slug=company_slug,
+                        device_id=status.device_id,
+                        observed_at=observed_at,
+                        received_at=received_at,
+                        source="status_80003",
+                    )
+                observation.fleet_id = record.fleet_id
+                observation.plate_no = record.plate_no
+                observation.total_km = validated_total_km
+                observation.day_km = validated_day_km
+                observation.raw_total_value = status.raw_total_value
+                observation.raw_day_value = status.raw_day_value
+                observation.validation_status = validation_status
+                observation.validation_reason = validation_reason
+                observation.payload_json = json.dumps(status.raw, ensure_ascii=True)
+                session.add(observation)
             if previous_identity != (record.company_slug, record.fleet_id, record.plate_no):
                 self._propagate_company_assignment(
                     session,
@@ -2473,43 +3161,65 @@ class IngestionService:
                     fleet_id=record.fleet_id,
                 )
 
+            total_for_snapshot = (
+                validated_total_km
+                if validated_total_km is not None
+                else record.last_total_km
+            )
+            today_local = received_at.astimezone(ZoneInfo(timezone_name)).date()
             snapshot = session.scalar(
                 select(DailyMileageSnapshot).where(
                     DailyMileageSnapshot.device_id == status.device_id,
                     DailyMileageSnapshot.snapshot_date == snapshot_date,
                 )
             )
-            if not snapshot:
-                snapshot = DailyMileageSnapshot(
-                    device_id=status.device_id,
-                    snapshot_date=snapshot_date,
-                    observed_at=observed_at,
-                    total_km=validated_total_km or record.last_total_km or 0.0,
-                    day_km=validated_day_km,
-                    plate_no=record.plate_no,
-                    company_slug=record.company_slug,
-                    fleet_id=record.fleet_id,
-                    raw_total_value=status.raw_total_value,
-                    raw_day_value=status.raw_day_value,
-                    km_validation_status=validation_status,
-                    km_validation_reason=validation_reason,
-                    source="live",
-                )
-            else:
-                snapshot.observed_at = observed_at
-                snapshot.plate_no = record.plate_no
-                snapshot.company_slug = record.company_slug
-                snapshot.fleet_id = record.fleet_id
-                snapshot.raw_total_value = status.raw_total_value
-                snapshot.raw_day_value = status.raw_day_value
-                snapshot.km_validation_status = validation_status
-                snapshot.km_validation_reason = validation_reason
-                snapshot.source = "live"
-                if validated_total_km is not None:
-                    snapshot.total_km = validated_total_km
-                if validated_day_km is not None:
-                    snapshot.day_km = validated_day_km
-            session.add(snapshot)
+            may_update_snapshot = not (
+                snapshot
+                and snapshot.snapshot_date < today_local
+                and snapshot.closure_status in {"closed", "repaired"}
+            )
+            if total_for_snapshot is not None and may_update_snapshot:
+                if not snapshot:
+                    snapshot = DailyMileageSnapshot(
+                        device_id=status.device_id,
+                        snapshot_date=snapshot_date,
+                        observed_at=observed_at,
+                        total_km=total_for_snapshot,
+                        day_km=validated_day_km,
+                        plate_no=record.plate_no,
+                        company_slug=record.company_slug,
+                        fleet_id=record.fleet_id,
+                        raw_total_value=status.raw_total_value,
+                        raw_day_value=status.raw_day_value,
+                        km_validation_status=validation_status,
+                        km_validation_reason=validation_reason,
+                        source="live",
+                        closure_status="provisional",
+                        coverage_status="covered" if validated_day_km is not None else "missing_day_km",
+                        sample_count=1,
+                        first_observed_at=observed_at,
+                        last_observed_at=observed_at,
+                    )
+                else:
+                    snapshot.observed_at = observed_at
+                    snapshot.plate_no = record.plate_no
+                    snapshot.company_slug = record.company_slug
+                    snapshot.fleet_id = record.fleet_id
+                    snapshot.raw_total_value = status.raw_total_value
+                    snapshot.raw_day_value = status.raw_day_value
+                    snapshot.km_validation_status = validation_status
+                    snapshot.km_validation_reason = validation_reason
+                    snapshot.source = "live"
+                    snapshot.closure_status = "provisional"
+                    snapshot.coverage_status = "covered" if validated_day_km is not None else "missing_day_km"
+                    snapshot.sample_count = max(snapshot.sample_count or 0, 0) + 1
+                    snapshot.first_observed_at = snapshot.first_observed_at or observed_at
+                    snapshot.last_observed_at = observed_at
+                    if validated_total_km is not None:
+                        snapshot.total_km = validated_total_km
+                    if validated_day_km is not None:
+                        snapshot.day_km = validated_day_km
+                session.add(snapshot)
 
             state = session.get(IngestState, "global")
             if state and update_feed_state:
@@ -3322,38 +4032,6 @@ class IngestionService:
                     provider_event_key=provider_event_key,
                 )
 
-            if inserted_alarm_event and alarm.total_mileage_km is not None:
-                snapshot = session.scalar(
-                    select(DailyMileageSnapshot).where(
-                        DailyMileageSnapshot.device_id == alarm.device_id,
-                        DailyMileageSnapshot.snapshot_date == snapshot_date,
-                    )
-                )
-                if not snapshot:
-                    snapshot = DailyMileageSnapshot(
-                        device_id=alarm.device_id,
-                        snapshot_date=snapshot_date,
-                        observed_at=occurred_at,
-                        total_km=alarm.total_mileage_km,
-                        day_km=None,
-                        plate_no=plate_no,
-                        company_slug=company_slug,
-                        fleet_id=fleet_id,
-                        raw_total_value=_payload_value(alarm.raw, "totalMileage", "total"),
-                        source=source,
-                    )
-                else:
-                    if occurred_at >= (ensure_utc(snapshot.observed_at) or occurred_at):
-                        snapshot.observed_at = occurred_at
-                        snapshot.total_km = alarm.total_mileage_km
-                    snapshot.plate_no = plate_no or snapshot.plate_no
-                    snapshot.company_slug = company_slug or snapshot.company_slug
-                    snapshot.fleet_id = fleet_id or snapshot.fleet_id
-                    snapshot.raw_total_value = _payload_value(alarm.raw, "totalMileage", "total")
-                    if snapshot.source != "live":
-                        snapshot.source = source
-                session.add(snapshot)
-
             state = session.get(IngestState, "global")
             if state:
                 state.mode = "live"
@@ -3737,6 +4415,9 @@ class IngestionService:
                 "alarm_events_deleted": delete(AlarmEvent).where(AlarmEvent.occurred_at < live_cutoff),
                 "raw_events_deleted": delete(HowenAlarmRaw).where(HowenAlarmRaw.received_at < live_cutoff),
                 "mileage_readings_deleted": delete(MileageReading).where(MileageReading.recorded_at < live_cutoff),
+                "mileage_observations_deleted": delete(MileageObservation).where(
+                    MileageObservation.observed_at < live_cutoff
+                ),
                 "daily_snapshots_deleted": delete(DailyMileageSnapshot).where(DailyMileageSnapshot.observed_at < live_cutoff),
                 "anomalies_deleted": delete(IngestionAnomaly).where(IngestionAnomaly.received_at < anomaly_cutoff),
                 "audits_deleted": delete(AlarmEventAudit).where(AlarmEventAudit.received_at < anomaly_cutoff),
@@ -3904,6 +4585,124 @@ def _append_reason(current: str | None, reason: str) -> str:
         return current
     reasons.append(reason)
     return ",".join(reasons)
+
+
+def _date_range(start_date: date, end_date: date):
+    current = start_date
+    while current <= end_date:
+        yield current
+        current += timedelta(days=1)
+
+
+def _mileage_report_device_id(row: dict[str, Any]) -> str | None:
+    for key in ("deviceId", "deviceID", "deviceid", "deviceno", "deviceNo", "dtu"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    for key in ("deviceName", "devicename", "name"):
+        value = str(row.get(key) or "").strip()
+        if "(" in value and value.endswith(")"):
+            candidate = value.rsplit("(", 1)[-1][:-1].strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _mileage_report_plate(row: dict[str, Any]) -> str | None:
+    for key in ("plateNo", "plateno", "plate", "vehicleNo"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    for key in ("deviceName", "devicename", "name"):
+        value = str(row.get(key) or "").strip()
+        if not value:
+            continue
+        candidate = value.split("(", 1)[0].strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _mileage_report_daily_values(
+    row: dict[str, Any],
+    *,
+    start_date: date,
+    end_date: date,
+) -> dict[date, tuple[float, Any]]:
+    values: dict[date, tuple[float, Any]] = {}
+    aliases: dict[str, date] = {}
+    for day in _date_range(start_date, end_date):
+        for alias in (
+            day.isoformat(),
+            day.strftime("%Y%m%d"),
+            day.strftime("%m-%d"),
+            day.strftime("%-m-%-d"),
+            day.strftime("%m/%d"),
+        ):
+            aliases[alias] = day
+
+    for key, raw_value in row.items():
+        day = aliases.get(str(key).strip())
+        if day is None:
+            continue
+        parsed = _parse_report_km(raw_value)
+        if parsed is not None:
+            values[day] = (parsed, raw_value)
+
+    for nested_key in ("list", "rows", "items", "details", "dailyMileageList", "dataList"):
+        nested_rows = row.get(nested_key)
+        if not isinstance(nested_rows, list):
+            continue
+        for item in nested_rows:
+            if not isinstance(item, dict):
+                continue
+            raw_date = item.get("date") or item.get("day") or item.get("statDate") or item.get("time")
+            parsed_date = _parse_report_date(raw_date)
+            if parsed_date is None or not (start_date <= parsed_date <= end_date):
+                continue
+            raw_value = (
+                item.get("mileage")
+                if item.get("mileage") is not None
+                else item.get("dayMileage", item.get("value"))
+            )
+            parsed = _parse_report_km(raw_value)
+            if parsed is not None:
+                values[parsed_date] = (parsed, raw_value)
+    return values
+
+
+def _parse_report_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_report_km(value: Any) -> float | None:
+    if isinstance(value, dict):
+        value = value.get("mileage") or value.get("dayMileage") or value.get("value")
+    if value in (None, "", "-"):
+        return None
+    try:
+        return round(float(str(value).replace(",", "").replace(" km", "").strip()), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _km_review_note(reason: str | None) -> str:
+    messages = {
+        "negative_day_km": "Howen devolvio una distancia diaria negativa. Debe aprobarse una reparacion o excluirse el vehiculo/dia.",
+        "impossible_day_distance": "La distancia diaria supera el limite operativo configurado y no se publicara sin revision humana.",
+        "source_disagreement": "El reporte diario de Howen difiere de una reparacion manual ya aprobada. Se conserva la decision vigente hasta nueva revision.",
+    }
+    return messages.get(reason, "El kilometraje no paso las validaciones operativas y requiere decision humana.")
 
 
 def _normalize_event_key_timestamp(value: datetime | None) -> str:

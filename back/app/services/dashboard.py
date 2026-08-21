@@ -61,7 +61,17 @@ from app.services.howen import HowenClient, HowenRateLimitError
 # reconciliation runs. We still count it while the historical-cut pipeline
 # finishes migrating existing datasets to canonical `harvest/backfill` sources.
 ACTIVE_EVENT_SOURCES = ("harvest", "live", "backfill", "catchup", "admin_backfill")
-ACTIVE_SNAPSHOT_SOURCES = ("live", "harvest", "backfill", "catchup")
+ACTIVE_SNAPSHOT_SOURCES = (
+    "live",
+    "howen_daily_report",
+    "manual_repair",
+    # Transitional read compatibility. Historical alarm ingestion no longer
+    # writes mileage, but existing verified snapshots remain visible until a
+    # company is rebuilt with the authoritative report pipeline.
+    "harvest",
+    "backfill",
+    "catchup",
+)
 ACTIVE_MILEAGE_SOURCES = ("status", "live", "backfill")
 MOCK_DEVICE_PREFIX = "DEV-"
 MOCK_FLEET_IDS = {"cotaba-main"}
@@ -114,7 +124,7 @@ class DashboardService:
         return bool(
             publication
             and publication.snapshot_json
-            and rebuild_status not in {"queued", "running", "failed"}
+            and rebuild_status in {"idle", "succeeded"}
         )
 
     def _load_published_snapshot(self, company_slug: str) -> dict[str, Any] | None:
@@ -285,6 +295,7 @@ class DashboardService:
                     .where(
                         snapshot_membership,
                         DailyMileageSnapshot.source.in_(ACTIVE_SNAPSHOT_SOURCES),
+                        DailyMileageSnapshot.excluded_at.is_(None),
                         DailyMileageSnapshot.observed_at >= cutoff,
                         DailyMileageSnapshot.observed_at <= reference_utc,
                     )
@@ -1026,6 +1037,7 @@ class DashboardService:
                 session.scalars(
                     select(DailyMileageSnapshot).where(
                         DailyMileageSnapshot.source.in_(ACTIVE_SNAPSHOT_SOURCES),
+                        DailyMileageSnapshot.excluded_at.is_(None),
                         DailyMileageSnapshot.snapshot_date.in_(snapshot_dates_today),
                     )
                 )
@@ -1315,7 +1327,7 @@ class DashboardService:
             if item["operational"] and not item["ready_in_selector"]:
                 activation_jobs.append(item)
         for slug, rebuild in latest_rebuilds.items():
-            if slug in companies_by_slug or rebuild.status not in {"queued", "running", "failed"}:
+            if slug in companies_by_slug or rebuild.status not in {"queued", "running", "failed", "awaiting_approval"}:
                 continue
             activation_jobs.append(
                 self._serialize_admin_company_activation_job(
@@ -1383,13 +1395,31 @@ class DashboardService:
             rebuild_published_cut_at = ensure_utc(rebuild.published_cut_at)
             rebuild_error_message = rebuild.error_message
             if rebuild_days_total > 0:
-                rebuild_progress_pct = min(100.0, round((rebuild_days_done / rebuild_days_total) * 100.0, 1))
+                alarm_progress = min(1.0, rebuild_days_done / rebuild_days_total)
+                rebuild_progress_pct = round(alarm_progress * 75.0, 1)
+            if rebuild.phase in {"km_provider", "km_validation", "km_persistence"}:
+                mileage_total = rebuild.mileage_rows_total or (
+                    (rebuild.mileage_days_total or 0) * (rebuild.mileage_devices_total or 0)
+                )
+                mileage_done = rebuild.mileage_rows_processed or (
+                    (rebuild.mileage_days_done or 0) * (rebuild.mileage_devices_done or 0)
+                )
+                mileage_progress = min(1.0, mileage_done / mileage_total) if mileage_total else 0.0
+                rebuild_progress_pct = round(75.0 + (mileage_progress * 20.0), 1)
+            elif rebuild.phase == "awaiting_mileage_approval":
+                rebuild_progress_pct = 95.0
+            elif rebuild.phase == "snapshot":
+                rebuild_progress_pct = 97.0
+            elif rebuild.phase == "publication":
+                rebuild_progress_pct = 99.0
+            elif rebuild.status == "succeeded":
+                rebuild_progress_pct = 100.0
 
         ready_in_selector = bool(
             self.registry.is_operational(company)
             and publication
             and publication.snapshot_json
-            and rebuild_status not in {"queued", "running", "failed"}
+            and rebuild_status in {"idle", "succeeded"}
         )
 
         return {
@@ -1411,6 +1441,17 @@ class DashboardService:
             "rebuild_rows_processed": (rebuild.rows_processed or 0) if rebuild else 0,
             "rebuild_current_device_id": rebuild.current_device_id if rebuild else None,
             "rebuild_last_heartbeat_at": ensure_utc(rebuild.last_heartbeat_at) if rebuild else None,
+            "mileage_days_total": (rebuild.mileage_days_total or 0) if rebuild else 0,
+            "mileage_days_done": (rebuild.mileage_days_done or 0) if rebuild else 0,
+            "mileage_devices_total": (rebuild.mileage_devices_total or 0) if rebuild else 0,
+            "mileage_devices_done": (rebuild.mileage_devices_done or 0) if rebuild else 0,
+            "mileage_rows_total": (rebuild.mileage_rows_total or 0) if rebuild else 0,
+            "mileage_rows_processed": (rebuild.mileage_rows_processed or 0) if rebuild else 0,
+            "mileage_valid_days": (rebuild.mileage_valid_days or 0) if rebuild else 0,
+            "mileage_missing_days": (rebuild.mileage_missing_days or 0) if rebuild else 0,
+            "mileage_coverage_pct": rebuild.mileage_coverage_pct if rebuild else None,
+            "degraded_publication_approved": bool(rebuild.degraded_publication_approved) if rebuild else False,
+            "degraded_publication_required": rebuild_status == "awaiting_approval",
             "rebuild_started_at": rebuild_started_at,
             "rebuild_finished_at": rebuild_finished_at,
             "rebuild_next_retry_at": rebuild_next_retry_at,
@@ -1432,7 +1473,24 @@ class DashboardService:
         rebuild_days_total = rebuild.days_total or 0
         rebuild_progress_pct = None
         if rebuild_days_total > 0:
-            rebuild_progress_pct = min(100.0, round((rebuild_days_done / rebuild_days_total) * 100.0, 1))
+            rebuild_progress_pct = min(75.0, round((rebuild_days_done / rebuild_days_total) * 75.0, 1))
+        if rebuild.phase in {"km_provider", "km_validation", "km_persistence"}:
+            mileage_total = rebuild.mileage_rows_total or (
+                (rebuild.mileage_days_total or 0) * (rebuild.mileage_devices_total or 0)
+            )
+            mileage_done = rebuild.mileage_rows_processed or (
+                (rebuild.mileage_days_done or 0) * (rebuild.mileage_devices_done or 0)
+            )
+            mileage_progress = min(1.0, mileage_done / mileage_total) if mileage_total else 0.0
+            rebuild_progress_pct = round(75.0 + (mileage_progress * 20.0), 1)
+        elif rebuild.phase == "awaiting_mileage_approval":
+            rebuild_progress_pct = 95.0
+        elif rebuild.phase == "snapshot":
+            rebuild_progress_pct = 97.0
+        elif rebuild.phase == "publication":
+            rebuild_progress_pct = 99.0
+        elif rebuild.status == "succeeded":
+            rebuild_progress_pct = 100.0
         return {
             "slug": slug,
             "name": name,
@@ -1452,6 +1510,17 @@ class DashboardService:
             "rebuild_rows_processed": rebuild.rows_processed or 0,
             "rebuild_current_device_id": rebuild.current_device_id,
             "rebuild_last_heartbeat_at": ensure_utc(rebuild.last_heartbeat_at),
+            "mileage_days_total": rebuild.mileage_days_total or 0,
+            "mileage_days_done": rebuild.mileage_days_done or 0,
+            "mileage_devices_total": rebuild.mileage_devices_total or 0,
+            "mileage_devices_done": rebuild.mileage_devices_done or 0,
+            "mileage_rows_total": rebuild.mileage_rows_total or 0,
+            "mileage_rows_processed": rebuild.mileage_rows_processed or 0,
+            "mileage_valid_days": rebuild.mileage_valid_days or 0,
+            "mileage_missing_days": rebuild.mileage_missing_days or 0,
+            "mileage_coverage_pct": rebuild.mileage_coverage_pct,
+            "degraded_publication_approved": bool(rebuild.degraded_publication_approved),
+            "degraded_publication_required": rebuild.status == "awaiting_approval",
             "rebuild_started_at": ensure_utc(rebuild.started_at),
             "rebuild_finished_at": ensure_utc(rebuild.finished_at),
             "rebuild_next_retry_at": ensure_utc(rebuild.next_retry_at),
@@ -1963,6 +2032,7 @@ class DashboardService:
                         )
                         .where(
                             DailyMileageSnapshot.source.in_(ACTIVE_SNAPSHOT_SOURCES),
+                            DailyMileageSnapshot.excluded_at.is_(None),
                             DailyMileageSnapshot.snapshot_date >= baseline_start,
                         )
                         .where(snapshot_membership if snapshot_membership is not None else True)
@@ -2492,6 +2562,7 @@ class DashboardService:
                     select(DailyMileageSnapshot)
                     .where(
                         DailyMileageSnapshot.source.in_(ACTIVE_SNAPSHOT_SOURCES),
+                        DailyMileageSnapshot.excluded_at.is_(None),
                         DailyMileageSnapshot.snapshot_date >= baseline_start,
                     )
                     .order_by(DailyMileageSnapshot.snapshot_date, DailyMileageSnapshot.observed_at)
@@ -2735,6 +2806,7 @@ class DashboardService:
         action: str,
         decided_by: str,
         note: str | None = None,
+        replacement_day_km: float | None = None,
     ) -> dict[str, Any]:
         if action not in {"approve", "discard"}:
             raise ValueError("Accion de revision invalida")
@@ -2747,12 +2819,20 @@ class DashboardService:
             review = session.get(ReconciliationReview, review_id)
             if not review:
                 return {}
+            review_payload = _parse_json(review.portal_payload_json)
+            if (
+                action == "approve"
+                and review_payload
+                and review_payload.get("type") == "km_review"
+                and review_payload.get("proposed_day_km") is None
+                and replacement_day_km is None
+            ):
+                raise ValueError("Debes indicar el kilometraje diario corregido para aprobar este caso")
             review.review_status = "approved" if action == "approve" else "discarded"
             review.decision_note = note
             review.decided_by = decided_by
             review.decided_at = now
             session.add(review)
-            review_payload = _parse_json(review.portal_payload_json)
             company_slug = review.company_slug
             review_reason = review.reason
             session.commit()
@@ -2762,7 +2842,44 @@ class DashboardService:
                 with self.session_factory() as session:
                     review = session.get(ReconciliationReview, review_id)
                     if review:
-                        review.applied_at = utc_now()
+                        issue_date_raw = review_payload.get("issue_date")
+                        issue_date = date.fromisoformat(str(issue_date_raw))
+                        proposed_value = (
+                            replacement_day_km
+                            if replacement_day_km is not None
+                            else float(review_payload["proposed_day_km"])
+                        )
+                        snapshot = session.scalar(
+                            select(DailyMileageSnapshot).where(
+                                DailyMileageSnapshot.device_id == review.device_id,
+                                DailyMileageSnapshot.snapshot_date == issue_date,
+                            )
+                        )
+                        device = session.get(DeviceRecord, review.device_id) if review.device_id else None
+                        if not snapshot:
+                            snapshot = DailyMileageSnapshot(
+                                device_id=str(review.device_id),
+                                snapshot_date=issue_date,
+                                observed_at=review.observed_at or now,
+                                total_km=float(device.last_total_km or proposed_value) if device else proposed_value,
+                            )
+                        snapshot.company_slug = company_slug
+                        snapshot.plate_no = review.plate_no or (device.plate_no if device else None)
+                        snapshot.fleet_id = device.fleet_id if device else snapshot.fleet_id
+                        snapshot.day_km = float(proposed_value)
+                        snapshot.source = "manual_repair"
+                        snapshot.coverage_status = "covered"
+                        snapshot.closure_status = "repaired"
+                        snapshot.km_validation_status = "valid"
+                        snapshot.km_validation_reason = None
+                        snapshot.repair_reason = review.reason
+                        snapshot.repaired_at = now
+                        snapshot.approved_at = now
+                        snapshot.approved_by = decided_by
+                        snapshot.excluded_at = None
+                        snapshot.excluded_by = None
+                        session.add(snapshot)
+                        review.applied_at = now
                         session.add(review)
                         session.commit()
             else:
@@ -2779,6 +2896,26 @@ class DashboardService:
                         session.add(review)
                         session.commit()
 
+        if action == "discard" and review_payload and review_payload.get("type") == "km_review":
+            with self.session_factory() as session:
+                review = session.get(ReconciliationReview, review_id)
+                issue_date_raw = review_payload.get("issue_date")
+                if review and issue_date_raw:
+                    snapshot = session.scalar(
+                        select(DailyMileageSnapshot).where(
+                            DailyMileageSnapshot.device_id == review.device_id,
+                            DailyMileageSnapshot.snapshot_date == date.fromisoformat(str(issue_date_raw)),
+                        )
+                    )
+                    if snapshot:
+                        snapshot.excluded_at = now
+                        snapshot.excluded_by = decided_by
+                        session.add(snapshot)
+                    review.applied_at = now
+                    session.add(review)
+                    session.commit()
+
+        self.clear_runtime_caches()
         with self.session_factory() as session:
             review = session.get(ReconciliationReview, review_id)
             return _serialize_reconciliation_review(review) if review else {}
