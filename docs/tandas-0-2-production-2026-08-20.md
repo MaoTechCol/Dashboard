@@ -83,7 +83,8 @@ application data or code.
 
 - Baseline tag: `v1-pre-batch`.
 - API/worker baseline tag: `v1-api-worker-20260820.1`.
-- Tandas 0-2 release marker: `v1-tanda-0-2`.
+- Tandas 0-2 code tag: `v1-tanda-0-2`.
+- Certified backup/restore marker: `v1-tanda-0-2-certified`.
 - Restore source: the off-host and Droplet copies of `20260820T171446Z`.
 - Immediate application rollback: deploy the desired tag and restart
   `dashboard-api.service` and `dashboard-worker.service`.
@@ -91,6 +92,10 @@ application data or code.
   archive from the same timestamp so code and data stay aligned.
 
 The custom-format dump integrity and its 577-entry restore catalog were verified.
-A destructive full restore was intentionally not run against the production
-database; final disaster-recovery certification still requires restoring it into an
-isolated PostgreSQL target.
+The dump was also restored into an isolated PostgreSQL 17 container without touching
+production. The portable restore excluded only the Supabase-managed
+`supabase_vault` extension and its `vault.secrets` data, which are unavailable in the
+stock PostgreSQL image. Application table counts matched the baseline exactly except
+for two audit rows and three anomaly rows written between the live baseline query and
+the dump snapshot. This proves the application backup can be restored and explains
+the small concurrent-capture delta.
