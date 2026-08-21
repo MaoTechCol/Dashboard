@@ -393,6 +393,9 @@ def certify(
         extra_raw = _counter_difference(remaining_raw, Counter())
         extra_analytic = _counter_difference(remaining_analytic, Counter())
         status_counts = Counter(review.review_status for review in reviews)
+        raw_source_counts = Counter(str(row.source or "unknown") for row in raw_rows)
+        raw_unexplained = sum(item["count"] for item in missing_raw + extra_raw)
+        analytic_unexplained = sum(item["count"] for item in missing_analytic + extra_analytic)
         result["alarms"] = {
             "source_file": alarm_export["path"],
             "range_start": range_start.isoformat(),
@@ -406,6 +409,7 @@ def certify(
             "local_analytic_rows": sum(analytic_counter.values()),
             "local_unique_analytic": len(analytic_counter),
             "temporal_dms_rows": sum(temporal_counter.values()),
+            "raw_source_counts": dict(raw_source_counts),
             "review_status_counts": dict(status_counts),
             "provider_categories": alarm_export["categories"],
             "missing_from_local_raw": missing_raw,
@@ -414,7 +418,9 @@ def certify(
             "extra_in_analytic": extra_analytic,
             "provider_time_normalized_raw_matches": alternate_raw_matches,
             "provider_time_normalized_analytic_matches": alternate_analytic_matches,
-            "unexplained_alarm_count": sum(item["count"] for item in missing_raw + extra_raw),
+            "raw_unexplained_alarm_count": raw_unexplained,
+            "analytic_unexplained_alarm_count": analytic_unexplained,
+            "unexplained_alarm_count": raw_unexplained + analytic_unexplained,
         }
 
     if mileage_export:
@@ -478,13 +484,20 @@ def certify(
             "vehicles": comparisons,
         }
 
-    alarm_ok = not alarm_export or result["alarms"]["unexplained_alarm_count"] == 0
+    alarm_ok = not alarm_export or (
+        result["alarms"]["raw_unexplained_alarm_count"] == 0
+        and result["alarms"]["analytic_unexplained_alarm_count"] == 0
+    )
     km_ok = not mileage_export or (
         result["mileage"]["difference_pct"] is not None and result["mileage"]["difference_pct"] < 1.0
     )
     result["status"] = "passed" if alarm_ok and km_ok else "failed"
     result["acceptance"] = {
         "alarm_unexplained_zero": alarm_ok,
+        "alarm_raw_layer_clean": not alarm_export
+        or result["alarms"]["raw_unexplained_alarm_count"] == 0,
+        "alarm_analytic_layer_clean": not alarm_export
+        or result["alarms"]["analytic_unexplained_alarm_count"] == 0,
         "mileage_difference_below_1pct": km_ok,
     }
     return result

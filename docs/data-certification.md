@@ -15,7 +15,17 @@ PROCESS_ROLE=worker uv run python scripts/certify_real_data.py \
   --output /tmp/certificacion-ismocol-alarmas.json
 ```
 
-La aceptacion exige `unexplained_alarm_count = 0`. El resultado separa las filas fisicas duplicadas por Howen de los eventos unicos, para no convertir duplicados del proveedor en faltantes locales.
+La aceptacion exige simultaneamente `raw_unexplained_alarm_count = 0` y
+`analytic_unexplained_alarm_count = 0`. `unexplained_alarm_count` suma las
+diferencias de ambas capas y nunca puede ocultar una capa analitica incompleta.
+El resultado separa las filas fisicas duplicadas por Howen de los eventos
+unicos y muestra `raw_source_counts`, para distinguir clips autoritativos de
+filas historicas heredadas.
+
+Tanto los cortes oficiales como las reconstrucciones historicas usan
+`record/findEvidences.action`, la misma fuente de Alarm Clips con video. El API
+historico por dispositivo queda disponible solo como fallback configurable y
+no esta habilitado en produccion.
 
 ## Kilometraje
 

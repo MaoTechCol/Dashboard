@@ -179,6 +179,20 @@ class EvidencePartitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["alarmGuid"] for row in alpha["1"]], ["a", "c"])
         self.assertEqual([row["alarmGuid"] for row in beta["2"]], ["b"])
 
+    async def test_historical_rebuild_fetches_only_requested_company_devices(self) -> None:
+        service = self._service()
+
+        grouped = await service._fetch_evidence_harvest_rows(
+            device_ids=["1"],
+            start_at=datetime(2026, 8, 1, 0, 0, tzinfo=ZoneInfo("UTC")),
+            end_at=datetime(2026, 8, 21, 23, 59, tzinfo=ZoneInfo("UTC")),
+            account_scope=False,
+        )
+
+        request = service.howen.fetch_evidence_alarms_authorized.await_args.kwargs
+        self.assertEqual(request["device_ids"], ["1"])
+        self.assertEqual([row["alarmGuid"] for row in grouped["1"]], ["a", "c"])
+
 
 if __name__ == "__main__":
     unittest.main()

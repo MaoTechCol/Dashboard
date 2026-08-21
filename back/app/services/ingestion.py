@@ -185,7 +185,7 @@ class IngestionService:
         self._harvest_locks: dict[str, asyncio.Lock] = {}
         self._cut_publish_locks: dict[datetime, asyncio.Lock] = {}
         self._historical_rebuild_tasks: dict[int, asyncio.Task[Any]] = {}
-        self._evidence_fetch_tasks: dict[tuple[str, str], asyncio.Task[list[dict[str, Any]]]] = {}
+        self._evidence_fetch_tasks: dict[tuple[str, str, str], asyncio.Task[list[dict[str, Any]]]] = {}
 
     def _historical_rebuild_max_concurrency(self) -> int:
         return max(int(getattr(self.settings, "historical_rebuild_max_concurrency", 1) or 1), 1)
@@ -2308,25 +2308,30 @@ class IngestionService:
         device_ids: list[str],
         start_at: datetime,
         end_at: datetime,
+        account_scope: bool = True,
     ) -> dict[str, list[dict[str, Any]]]:
         if not device_ids:
             return {}
-        account_device_ids = sorted(
-            {
-                device_id
-                for company in self.registry.all()
-                if self.registry.is_operational(company)
-                for device_id in self._list_company_device_ids(company.slug)
-            }
-        )
-        if not account_device_ids:
-            account_device_ids = list(device_ids)
+        requested_device_ids = sorted(set(device_ids))
+        account_device_ids = requested_device_ids
+        if account_scope:
+            account_device_ids = sorted(
+                {
+                    device_id
+                    for company in self.registry.all()
+                    if self.registry.is_operational(company)
+                    for device_id in self._list_company_device_ids(company.slug)
+                }
+            )
+            if not account_device_ids:
+                account_device_ids = requested_device_ids
         local_start_at, local_end_at = self._historical_window_for_device(
             device_id=account_device_ids[0],
             start_at=start_at,
             end_at=end_at,
         )
-        cache_key = (local_start_at.isoformat(), local_end_at.isoformat())
+        scope_key = "account" if account_scope else ",".join(account_device_ids)
+        cache_key = (scope_key, local_start_at.isoformat(), local_end_at.isoformat())
         fetch_task = self._evidence_fetch_tasks.get(cache_key)
         if fetch_task is None:
             fetch_task = asyncio.create_task(
@@ -2372,6 +2377,65 @@ class IngestionService:
                 received_at=utc_now(),
             )
         return grouped
+
+    async def _fetch_evidence_backfill_rows(
+        self,
+        *,
+        device_ids: list[str],
+        start_at: datetime,
+        end_at: datetime,
+        source: str,
+        company_slug: str | None,
+        defer_on_rate_limit: bool,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Fetch the authoritative Alarm Clips rows once for a historical company window."""
+        max_retries = max(int(self.settings.backfill_rate_limit_max_retries), 0)
+        base_cooldown = max(float(self.settings.backfill_rate_limit_cooldown_seconds), 1.0)
+        max_cooldown = max(float(self.settings.backfill_rate_limit_max_cooldown_seconds), base_cooldown)
+        attempt = 0
+        while True:
+            try:
+                return await self._fetch_evidence_harvest_rows(
+                    device_ids=device_ids,
+                    start_at=start_at,
+                    end_at=end_at,
+                    account_scope=False,
+                )
+            except Exception as exc:
+                if not self.howen.is_rate_limited(exc) or attempt >= max_retries:
+                    raise
+                cooldown = min(base_cooldown * (2**attempt), max_cooldown)
+                next_retry_at = utc_now() + timedelta(seconds=cooldown)
+                await self._record_anomaly(
+                    source_type="backfill",
+                    device_id=None,
+                    company_slug=company_slug,
+                    received_at=utc_now(),
+                    raw_event_time=None,
+                    reason="evidence_backfill_rate_limited_retry",
+                    payload={
+                        "source": source,
+                        "company_slug": company_slug,
+                        "device_count": len(device_ids),
+                        "range_start": ensure_utc(start_at).isoformat(),
+                        "range_end": ensure_utc(end_at).isoformat(),
+                        "attempt": attempt + 1,
+                        "max_retries": max_retries,
+                        "cooldown_seconds": cooldown,
+                        "next_retry_at": ensure_utc(next_retry_at).isoformat(),
+                        "error": str(exc),
+                    },
+                )
+                if defer_on_rate_limit:
+                    raise HistoricalBackfillDeferred(
+                        next_retry_at=next_retry_at,
+                        message=(
+                            "Proveedor limitando la consulta historica de clips. "
+                            f"Reintento programado para {ensure_utc(next_retry_at).isoformat()}."
+                        ),
+                    ) from exc
+                await asyncio.sleep(cooldown)
+                attempt += 1
 
     async def _run_live_forever(self) -> None:
         force_login = False
@@ -2592,17 +2656,57 @@ class IngestionService:
             with suppress(KeyError):
                 batch_company = self.registry.get(company_slug)
         per_device_pause = max(float(self.settings.catchup_batch_pause_seconds), 0.0) if source == "catchup" else 0.0
+        evidence_rows_by_device: dict[str, list[dict[str, Any]]] | None = None
+        evidence_fetch_error: Exception | None = None
+        use_evidence_bulk = (
+            str(getattr(self.settings, "howen_alarm_source", "evidence_bulk")) == "evidence_bulk"
+        )
+        if use_evidence_bulk and device_ids:
+            try:
+                evidence_rows_by_device = await self._fetch_evidence_backfill_rows(
+                    device_ids=device_ids,
+                    start_at=start_at,
+                    end_at=end_at,
+                    source=source,
+                    company_slug=company_slug,
+                    defer_on_rate_limit=defer_on_rate_limit,
+                )
+                logger.info(
+                    "historical_evidence_bulk company=%s source=%s devices=%s rows=%s",
+                    company_slug,
+                    source,
+                    len(device_ids),
+                    sum(len(items) for items in evidence_rows_by_device.values()),
+                )
+            except HistoricalBackfillDeferred:
+                raise
+            except Exception as exc:
+                if bool(getattr(self.settings, "howen_evidence_fallback_to_device_api", False)):
+                    logger.warning(
+                        "historical_evidence_fallback company=%s source=%s error=%s",
+                        company_slug,
+                        source,
+                        exc,
+                    )
+                    use_evidence_bulk = False
+                else:
+                    evidence_fetch_error = exc
         for index, device_id in enumerate(device_ids):
             if yield_to_live_harvest:
                 await self._yield_to_ready_harvests()
             try:
-                rows = await self._fetch_historical_backfill_rows(
-                    device_id=device_id,
-                    start_at=start_at,
-                    end_at=end_at,
-                    source=source,
-                    defer_on_rate_limit=defer_on_rate_limit,
-                )
+                if evidence_fetch_error is not None:
+                    raise evidence_fetch_error
+                if use_evidence_bulk and evidence_rows_by_device is not None:
+                    rows = evidence_rows_by_device.get(device_id, [])
+                else:
+                    rows = await self._fetch_historical_backfill_rows(
+                        device_id=device_id,
+                        start_at=start_at,
+                        end_at=end_at,
+                        source=source,
+                        defer_on_rate_limit=defer_on_rate_limit,
+                    )
             except HistoricalBackfillDeferred:
                 raise
             except Exception as exc:
