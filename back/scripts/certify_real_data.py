@@ -170,7 +170,10 @@ def read_alarm_export(path: Path, *, fleet_name: str | None, timezone: ZoneInfo)
         "range_end": max(observed) + timedelta(seconds=1),
         "counter": counter,
         "records": [
-            {"primary_key": primary, "candidate_keys": tuple(sorted(candidates))}
+            {
+                "primary_key": primary,
+                "candidate_keys": (primary, *sorted(candidates - {primary})),
+            }
             for primary, candidates in records_by_primary.items()
         ],
         "categories": dict(categories),

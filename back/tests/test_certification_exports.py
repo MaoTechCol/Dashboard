@@ -42,6 +42,33 @@ class CertificationExportTests(unittest.TestCase):
         key = result["records"][0]["primary_key"]
         self.assertEqual(key[2], "2026-08-21T15:00:00+00:00")
 
+    def test_alarm_export_keeps_begin_time_as_primary_candidate(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "alarms-with-reporting-time.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Device ID", "Alarm Type", "Fleet", "Begin Time", "Reporting time"])
+            sheet.append(
+                [
+                    "device-1",
+                    "Eyes Closed",
+                    "ISMOCOL UTIJP",
+                    "2026-08-21 10:00:00",
+                    "2026-08-21 09:59:00",
+                ]
+            )
+            workbook.save(path)
+
+            result = read_alarm_export(
+                path,
+                fleet_name="ISMOCOL UTIJP",
+                timezone=ZoneInfo("America/Bogota"),
+            )
+
+        record = result["records"][0]
+        self.assertEqual(record["candidate_keys"][0], record["primary_key"])
+        self.assertGreater(len(record["candidate_keys"]), 1)
+
     def test_mileage_export_preserves_explicit_zero_and_missing_cells(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "mileage.xlsx"
