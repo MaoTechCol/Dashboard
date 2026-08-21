@@ -44,7 +44,7 @@ router = APIRouter()
 
 def _enqueue_snapshot_refresh(context: object, company_slug: str) -> dict[str, object]:
     cut_at = context.ingestion.latest_due_cut()
-    return context.jobs.enqueue_latest_refresh(
+    return context.jobs.enqueue_latest_harvest(
         company_slug=company_slug,
         cut_at=cut_at,
         payload={"company_slug": company_slug, "cut_at": cut_at.isoformat()},
