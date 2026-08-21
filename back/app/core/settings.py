@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     howen_request_spacing_max_seconds: float = 8.0
     howen_request_recovery_successes: int = 20
     howen_alarm_source: str = "evidence_bulk"
-    howen_evidence_page_size: int = 48
+    howen_evidence_page_size: int = 500
     howen_evidence_max_devices_per_request: int = 200
     howen_evidence_fallback_to_device_api: bool = True
     harvest_cut_interval_minutes: int = 15
