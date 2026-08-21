@@ -13,7 +13,7 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from app.bootstrap import AppContext, build_context
-from app.core.systemd import notify_systemd, watchdog_loop
+from app.core.systemd import memory_monitor_loop, notify_systemd, watchdog_loop
 from app.core.time import ensure_utc
 from app.models import CompanyHistoricalRebuildJob, IngestState
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, KmRepairRequest
@@ -50,6 +50,16 @@ class DashboardWorker:
         )
         await asyncio.to_thread(self._enqueue_orphaned_rebuilds)
         watchdog_task = asyncio.create_task(watchdog_loop(self._stop), name="worker-systemd-watchdog")
+        memory_monitor_task = asyncio.create_task(
+            memory_monitor_loop(
+                self._stop,
+                role=self.context.settings.process_role,
+                warning_mb=self.context.settings.memory_warning_mb,
+                critical_mb=self.context.settings.memory_critical_mb,
+                interval_seconds=self.context.settings.memory_monitor_interval_seconds,
+            ),
+            name="worker-memory-monitor",
+        )
         notify_systemd("READY=1\nSTATUS=Worker disponible")
         scheduler_task = asyncio.create_task(self._scheduler_loop(), name="worker-scheduler")
         consumer_task = asyncio.create_task(self._consumer_loop(), name="worker-consumer")
@@ -78,8 +88,15 @@ class DashboardWorker:
             for task in critical_tasks:
                 task.cancel()
             watchdog_task.cancel()
+            memory_monitor_task.cancel()
             stop_task.cancel()
-            await asyncio.gather(*critical_tasks, watchdog_task, stop_task, return_exceptions=True)
+            await asyncio.gather(
+                *critical_tasks,
+                watchdog_task,
+                memory_monitor_task,
+                stop_task,
+                return_exceptions=True,
+            )
             await self.context.ingestion.stop()
             logger.info("worker_stop worker_id=%s", self.worker_id)
 
@@ -319,6 +336,16 @@ class DashboardWorker:
             result = await asyncio.to_thread(
                 self.context.dashboard.repair_km,
                 KmRepairRequest.model_validate(payload["request"]),
+            )
+            self.context.ingestion.mark_dirty()
+            return result
+        if job_type == "review_bulk_decision":
+            result = await asyncio.to_thread(
+                self.context.dashboard.decide_reconciliation_reviews_bulk,
+                review_ids=[int(review_id) for review_id in payload.get("review_ids", [])],
+                action=str(payload["action"]),
+                decided_by=str(payload["decided_by"]),
+                note=payload.get("note"),
             )
             self.context.ingestion.mark_dirty()
             return result

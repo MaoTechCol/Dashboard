@@ -18,8 +18,9 @@ Restart=always
 RestartSec=5
 OOMPolicy=stop
 TimeoutStopSec=60
-MemoryHigh=700M
-MemoryMax=1100M
+MemoryHigh=1300M
+MemoryMax=2200M
+MemorySwapMax=1G
 TasksMax=256
 
 [Install]

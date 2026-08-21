@@ -51,6 +51,9 @@ export interface AdminCompanyCatalog {
   companies: AdminCompanyCatalogItem[];
   activation_jobs: AdminCompanyCatalogItem[];
   fleet_candidates: FleetCandidate[];
+  job_id?: string;
+  job_type?: string;
+  status?: string;
 }
 
 export interface SessionUser {

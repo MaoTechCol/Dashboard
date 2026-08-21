@@ -203,6 +203,17 @@ def dashboard_snapshot(
     return payload
 
 
+@router.post("/dashboard/refresh", status_code=status.HTTP_202_ACCEPTED)
+def queue_dashboard_refresh(
+    request: Request,
+    company: str | None = Query(default=None),
+) -> dict[str, object]:
+    user = get_current_user(request)
+    company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
+    context = get_context(request)
+    return _enqueue_snapshot_refresh(context, company_slug)
+
+
 @router.get("/dashboard/{company_slug}")
 def dashboard_snapshot_by_slug(
     company_slug: str,
@@ -397,7 +408,7 @@ async def admin_activate_company(request: Request, payload: CompanyActivationReq
         maintenance=False,
     )
     rebuild_job_id = context.ingestion.queue_historical_rebuild(rebuild_request, spawn=False)
-    context.jobs.enqueue(
+    queued_job = context.jobs.enqueue(
         job_type="historical_rebuild",
         payload={
             "request": rebuild_request.model_dump(mode="json"),
@@ -408,7 +419,11 @@ async def admin_activate_company(request: Request, payload: CompanyActivationReq
         company_slug=company.slug,
     )
     context.ingestion.mark_dirty()
-    return admin_companies(request)
+    return admin_companies(request) | {
+        "job_id": queued_job["job_id"],
+        "job_type": queued_job["job_type"],
+        "status": queued_job["status"],
+    }
 
 
 @router.post("/admin/companies/{company_slug}/deactivate", status_code=status.HTTP_202_ACCEPTED)
@@ -420,14 +435,18 @@ async def admin_deactivate_company(company_slug: str, request: Request) -> dict[
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
-    context.jobs.enqueue(
+    queued_job = context.jobs.enqueue(
         job_type="company_purge",
         payload={"company_slug": company_slug},
         priority=PRIORITY_COMPANY_PURGE,
         idempotency_key=f"company_purge:{company_slug}:{uuid4().hex}",
         company_slug=company_slug,
     )
-    return admin_companies(request)
+    return admin_companies(request) | {
+        "job_id": queued_job["job_id"],
+        "job_type": queued_job["job_type"],
+        "status": queued_job["status"],
+    }
 
 
 @router.post("/admin/users/admin/password")
@@ -744,33 +763,49 @@ def admin_reconciliation_review_discard(
     return result
 
 
-@router.post("/admin/reconciliation/reviews/bulk/approve")
+@router.post(
+    "/admin/reconciliation/reviews/bulk/approve",
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def admin_reconciliation_review_bulk_approve(
     request: Request,
     payload: ReconciliationReviewBulkDecisionRequest,
 ) -> dict[str, object]:
     user = require_admin(request)
     context = get_context(request)
-    return context.dashboard.decide_reconciliation_reviews_bulk(
-        review_ids=payload.ids,
-        action="approve",
-        decided_by=user.username,
-        note=payload.note,
+    return context.jobs.enqueue(
+        job_type="review_bulk_decision",
+        payload={
+            "review_ids": payload.ids,
+            "action": "approve",
+            "decided_by": user.username,
+            "note": payload.note,
+        },
+        priority=PRIORITY_DATA_MAINTENANCE,
+        idempotency_key=f"review_bulk:approve:{uuid4().hex}",
     )
 
 
-@router.post("/admin/reconciliation/reviews/bulk/discard")
+@router.post(
+    "/admin/reconciliation/reviews/bulk/discard",
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def admin_reconciliation_review_bulk_discard(
     request: Request,
     payload: ReconciliationReviewBulkDecisionRequest,
 ) -> dict[str, object]:
     user = require_admin(request)
     context = get_context(request)
-    return context.dashboard.decide_reconciliation_reviews_bulk(
-        review_ids=payload.ids,
-        action="discard",
-        decided_by=user.username,
-        note=payload.note,
+    return context.jobs.enqueue(
+        job_type="review_bulk_decision",
+        payload={
+            "review_ids": payload.ids,
+            "action": "discard",
+            "decided_by": user.username,
+            "note": payload.note,
+        },
+        priority=PRIORITY_DATA_MAINTENANCE,
+        idempotency_key=f"review_bulk:discard:{uuid4().hex}",
     )
 
 

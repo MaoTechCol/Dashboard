@@ -80,6 +80,17 @@ class Settings(BaseSettings):
     worker_retry_base_seconds: int = 30
     worker_retry_max_seconds: int = 900
     worker_max_attempts: int = 5
+    database_connect_timeout_seconds: int = 5
+    database_lock_timeout_ms: int = 5_000
+    api_database_statement_timeout_ms: int = 12_000
+    worker_database_statement_timeout_ms: int = 300_000
+    api_database_pool_timeout_seconds: int = 5
+    worker_database_pool_timeout_seconds: int = 30
+    memory_monitor_interval_seconds: int = 15
+    api_memory_warning_mb: int = 450
+    api_memory_critical_mb: int = 750
+    worker_memory_warning_mb: int = 1_100
+    worker_memory_critical_mb: int = 2_000
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -136,6 +147,30 @@ class Settings(BaseSettings):
     @property
     def session_cache_path(self) -> Path:
         return self.root_dir / "storage" / "howen_session.json"
+
+    @property
+    def database_statement_timeout_ms(self) -> int:
+        if self.process_role == "worker":
+            return self.worker_database_statement_timeout_ms
+        return self.api_database_statement_timeout_ms
+
+    @property
+    def database_pool_timeout_seconds(self) -> int:
+        if self.process_role == "worker":
+            return self.worker_database_pool_timeout_seconds
+        return self.api_database_pool_timeout_seconds
+
+    @property
+    def memory_warning_mb(self) -> int:
+        if self.process_role == "worker":
+            return self.worker_memory_warning_mb
+        return self.api_memory_warning_mb
+
+    @property
+    def memory_critical_mb(self) -> int:
+        if self.process_role == "worker":
+            return self.worker_memory_critical_mb
+        return self.api_memory_critical_mb
 
 
 @lru_cache(maxsize=1)

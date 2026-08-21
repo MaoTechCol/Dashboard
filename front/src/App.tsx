@@ -29,7 +29,7 @@ import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useStat
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 import { Bar, Doughnut, Line } from "react-chartjs-2";
 
-import { ApiError, apiFetch, apiJson, buildApiUrl } from "./api";
+import { ApiError, apiFetch, apiJson, buildApiUrl, waitForBackgroundJob } from "./api";
 import { useDashboardStream } from "./hooks/useDashboardStream";
 import { buildTimeline, formatCategory } from "./lib/alerts";
 import type {
@@ -41,6 +41,7 @@ import type {
   AdminOverview,
   AdminVehicle,
   AuthMeResponse,
+  BackgroundJobStatus,
   CompanySummary,
   DashboardSnapshot,
   FeedState,
@@ -3240,11 +3241,18 @@ function AdminAuditModule({
       setActionLoading(true);
       setError(null);
       setSuccess(null);
-      const response = await apiJson<ReconciliationReviewBulkDecisionResult>(`/admin/reconciliation/reviews/bulk/${action}`, {
+      const queuedJob = await apiJson<BackgroundJobStatus>(`/admin/reconciliation/reviews/bulk/${action}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids: reviewIds, note: null }),
       });
+      const completedJob = await waitForBackgroundJob<BackgroundJobStatus>(queuedJob.job_id, { timeoutMs: 120_000 });
+      const response = completedJob?.result as unknown as ReconciliationReviewBulkDecisionResult | null;
+      if (!response) {
+        setSuccess("La decision quedo en proceso y se reflejara al terminar el worker.");
+        setSelectedReviewIds([]);
+        return;
+      }
       const affected = response.updated;
       const label = affected === 1 ? "1 caso" : `${affected} casos`;
       setSuccess(

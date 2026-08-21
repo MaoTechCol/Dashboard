@@ -44,19 +44,20 @@ export function useDashboardStream(companySlug: string | null) {
     const request = (async () => {
       const params = new URLSearchParams({ company: nextCompany });
       if (force) {
-        params.set("refresh", "1");
-        params.set("_ts", String(Date.now()));
-      }
-      const payload = await apiJson<DashboardSnapshot>(`/dashboard?${params.toString()}`);
-      const refreshJob = payload.meta.refreshJob;
-      if (force && refreshJob && refreshJob.status !== "succeeded") {
-        await waitForBackgroundJob<BackgroundJobStatus>(refreshJob.job_id);
+        const refreshJob = await apiJson<BackgroundJobStatus>(
+          `/dashboard/refresh?company=${encodeURIComponent(nextCompany)}`,
+          { method: "POST" },
+        );
+        if (refreshJob.status !== "succeeded") {
+          await waitForBackgroundJob<BackgroundJobStatus>(refreshJob.job_id);
+        }
         const currentCompany = companyRef.current;
         if (currentCompany === nextCompany) {
           const refreshed = await apiJson<DashboardSnapshot>(`/dashboard?company=${encodeURIComponent(nextCompany)}`);
           setSnapshot(refreshed);
         }
       } else {
+        const payload = await apiJson<DashboardSnapshot>(`/dashboard?${params.toString()}`);
         setSnapshot(payload);
       }
       setLoading(false);
