@@ -49,6 +49,7 @@ class DailyMileageSnapshot(Base):
     __tablename__ = "daily_mileage_snapshots"
     __table_args__ = (
         UniqueConstraint("device_id", "snapshot_date", name="uq_daily_snapshot_device_date"),
+        Index("ix_daily_snapshots_company_date", "company_slug", "snapshot_date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -75,6 +76,7 @@ class AlarmEvent(Base):
     __table_args__ = (
         UniqueConstraint("provider_event_key", name="uq_alarm_events_provider_event_key"),
         Index("ix_alarm_events_company_device_occurred", "company_slug", "device_id", "occurred_at"),
+        Index("ix_alarm_events_company_occurred", "company_slug", "occurred_at"),
     )
 
     guid: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -109,6 +111,7 @@ class AlarmEventAudit(Base):
     __tablename__ = "alarm_event_audit"
     __table_args__ = (
         Index("ix_alarm_event_audit_company_device_received", "company_slug", "device_id", "received_at"),
+        Index("ix_alarm_event_audit_company_received", "company_slug", "received_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -132,6 +135,8 @@ class HowenAlarmRaw(Base):
     __table_args__ = (
         UniqueConstraint("provider_event_key", name="uq_howen_alarm_raw_provider_event_key"),
         Index("ix_howen_alarm_raw_company_device_occurred", "company_slug", "device_id", "occurred_at"),
+        Index("ix_howen_alarm_raw_company_occurred", "company_slug", "occurred_at"),
+        Index("ix_howen_alarm_raw_company_received", "company_slug", "received_at"),
     )
 
     guid: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -195,6 +200,9 @@ class ManagedCompany(Base):
 
 class IngestionAnomaly(Base):
     __tablename__ = "ingestion_anomalies"
+    __table_args__ = (
+        Index("ix_ingestion_anomalies_company_received", "company_slug", "received_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_type: Mapped[str] = mapped_column(String(32), index=True)
@@ -406,6 +414,10 @@ class ReconciliationJobDevice(Base):
 
 class ReconciliationReview(Base):
     __tablename__ = "reconciliation_reviews"
+    __table_args__ = (
+        Index("ix_reconciliation_reviews_company_observed", "company_slug", "observed_at"),
+        Index("ix_reconciliation_reviews_company_created", "company_slug", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     review_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)

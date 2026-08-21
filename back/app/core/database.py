@@ -144,6 +144,11 @@ def _run_compat_migrations() -> None:
         _ensure_column("daily_mileage_snapshots", "km_validation_reason", "VARCHAR(255)")
         _ensure_column("daily_mileage_snapshots", "repair_reason", "VARCHAR(255)")
         _ensure_column("daily_mileage_snapshots", "repaired_at", "DATETIME")
+        _ensure_index(
+            "ix_daily_snapshots_company_date",
+            "daily_mileage_snapshots",
+            ["company_slug", "snapshot_date"],
+        )
     if "alarm_events" in existing_tables:
         _ensure_column("alarm_events", "provider_event_key", "VARCHAR(255)")
         _ensure_column("alarm_events", "company_slug", "VARCHAR(64)")
@@ -167,6 +172,11 @@ def _run_compat_migrations() -> None:
             "alarm_events",
             ["company_slug", "device_id", "occurred_at"],
         )
+        _ensure_index(
+            "ix_alarm_events_company_occurred",
+            "alarm_events",
+            ["company_slug", "occurred_at"],
+        )
     if "howen_alarm_raw" in existing_tables:
         _ensure_column("howen_alarm_raw", "provider_event_key", "VARCHAR(255)")
         _ensure_column("howen_alarm_raw", "raw_event_time", "VARCHAR(128)")
@@ -181,11 +191,43 @@ def _run_compat_migrations() -> None:
             "howen_alarm_raw",
             ["company_slug", "device_id", "occurred_at"],
         )
+        _ensure_index(
+            "ix_howen_alarm_raw_company_occurred",
+            "howen_alarm_raw",
+            ["company_slug", "occurred_at"],
+        )
+        _ensure_index(
+            "ix_howen_alarm_raw_company_received",
+            "howen_alarm_raw",
+            ["company_slug", "received_at"],
+        )
     if "alarm_event_audit" in existing_tables:
         _ensure_index(
             "ix_alarm_event_audit_company_device_received",
             "alarm_event_audit",
             ["company_slug", "device_id", "received_at"],
+        )
+        _ensure_index(
+            "ix_alarm_event_audit_company_received",
+            "alarm_event_audit",
+            ["company_slug", "received_at"],
+        )
+    if "ingestion_anomalies" in existing_tables:
+        _ensure_index(
+            "ix_ingestion_anomalies_company_received",
+            "ingestion_anomalies",
+            ["company_slug", "received_at"],
+        )
+    if "reconciliation_reviews" in existing_tables:
+        _ensure_index(
+            "ix_reconciliation_reviews_company_observed",
+            "reconciliation_reviews",
+            ["company_slug", "observed_at"],
+        )
+        _ensure_index(
+            "ix_reconciliation_reviews_company_created",
+            "reconciliation_reviews",
+            ["company_slug", "created_at"],
         )
     if "catchup_cursor" in existing_tables:
         _ensure_column("catchup_cursor", "last_successful_catchup_cursor_at", "DATETIME")

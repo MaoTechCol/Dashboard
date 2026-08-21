@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import load_only
 
 from app.core.catalog import CATEGORY_META, CATEGORY_ORDER
@@ -1848,6 +1848,21 @@ class DashboardService:
 
             alarm_query = (
                 select(AlarmEvent)
+                .options(
+                    load_only(
+                        AlarmEvent.guid,
+                        AlarmEvent.provider_event_key,
+                        AlarmEvent.device_id,
+                        AlarmEvent.plate_no,
+                        AlarmEvent.category,
+                        AlarmEvent.subtype,
+                        AlarmEvent.mapping_source,
+                        AlarmEvent.classification_status,
+                        AlarmEvent.raw_alarm_type,
+                        AlarmEvent.raw_tp,
+                        AlarmEvent.occurred_at,
+                    )
+                )
                 .where(
                     AlarmEvent.source.in_(ACTIVE_EVENT_SOURCES),
                     AlarmEvent.occurred_at >= query_start_at,
@@ -1859,55 +1874,106 @@ class DashboardService:
                 alarm_query = alarm_query.where(alarm_membership)
             window_alarm_rows = list(session.scalars(alarm_query))
 
-            raw_event_time = func.coalesce(HowenAlarmRaw.occurred_at, HowenAlarmRaw.received_at)
             raw_query = (
                 select(HowenAlarmRaw)
-                .where(
-                    raw_event_time.between(query_start_at, end_at)
+                .options(
+                    load_only(
+                        HowenAlarmRaw.guid,
+                        HowenAlarmRaw.provider_event_key,
+                        HowenAlarmRaw.occurred_at,
+                        HowenAlarmRaw.received_at,
+                        HowenAlarmRaw.classification_status,
+                        HowenAlarmRaw.temporal_status,
+                    )
                 )
-                .order_by(HowenAlarmRaw.received_at.desc())
+                .where(
+                    or_(
+                        HowenAlarmRaw.occurred_at.between(query_start_at, end_at),
+                        and_(
+                            HowenAlarmRaw.occurred_at.is_(None),
+                            HowenAlarmRaw.received_at.between(query_start_at, end_at),
+                        ),
+                    )
+                )
+                .order_by(HowenAlarmRaw.occurred_at.desc(), HowenAlarmRaw.received_at.desc())
             )
             if raw_membership is not None:
                 raw_query = raw_query.where(raw_membership)
             window_raw_rows = list(session.scalars(raw_query))
-            review_event_time = func.coalesce(ReconciliationReview.observed_at, ReconciliationReview.created_at)
             window_review_rows = list(
                 session.scalars(
                     select(ReconciliationReview)
+                    .options(
+                        load_only(
+                            ReconciliationReview.guid,
+                            ReconciliationReview.observed_at,
+                            ReconciliationReview.created_at,
+                            ReconciliationReview.suggested_action,
+                            ReconciliationReview.classification_status,
+                            ReconciliationReview.review_status,
+                        )
+                    )
                     .where(
                         ReconciliationReview.company_slug == company_slug,
-                        review_event_time.between(query_start_at, end_at),
+                        or_(
+                            ReconciliationReview.observed_at.between(query_start_at, end_at),
+                            and_(
+                                ReconciliationReview.observed_at.is_(None),
+                                ReconciliationReview.created_at.between(query_start_at, end_at),
+                            ),
+                        ),
                     )
-                    .order_by(review_event_time.desc())
+                    .order_by(ReconciliationReview.observed_at.desc(), ReconciliationReview.created_at.desc())
                 )
             )
-            anomalies = list(
-                session.scalars(
-                    select(IngestionAnomaly)
+            anomaly_reason_counts = dict(
+                session.execute(
+                    select(IngestionAnomaly.reason, func.count(IngestionAnomaly.id))
                     .where(
                         IngestionAnomaly.company_slug == company_slug,
                         IngestionAnomaly.received_at >= start_at,
                         IngestionAnomaly.received_at <= end_at,
                     )
-                    .order_by(IngestionAnomaly.received_at.desc())
-                )
+                    .group_by(IngestionAnomaly.reason)
+                ).all()
             )
-            alarm_audits = list(
-                session.scalars(
-                    select(AlarmEventAudit)
+            audit_stage_counts = dict(
+                session.execute(
+                    select(AlarmEventAudit.stage, func.count(AlarmEventAudit.id))
                     .where(
                         AlarmEventAudit.company_slug == company_slug,
                         AlarmEventAudit.received_at >= start_at,
                         AlarmEventAudit.received_at <= end_at,
                     )
-                    .order_by(AlarmEventAudit.received_at.desc())
-                )
+                    .group_by(AlarmEventAudit.stage)
+                ).all()
+            )
+            audit_reason_counts = dict(
+                session.execute(
+                    select(AlarmEventAudit.reason, func.count(AlarmEventAudit.id))
+                    .where(
+                        AlarmEventAudit.company_slug == company_slug,
+                        AlarmEventAudit.received_at >= start_at,
+                        AlarmEventAudit.received_at <= end_at,
+                    )
+                    .group_by(AlarmEventAudit.reason)
+                ).all()
             )
             baseline_snapshots = [
                 snapshot
                 for snapshot in session.scalars(
                     (
                         select(DailyMileageSnapshot)
+                        .options(
+                            load_only(
+                                DailyMileageSnapshot.device_id,
+                                DailyMileageSnapshot.plate_no,
+                                DailyMileageSnapshot.snapshot_date,
+                                DailyMileageSnapshot.total_km,
+                                DailyMileageSnapshot.day_km,
+                                DailyMileageSnapshot.observed_at,
+                            )
+                        )
                         .where(
                             DailyMileageSnapshot.source.in_(ACTIVE_SNAPSHOT_SOURCES),
                             DailyMileageSnapshot.snapshot_date >= baseline_start,
@@ -1925,9 +1991,6 @@ class DashboardService:
             raw_alarm.received_at = ensure_utc(raw_alarm.received_at) or raw_alarm.received_at
         for snapshot in baseline_snapshots:
             snapshot.observed_at = ensure_utc(snapshot.observed_at) or snapshot.observed_at
-        for audit_row in alarm_audits:
-            audit_row.received_at = ensure_utc(audit_row.received_at) or audit_row.received_at
-            audit_row.observed_at = ensure_utc(audit_row.observed_at)
 
         def _alarm_in_window(event: AlarmEvent, window_start: datetime) -> bool:
             return bool(event.occurred_at and event.occurred_at >= window_start and event.occurred_at <= end_at)
@@ -1996,8 +2059,8 @@ class DashboardService:
                 unclassified_total=sum(1 for event in all_company_alarms if event.classification_status == "unmapped"),
                 mapping_sources=dict(Counter(event.mapping_source or "unknown" for event in all_company_alarms)),
                 by_category=dict(Counter(event.category for event in all_company_alarms)),
-                audit_stages=dict(Counter(audit_row.stage for audit_row in alarm_audits)),
-                audit_reasons=dict(Counter(audit_row.reason for audit_row in alarm_audits)),
+                audit_stages=audit_stage_counts,
+                audit_reasons=audit_reason_counts,
                 by_subtype=[
                     {"subtype": subtype or "sin_subtipo", "count": count}
                     for subtype, count in Counter(
@@ -2006,8 +2069,8 @@ class DashboardService:
                 ],
             ),
             anomalies=AnomalyAuditView(
-                total=len(anomalies),
-                by_reason=dict(Counter(anomaly.reason for anomaly in anomalies)),
+                total=sum(anomaly_reason_counts.values()),
+                by_reason=anomaly_reason_counts,
             ),
             requested_window=RecentAuditView(**requested_metrics),
             recent_7d=RecentAuditView(**recent_7d_metrics),
