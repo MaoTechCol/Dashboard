@@ -1888,6 +1888,10 @@ class DashboardService:
                 )
                 .where(
                     or_(
+                        HowenAlarmRaw.classification_status.in_(("classified_dms", "unmapped")),
+                        HowenAlarmRaw.temporal_status == "future_rejected",
+                    ),
+                    or_(
                         HowenAlarmRaw.occurred_at.between(query_start_at, end_at),
                         and_(
                             HowenAlarmRaw.occurred_at.is_(None),
@@ -1935,28 +1939,6 @@ class DashboardService:
                         IngestionAnomaly.received_at <= end_at,
                     )
                     .group_by(IngestionAnomaly.reason)
-                ).all()
-            )
-            audit_stage_counts = dict(
-                session.execute(
-                    select(AlarmEventAudit.stage, func.count(AlarmEventAudit.id))
-                    .where(
-                        AlarmEventAudit.company_slug == company_slug,
-                        AlarmEventAudit.received_at >= start_at,
-                        AlarmEventAudit.received_at <= end_at,
-                    )
-                    .group_by(AlarmEventAudit.stage)
-                ).all()
-            )
-            audit_reason_counts = dict(
-                session.execute(
-                    select(AlarmEventAudit.reason, func.count(AlarmEventAudit.id))
-                    .where(
-                        AlarmEventAudit.company_slug == company_slug,
-                        AlarmEventAudit.received_at >= start_at,
-                        AlarmEventAudit.received_at <= end_at,
-                    )
-                    .group_by(AlarmEventAudit.reason)
                 ).all()
             )
             baseline_snapshots = [
@@ -2059,8 +2041,11 @@ class DashboardService:
                 unclassified_total=sum(1 for event in all_company_alarms if event.classification_status == "unmapped"),
                 mapping_sources=dict(Counter(event.mapping_source or "unknown" for event in all_company_alarms)),
                 by_category=dict(Counter(event.category for event in all_company_alarms)),
-                audit_stages=audit_stage_counts,
-                audit_reasons=audit_reason_counts,
+                # Detailed audit rows remain available for support, but the
+                # interactive diagnostic funnel must not scan that write-heavy
+                # table on every window change.
+                audit_stages={},
+                audit_reasons={},
                 by_subtype=[
                     {"subtype": subtype or "sin_subtipo", "count": count}
                     for subtype, count in Counter(

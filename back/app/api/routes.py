@@ -10,6 +10,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import get_context, get_current_user, require_admin, resolve_company_slug
+from app.core.time import ensure_utc
 from app.models import ReportAsset
 from app.schemas import (
     AdminCompanyCatalogItemView,
@@ -562,8 +563,8 @@ def admin_audit(
     user = require_admin(request)
     company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
     context = get_context(request)
-    end_at = to_at or datetime.now().astimezone()
-    start_at = from_at or (end_at - timedelta(days=7))
+    end_at = ensure_utc(to_at or datetime.now().astimezone())
+    start_at = ensure_utc(from_at or (end_at - timedelta(days=7)))
     if start_at >= end_at:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="from debe ser menor que to")
     return context.dashboard.build_admin_audit(company_slug, start_at=start_at, end_at=end_at)
