@@ -847,6 +847,14 @@ a {
   gap: 1rem;
 }
 
+.review-pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
 .review-card {
   display: flex;
   flex-direction: column;

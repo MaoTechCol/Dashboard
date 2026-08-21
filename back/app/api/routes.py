@@ -698,9 +698,12 @@ def admin_reconciliation_reviews(
     from_at: datetime | None = Query(default=None, alias="from"),
     to_at: datetime | None = Query(default=None, alias="to"),
     status_filter: str = Query(default="pending", alias="status"),
-    limit: int = Query(default=60, ge=1, le=200),
+    limit: int | None = Query(default=None, ge=1, le=200),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=24, ge=1, le=100),
     sync_queue: bool = Query(default=False, alias="sync"),
     suggested_filter: str | None = Query(default=None, alias="suggested"),
+    reason_filter: str | None = Query(default=None, alias="reason"),
 ) -> dict[str, object]:
     user = require_admin(request)
     company_slug = resolve_company_slug(request=request, user=user, requested_slug=company)
@@ -714,11 +717,18 @@ def admin_reconciliation_reviews(
         start_at=start_at,
         end_at=end_at,
         review_status=status_filter,
-        limit=limit,
+        page=page,
+        page_size=limit or page_size,
         sync_queue=sync_queue,
         suggested_actions=[
             item.strip()
             for item in (suggested_filter or "").split(",")
+            if item.strip()
+        ]
+        or None,
+        reasons=[
+            item.strip()
+            for item in (reason_filter or "").split(",")
             if item.strip()
         ]
         or None,

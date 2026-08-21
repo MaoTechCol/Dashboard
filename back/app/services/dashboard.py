@@ -1518,6 +1518,7 @@ class DashboardService:
         company: CompanyConfig,
         alarms: list[AlarmEvent],
         raw_rows: list[HowenAlarmRaw],
+        review_rows: list[ReconciliationReview],
         baseline_snapshots: list[DailyMileageSnapshot],
         review_status_by_guid: dict[str, str],
         tz: ZoneInfo,
@@ -1537,10 +1538,43 @@ class DashboardService:
             fleet_vehicle_count=fleet_vehicle_count,
         )
         metrics = dict(analysis["metrics"])
-        metrics["raw_events"] = sum(
-            1
-            for row in raw_rows
-            if row.classification_status == "classified_dms" and row.temporal_status == "accepted"
+        received_rows = [row for row in raw_rows if row.classification_status == "classified_dms"]
+        accepted_rows = [row for row in received_rows if row.temporal_status == "accepted"]
+        analytic_events = [event for event in alarms if event.classification_status == "classified_dms"]
+        dms_review_rows = [
+            row
+            for row in review_rows
+            if row.suggested_action in {"review_visibility", "review_raw", "review_anomaly"}
+            and row.classification_status != "classified_non_dms"
+        ]
+        retained_rows = [row for row in dms_review_rows if row.review_status == "pending"]
+        discarded_rows = [row for row in dms_review_rows if row.review_status == "discarded"]
+
+        analytic_provider_keys = {event.provider_event_key for event in analytic_events if event.provider_event_key}
+        analytic_guids = {event.guid for event in analytic_events if event.guid}
+        reviewed_guids = {row.guid for row in dms_review_rows if row.guid}
+
+        def _is_reconciled(row: HowenAlarmRaw) -> bool:
+            if row.temporal_status != "accepted":
+                return True
+            if row.provider_event_key and row.provider_event_key in analytic_provider_keys:
+                return True
+            return bool(row.guid and (row.guid in analytic_guids or row.guid in reviewed_guids))
+
+        reconciled_dms = sum(1 for row in received_rows if _is_reconciled(row))
+        metrics.update(
+            {
+                "received_dms": len(received_rows),
+                "analytic_dms": len(analytic_events),
+                "visible_episodes": metrics.get("visible_alerts", 0),
+                "fused_detections": metrics.get("fused_in_episode", 0),
+                "retained_for_review": len(retained_rows),
+                "discarded_by_admin": len(discarded_rows),
+                "reconciled_dms": reconciled_dms,
+                "unexplained_difference": max(len(received_rows) - reconciled_dms, 0),
+                # Compatibility for consumers that still read the original funnel.
+                "raw_events": len(accepted_rows),
+            }
         )
         metrics["non_dms_hidden"] = sum(
             1
@@ -1823,23 +1857,30 @@ class DashboardService:
             )
             if alarm_membership is not None:
                 alarm_query = alarm_query.where(alarm_membership)
-            window_alarm_rows = [
-                event for event in session.scalars(alarm_query) if review_status_by_guid.get(event.guid) != "discarded"
-            ]
+            window_alarm_rows = list(session.scalars(alarm_query))
 
+            raw_event_time = func.coalesce(HowenAlarmRaw.occurred_at, HowenAlarmRaw.received_at)
             raw_query = (
                 select(HowenAlarmRaw)
                 .where(
-                    or_(
-                        HowenAlarmRaw.occurred_at.between(query_start_at, end_at),
-                        HowenAlarmRaw.received_at.between(query_start_at, end_at),
-                    )
+                    raw_event_time.between(query_start_at, end_at)
                 )
                 .order_by(HowenAlarmRaw.received_at.desc())
             )
             if raw_membership is not None:
                 raw_query = raw_query.where(raw_membership)
             window_raw_rows = list(session.scalars(raw_query))
+            review_event_time = func.coalesce(ReconciliationReview.observed_at, ReconciliationReview.created_at)
+            window_review_rows = list(
+                session.scalars(
+                    select(ReconciliationReview)
+                    .where(
+                        ReconciliationReview.company_slug == company_slug,
+                        review_event_time.between(query_start_at, end_at),
+                    )
+                    .order_by(review_event_time.desc())
+                )
+            )
             anomalies = list(
                 session.scalars(
                     select(IngestionAnomaly)
@@ -1892,9 +1933,12 @@ class DashboardService:
             return bool(event.occurred_at and event.occurred_at >= window_start and event.occurred_at <= end_at)
 
         def _raw_in_window(row: HowenAlarmRaw, window_start: datetime) -> bool:
-            occurred_in_range = bool(row.occurred_at and row.occurred_at >= window_start and row.occurred_at <= end_at)
-            received_in_range = bool(row.received_at and row.received_at >= window_start and row.received_at <= end_at)
-            return occurred_in_range or received_in_range
+            event_time = row.occurred_at or row.received_at
+            return bool(event_time and event_time >= window_start and event_time <= end_at)
+
+        def _review_in_window(row: ReconciliationReview, window_start: datetime) -> bool:
+            event_time = ensure_utc(row.observed_at) or ensure_utc(row.created_at)
+            return bool(event_time and event_time >= window_start and event_time <= end_at)
 
         all_company_alarms = [event for event in window_alarm_rows if _alarm_in_window(event, start_at)]
         recent_company_alarms = [event for event in window_alarm_rows if _alarm_in_window(event, recent_start_at)]
@@ -1902,12 +1946,16 @@ class DashboardService:
         raw_company_alarms = [row for row in window_raw_rows if _raw_in_window(row, start_at)]
         recent_raw_company_alarms = [row for row in window_raw_rows if _raw_in_window(row, recent_start_at)]
         recent_7d_raw_company_alarms = [row for row in window_raw_rows if _raw_in_window(row, recent_7d_start_at)]
+        requested_reviews = [row for row in window_review_rows if _review_in_window(row, start_at)]
+        recent_reviews = [row for row in window_review_rows if _review_in_window(row, recent_start_at)]
+        recent_7d_reviews = [row for row in window_review_rows if _review_in_window(row, recent_7d_start_at)]
         daily_km_by_vehicle, _ = _build_daily_km(baseline_snapshots, [], window_alarm_rows, tz)
 
         requested_metrics = self._build_admin_recent_metrics(
             company=company,
             alarms=all_company_alarms,
             raw_rows=raw_company_alarms,
+            review_rows=requested_reviews,
             baseline_snapshots=baseline_snapshots,
             review_status_by_guid=review_status_by_guid,
             tz=tz,
@@ -1918,6 +1966,7 @@ class DashboardService:
             company=company,
             alarms=recent_company_alarms,
             raw_rows=recent_raw_company_alarms,
+            review_rows=recent_reviews,
             baseline_snapshots=baseline_snapshots,
             review_status_by_guid=review_status_by_guid,
             tz=tz,
@@ -1928,6 +1977,7 @@ class DashboardService:
             company=company,
             alarms=recent_7d_company_alarms,
             raw_rows=recent_7d_raw_company_alarms,
+            review_rows=recent_7d_reviews,
             baseline_snapshots=baseline_snapshots,
             review_status_by_guid=review_status_by_guid,
             tz=tz,
@@ -1941,8 +1991,8 @@ class DashboardService:
             range_start=start_at,
             range_end=end_at,
             alarms=AlarmAuditView(
-                accepted_total=len(all_company_alarms),
-                visible_total=sum(1 for event in all_company_alarms if event.classification_status == "classified_dms"),
+                accepted_total=requested_metrics["analytic_dms"],
+                visible_total=requested_metrics["visible_episodes"],
                 unclassified_total=sum(1 for event in all_company_alarms if event.classification_status == "unmapped"),
                 mapping_sources=dict(Counter(event.mapping_source or "unknown" for event in all_company_alarms)),
                 by_category=dict(Counter(event.category for event in all_company_alarms)),
@@ -2082,9 +2132,11 @@ class DashboardService:
         start_at: datetime,
         end_at: datetime,
         review_status: str = "pending",
-        limit: int = 60,
+        page: int = 1,
+        page_size: int = 24,
         sync_queue: bool = False,
         suggested_actions: list[str] | None = None,
+        reasons: list[str] | None = None,
     ) -> dict[str, Any]:
         company = self.registry.get(company_slug)
         if sync_queue and self._should_sync_operational_review_queue(company=company, start_at=start_at, end_at=end_at):
@@ -2094,25 +2146,29 @@ class DashboardService:
                 end_at=end_at,
             )
         with self.session_factory() as session:
-            filters = [
+            review_event_time = func.coalesce(ReconciliationReview.observed_at, ReconciliationReview.created_at)
+            base_filters = [
                 ReconciliationReview.company_slug == company_slug,
                 ReconciliationReview.review_status == review_status,
-                or_(
-                    ReconciliationReview.observed_at.between(start_at, end_at),
-                    ReconciliationReview.created_at.between(start_at, end_at),
-                ),
+                review_event_time.between(start_at, end_at),
             ]
+            filters = list(base_filters)
             if suggested_actions:
                 filters.append(ReconciliationReview.suggested_action.in_(suggested_actions))
+            if reasons:
+                filters.append(ReconciliationReview.reason.in_(reasons))
             base_query = select(ReconciliationReview).where(*filters)
             total_items = session.scalar(
+                select(func.count(ReconciliationReview.id)).where(*base_filters)
+            ) or 0
+            filtered_items = session.scalar(
                 select(func.count()).select_from(base_query.order_by(None).subquery())
             ) or 0
             counts_by_action = {
                 action or "sin_accion": count
                 for action, count in session.execute(
                     select(ReconciliationReview.suggested_action, func.count())
-                    .where(*filters)
+                    .where(*base_filters)
                     .group_by(ReconciliationReview.suggested_action)
                 ).all()
             }
@@ -2120,19 +2176,29 @@ class DashboardService:
                 reason or "sin_motivo": count
                 for reason, count in session.execute(
                     select(ReconciliationReview.reason, func.count())
-                    .where(*filters)
+                    .where(*base_filters)
                     .group_by(ReconciliationReview.reason)
                 ).all()
             }
+            effective_page_size = max(1, min(page_size, 100))
+            total_pages = (filtered_items + effective_page_size - 1) // effective_page_size if filtered_items else 0
+            effective_page = min(max(page, 1), max(total_pages, 1))
             rows = list(
                 session.scalars(
                     base_query
-                    .order_by(ReconciliationReview.observed_at.desc(), ReconciliationReview.created_at.desc())
-                    .limit(max(1, min(limit, 200)))
+                    .order_by(review_event_time.desc(), ReconciliationReview.id.desc())
+                    .offset((effective_page - 1) * effective_page_size)
+                    .limit(effective_page_size)
                 )
             )
         return ReconciliationReviewListView(
             total_items=total_items,
+            filtered_items=filtered_items,
+            page=effective_page,
+            page_size=effective_page_size,
+            total_pages=total_pages,
+            has_next=effective_page < total_pages,
+            has_previous=effective_page > 1,
             counts_by_action=counts_by_action,
             counts_by_reason=counts_by_reason,
             items=[ReconciliationReviewItemView.model_validate(_serialize_reconciliation_review(row)) for row in rows],
@@ -2149,10 +2215,7 @@ class DashboardService:
             latest_review_update = session.scalar(
                 select(func.max(ReconciliationReview.updated_at)).where(
                     ReconciliationReview.company_slug == company.slug,
-                    or_(
-                        ReconciliationReview.observed_at.between(start_at, end_at),
-                        ReconciliationReview.created_at.between(start_at, end_at),
-                    ),
+                    func.coalesce(ReconciliationReview.observed_at, ReconciliationReview.created_at).between(start_at, end_at),
                 )
             )
             latest_source_points = [

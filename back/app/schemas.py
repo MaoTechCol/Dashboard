@@ -304,6 +304,14 @@ class AdminOverviewView(BaseModel):
 
 
 class RecentAuditView(BaseModel):
+    received_dms: int = 0
+    analytic_dms: int = 0
+    visible_episodes: int = 0
+    fused_detections: int = 0
+    retained_for_review: int = 0
+    discarded_by_admin: int = 0
+    reconciled_dms: int = 0
+    unexplained_difference: int = 0
     raw_events: int = 0
     grouped_episodes: int = 0
     visible_alerts: int = 0
@@ -474,6 +482,12 @@ class ReconciliationReviewItemView(BaseModel):
 
 class ReconciliationReviewListView(BaseModel):
     total_items: int = 0
+    filtered_items: int = 0
+    page: int = 1
+    page_size: int = 24
+    total_pages: int = 0
+    has_next: bool = False
+    has_previous: bool = False
     counts_by_action: dict[str, int] = Field(default_factory=dict)
     counts_by_reason: dict[str, int] = Field(default_factory=dict)
     items: list[ReconciliationReviewItemView] = Field(default_factory=list)

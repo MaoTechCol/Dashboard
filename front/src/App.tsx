@@ -72,6 +72,7 @@ const DIAGNOSTIC_WINDOW_OPTIONS: Array<{ key: DiagnosticWindowMode; label: strin
   { key: "month", label: "30 dias" },
 ];
 const DIAGNOSTIC_CACHE_TTL_MS = 30_000;
+const DIAGNOSTIC_REVIEW_PAGE_SIZE = 12;
 
 const DASHBOARD_TABS: Array<{ id: DashboardTab; label: string }> = [
   { id: "24h", label: "Últimas 24h" },
@@ -184,10 +185,6 @@ function settledError(result: PromiseSettledResult<unknown>): string | null {
 interface DiagnosticAuditCacheEntry {
   loadedAt: number;
   audit: AdminAudit;
-  reviewQueue: ReconciliationReviewItem[];
-  reviewQueueTotal: number;
-  reviewCountsByAction: Record<string, number>;
-  reviewCountsByReason: Record<string, number>;
 }
 
 const STACKED_BAR_OPTIONS: ChartOptions<"bar"> = {
@@ -2648,6 +2645,10 @@ function AdminAuditModule({
   const [kmQuality, setKmQuality] = useState<KmQualitySummary | null>(null);
   const [reviewQueue, setReviewQueue] = useState<ReconciliationReviewItem[]>([]);
   const [reviewQueueTotal, setReviewQueueTotal] = useState(0);
+  const [reviewFilteredTotal, setReviewFilteredTotal] = useState(0);
+  const [reviewPage, setReviewPage] = useState(1);
+  const [reviewTotalPages, setReviewTotalPages] = useState(0);
+  const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewCountsByAction, setReviewCountsByAction] = useState<Record<string, number>>({});
   const [reviewCountsByReason, setReviewCountsByReason] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
@@ -2667,6 +2668,7 @@ function AdminAuditModule({
     new Map(),
   );
   const activeAuditRequestRef = useRef(0);
+  const activeReviewRequestRef = useRef(0);
   const auditBootstrappedRef = useRef(false);
   const lastAuditSnapshotVersionRef = useRef<string | null>(null);
   const timezoneName = company?.timezone ?? "America/Bogota";
@@ -2735,14 +2737,6 @@ function AdminAuditModule({
     () => reviewCountsByAction.review_km ?? 0,
     [reviewCountsByAction],
   );
-  const anomalyReasonLabels = useMemo(
-    () =>
-      Object.entries(audit?.anomalies.by_reason ?? {})
-        .sort((left, right) => right[1] - left[1])
-        .slice(0, 2)
-        .map(([reason, count]) => `${formatAuditReason(reason)} (${count})`),
-    [audit],
-  );
   const kmExceptionVehicles = useMemo(() => {
     const flagged = new Set([
       ...(kmQuality?.sample_invalid_vehicles ?? []),
@@ -2759,10 +2753,6 @@ function AdminAuditModule({
     );
   }, [kmQuality]);
   const activeWindowMetrics = audit?.requested_window ?? null;
-  const supportOnlyCount = useMemo(() => {
-    if (!activeWindowMetrics) return 0;
-    return activeWindowMetrics.non_dms_hidden + activeWindowMetrics.unmapped_hidden + activeWindowMetrics.future_rejected;
-  }, [activeWindowMetrics]);
   const reviewFilterOptions = useMemo(
     () => [
       { key: "review_visibility", label: "Reglas cliente", count: pendingVisibilityCount },
@@ -2783,15 +2773,7 @@ function AdminAuditModule({
         })),
     [reviewCountsByReason],
   );
-  const filteredReviewQueue = useMemo(() => {
-    return reviewQueue.filter((review) => {
-      const actionMatches =
-        selectedReviewBuckets.length === 0 || selectedReviewBuckets.includes(review.suggested_action);
-      const reasonMatches =
-        selectedReviewReasons.length === 0 || selectedReviewReasons.includes(review.reason);
-      return actionMatches && reasonMatches;
-    });
-  }, [reviewQueue, selectedReviewBuckets, selectedReviewReasons]);
+  const filteredReviewQueue = reviewQueue;
   const activeReviewFilterLabel = useMemo(() => {
     const actionLabel =
       selectedReviewBuckets.length === 0
@@ -2811,22 +2793,15 @@ function AdminAuditModule({
   }, [reviewFilterOptions, reviewReasonOptions, selectedReviewBuckets, selectedReviewReasons]);
   const supportFlowChart = useMemo(() => {
     const requested = audit?.requested_window;
-    const labels = [
-      "Tarjetas visibles",
-      "Fusionadas en episodio",
-      "Suprimidas",
-      "No DMS",
-      "Sin mapa",
-      "Temporal",
-    ];
+    const labels = ["DMS recibidos", "Analiticos", "Episodios visibles", "Fusionados", "Retenidos", "Descartados"];
     const values = requested
       ? [
-          requested.visible_alerts,
-          requested.fused_in_episode,
-          requested.suppressed_by_rule,
-          requested.non_dms_hidden,
-          requested.unmapped_hidden,
-          requested.future_rejected,
+          requested.received_dms,
+          requested.analytic_dms,
+          requested.visible_episodes,
+          requested.fused_detections,
+          requested.retained_for_review,
+          requested.discarded_by_admin,
         ]
       : [0, 0, 0, 0, 0, 0];
     return {
@@ -2835,7 +2810,7 @@ function AdminAuditModule({
         labels,
         datasets: [
           {
-            label: "Eventos del mes",
+            label: "Eventos de la ventana",
             data: values,
             backgroundColor: ["#10b981", "#38bdf8", "#f59e0b", "#64748b", "#a855f7", "#ef4444"],
             borderRadius: 10,
@@ -2956,11 +2931,6 @@ function AdminAuditModule({
 
   const applyAuditCacheEntry = useCallback((entry: DiagnosticAuditCacheEntry) => {
     setAudit(entry.audit);
-    setReviewQueue(entry.reviewQueue);
-    setReviewQueueTotal(entry.reviewQueueTotal);
-    setReviewCountsByAction(entry.reviewCountsByAction);
-    setReviewCountsByReason(entry.reviewCountsByReason);
-    setSelectedReviewIds((current) => current.filter((id) => entry.reviewQueue.some((review) => review.id === id)));
   }, []);
 
   useEffect(() => {
@@ -2974,19 +2944,24 @@ function AdminAuditModule({
     setSelectedReviewBuckets([]);
     setSelectedReviewReasons([]);
     setSelectedReviewIds([]);
+    setReviewQueue([]);
+    setReviewQueueTotal(0);
+    setReviewFilteredTotal(0);
+    setReviewTotalPages(0);
+    setReviewCountsByAction({});
+    setReviewCountsByReason({});
+    setReviewPage(1);
   }, [selectedCompany, selectedWindowMode, timezoneName]);
 
   const loadAudit = useCallback(
     async ({
       windowMode,
       background = false,
-      syncQueue = false,
       includeKm = false,
       applyCurrent = true,
     }: {
       windowMode: DiagnosticWindowMode;
       background?: boolean;
-      syncQueue?: boolean;
       includeKm?: boolean;
       applyCurrent?: boolean;
     }) => {
@@ -3000,7 +2975,7 @@ function AdminAuditModule({
         if (!background && !hasWindowCache) {
           setLoading(true);
           setRefreshing(false);
-        } else if (background || audit !== null || kmQuality !== null || reviewQueueTotal > 0 || reviewQueue.length > 0) {
+        } else if (background || audit !== null || kmQuality !== null) {
           setRefreshing(true);
         } else {
           setLoading(true);
@@ -3017,45 +2992,18 @@ function AdminAuditModule({
           includeKm
             ? apiJson<KmQualitySummary>(`/admin/km/quality?company=${encodeURIComponent(selectedCompany)}`)
             : Promise.resolve<KmQualitySummary | null>(null),
-          apiJson<ReconciliationReviewList>(
-            `/admin/reconciliation/reviews?company=${encodeURIComponent(selectedCompany)}&from=${encodeURIComponent(
-              toCompanyIso(windowRange.from, timezoneName),
-            )}&to=${encodeURIComponent(toCompanyIso(windowRange.to, timezoneName))}&status=pending&limit=120&sync=${syncQueue ? "1" : "0"}`,
-          ),
           apiJson<AdminAudit>(`/admin/audit?${params.toString()}`),
         ]);
 
-        const [nextKmQuality, nextReviewQueue, nextAudit] = requestBatch;
-        if (nextAudit.status === "fulfilled" && nextReviewQueue.status === "fulfilled") {
+        const [nextKmQuality, nextAudit] = requestBatch;
+        if (nextAudit.status === "fulfilled") {
           const nextCacheEntry: DiagnosticAuditCacheEntry = {
             loadedAt: Date.now(),
             audit: nextAudit.value,
-            reviewQueue: nextReviewQueue.value.items,
-            reviewQueueTotal: nextReviewQueue.value.total_items,
-            reviewCountsByAction: nextReviewQueue.value.counts_by_action,
-            reviewCountsByReason: nextReviewQueue.value.counts_by_reason,
           };
           auditWindowCacheRef.current.set(cacheKey, nextCacheEntry);
           if (applyCurrent && activeAuditRequestRef.current === requestId && cacheKey === detailCacheKey) {
             applyAuditCacheEntry(nextCacheEntry);
-          }
-        } else {
-          if (nextAudit.status === "fulfilled" && applyCurrent && activeAuditRequestRef.current === requestId && cacheKey === detailCacheKey) {
-            setAudit(nextAudit.value);
-          }
-          if (
-            nextReviewQueue.status === "fulfilled" &&
-            applyCurrent &&
-            activeAuditRequestRef.current === requestId &&
-            cacheKey === detailCacheKey
-          ) {
-            setReviewQueue(nextReviewQueue.value.items);
-            setReviewQueueTotal(nextReviewQueue.value.total_items);
-            setReviewCountsByAction(nextReviewQueue.value.counts_by_action);
-            setReviewCountsByReason(nextReviewQueue.value.counts_by_reason);
-            setSelectedReviewIds((current) =>
-              current.filter((id) => nextReviewQueue.value.items.some((review) => review.id === id)),
-            );
           }
         }
 
@@ -3092,13 +3040,54 @@ function AdminAuditModule({
       buildWindowCacheKey,
       detailCacheKey,
       kmQuality,
-      reviewQueue.length,
-      reviewQueueTotal,
       selectedCompany,
       snapshotVersion,
       timezoneName,
       windowRanges,
     ],
+  );
+
+  const loadReviewPage = useCallback(
+    async ({ syncQueue = false }: { syncQueue?: boolean } = {}) => {
+      const requestId = activeReviewRequestRef.current + 1;
+      activeReviewRequestRef.current = requestId;
+      setReviewLoading(true);
+      try {
+        const params = new URLSearchParams({
+          company: selectedCompany,
+          from: toCompanyIso(range.from, timezoneName),
+          to: toCompanyIso(range.to, timezoneName),
+          status: "pending",
+          page: String(reviewPage),
+          page_size: String(DIAGNOSTIC_REVIEW_PAGE_SIZE),
+          sync: syncQueue ? "1" : "0",
+        });
+        if (selectedReviewBuckets.length > 0) {
+          params.set("suggested", selectedReviewBuckets.join(","));
+        }
+        if (selectedReviewReasons.length > 0) {
+          params.set("reason", selectedReviewReasons.join(","));
+        }
+        const response = await apiJson<ReconciliationReviewList>(`/admin/reconciliation/reviews?${params.toString()}`);
+        if (activeReviewRequestRef.current !== requestId) return;
+        setReviewQueue(response.items);
+        setReviewQueueTotal(response.total_items);
+        setReviewFilteredTotal(response.filtered_items);
+        setReviewPage(response.page);
+        setReviewTotalPages(response.total_pages);
+        setReviewCountsByAction(response.counts_by_action);
+        setReviewCountsByReason(response.counts_by_reason);
+        setSelectedReviewIds((current) => current.filter((id) => response.items.some((review) => review.id === id)));
+      } catch (nextError) {
+        if (activeReviewRequestRef.current === requestId) {
+          setError(nextError instanceof Error ? nextError.message : "No se pudo cargar la bandeja de decisiones");
+        }
+      } finally {
+        if (activeReviewRequestRef.current === requestId) {
+          setReviewLoading(false);
+        }
+      }
+    }, [range.from, range.to, reviewPage, selectedCompany, selectedReviewBuckets, selectedReviewReasons, timezoneName],
   );
 
   const loadAuditDetails = useCallback(async () => {
@@ -3142,19 +3131,21 @@ function AdminAuditModule({
 
   const refreshDiagnostic = useCallback(
     async (syncQueue = true) => {
-      await loadAudit({
-        windowMode: selectedWindowMode,
-        background: false,
-        syncQueue,
-        includeKm: true,
-        applyCurrent: true,
-      });
+      await Promise.all([
+        loadAudit({
+          windowMode: selectedWindowMode,
+          background: false,
+          includeKm: true,
+          applyCurrent: true,
+        }),
+        loadReviewPage({ syncQueue }),
+      ]);
       if (detailOpen) {
         setLoadedDetailKey(null);
         await loadAuditDetails();
       }
     },
-    [detailOpen, loadAudit, loadAuditDetails, selectedWindowMode],
+    [detailOpen, loadAudit, loadAuditDetails, loadReviewPage, selectedWindowMode],
   );
 
   useEffect(() => {
@@ -3183,7 +3174,6 @@ function AdminAuditModule({
       void loadAudit({
         windowMode: selectedWindowMode,
         background: Boolean(cachedAudit || cachedKm),
-        syncQueue: false,
         includeKm: shouldFetchKm,
         applyCurrent: true,
       });
@@ -3201,6 +3191,11 @@ function AdminAuditModule({
   ]);
 
   useEffect(() => {
+    if (!enabled) return;
+    void loadReviewPage();
+  }, [enabled, loadReviewPage, snapshotVersion]);
+
+  useEffect(() => {
     if (!enabled || !snapshotVersion) return;
     if (!auditBootstrappedRef.current) return;
     if (snapshotVersion === lastAuditSnapshotVersionRef.current) return;
@@ -3208,7 +3203,6 @@ function AdminAuditModule({
     void loadAudit({
       windowMode: selectedWindowMode,
       background: true,
-      syncQueue: false,
       includeKm: true,
       applyCurrent: true,
     });
@@ -3351,28 +3345,39 @@ function AdminAuditModule({
       <section className="metric-grid audit-kpi-grid">
         <MetricCard
           label="DMS recibidos"
-          value={activeWindowMetrics ? String(activeWindowMetrics.raw_events) : loading ? "..." : "0"}
-          detail={`${range.label} · proveedor aceptado para analitica`}
+          value={activeWindowMetrics ? String(activeWindowMetrics.received_dms) : loading ? "..." : "0"}
+          detail={`${range.label} · identificados en la fuente`}
         />
         <MetricCard
-          label="Visibles en cliente"
-          value={activeWindowMetrics ? String(activeWindowMetrics.visible_alerts) : loading ? "..." : "0"}
-          detail={`${activeWindowMetrics?.fused_in_episode ?? 0} detecciones extra quedaron fusionadas`}
+          label="DMS analiticos"
+          value={activeWindowMetrics ? String(activeWindowMetrics.analytic_dms) : loading ? "..." : "0"}
+          detail="Persistidos para reglas y agregados"
         />
         <MetricCard
-          label="Descartadas por regla"
-          value={activeWindowMetrics ? String(activeWindowMetrics.suppressed_by_rule) : loading ? "..." : "0"}
-          detail={`${activeWindowMetrics?.dismissed_alerts ?? 0} episodios no llegaron al cliente`}
+          label="Episodios visibles"
+          value={activeWindowMetrics ? String(activeWindowMetrics.visible_episodes) : loading ? "..." : "0"}
+          detail="Tarjetas que recibe el dashboard cliente"
         />
         <MetricCard
-          label="Pendientes manuales"
-          value={loading && reviewQueueTotal === 0 ? "..." : String(reviewQueueTotal)}
-          detail={`${pendingVisibilityCount} reglas · ${pendingAnomalyCount} anomalias · ${pendingRawCount} flujo DMS · ${pendingKmCount} km`}
+          label="Detecciones fusionadas"
+          value={activeWindowMetrics ? String(activeWindowMetrics.fused_detections) : loading ? "..." : "0"}
+          detail="Incluidas dentro de episodios visibles"
         />
         <MetricCard
-          label="Fuera del cliente"
-          value={activeWindowMetrics ? String(supportOnlyCount) : loading ? "..." : "0"}
-          detail={anomalyReasonLabels.length ? anomalyReasonLabels.join(" · ") : "No DMS, sin mapa o temporalidad"}
+          label="DMS retenidos"
+          value={activeWindowMetrics ? String(activeWindowMetrics.retained_for_review) : loading ? "..." : "0"}
+          detail={`${reviewQueueTotal} casos totales en bandeja, incluidos km`}
+        />
+        <MetricCard
+          label="Descartados por admin"
+          value={activeWindowMetrics ? String(activeWindowMetrics.discarded_by_admin) : loading ? "..." : "0"}
+          detail="Decisiones humanas registradas en la ventana"
+        />
+        <MetricCard
+          label="Diferencia inexplicada"
+          value={activeWindowMetrics ? String(activeWindowMetrics.unexplained_difference) : loading ? "..." : "0"}
+          detail="Debe permanecer en cero"
+          tone={(activeWindowMetrics?.unexplained_difference ?? 0) > 0 ? "danger" : "white"}
         />
       </section>
 
@@ -3392,7 +3397,10 @@ function AdminAuditModule({
           <button
             type="button"
             className={`chip chip-toggle ${selectedReviewBuckets.length === 0 ? "active" : ""}`}
-            onClick={() => setSelectedReviewBuckets([])}
+            onClick={() => {
+              setSelectedReviewBuckets([]);
+              setReviewPage(1);
+            }}
           >
             Todas {reviewQueueTotal}
           </button>
@@ -3401,13 +3409,14 @@ function AdminAuditModule({
               key={option.key}
               type="button"
               className={`chip chip-toggle ${selectedReviewBuckets.includes(option.key) ? "active" : ""}`}
-              onClick={() =>
+              onClick={() => {
+                setReviewPage(1);
                 setSelectedReviewBuckets((current) =>
                   current.includes(option.key)
                     ? current.filter((value) => value !== option.key)
                     : [...current, option.key],
-                )
-              }
+                );
+              }}
             >
               {option.label} {option.count}
             </button>
@@ -3417,7 +3426,10 @@ function AdminAuditModule({
           <button
             type="button"
             className={`chip chip-toggle ${selectedReviewReasons.length === 0 ? "active" : ""}`}
-            onClick={() => setSelectedReviewReasons([])}
+            onClick={() => {
+              setSelectedReviewReasons([]);
+              setReviewPage(1);
+            }}
           >
             Todos los motivos
           </button>
@@ -3426,20 +3438,21 @@ function AdminAuditModule({
               key={option.key}
               type="button"
               className={`chip chip-toggle ${selectedReviewReasons.includes(option.key) ? "active" : ""}`}
-              onClick={() =>
+              onClick={() => {
+                setReviewPage(1);
                 setSelectedReviewReasons((current) =>
                   current.includes(option.key)
                     ? current.filter((value) => value !== option.key)
                     : [...current, option.key],
-                )
-              }
+                );
+              }}
             >
               {option.label} {option.count}
             </button>
           ))}
         </div>
         <div className="panel-copy" style={{ marginBottom: "1rem" }}>
-          Filtro activo: {activeReviewFilterLabel}. Activa una categoria para aislar solo ese tipo de revision en el visor mensual.
+          Filtro activo: {activeReviewFilterLabel}. Toda la bandeja respeta {range.label.toLowerCase()}.
         </div>
         <div className="panel-copy" style={{ marginBottom: "1rem" }}>
           Si apruebas un caso, quedara listo para entrar en el siguiente corte o con refresh manual. Si lo descartas, saldra de la bandeja y seguira fuera del dashboard cliente.
@@ -3483,10 +3496,13 @@ function AdminAuditModule({
             Descartar seleccionados
           </button>
         </div>
-        {reviewQueueTotal > reviewQueue.length ? (
-          <p className="panel-copy">Mostrando los {reviewQueue.length} pendientes mas recientes de un total de {reviewQueueTotal} en esta ventana.</p>
+        {reviewFilteredTotal > reviewQueue.length ? (
+          <p className="panel-copy">
+            Mostrando {reviewQueue.length > 0 ? (reviewPage - 1) * DIAGNOSTIC_REVIEW_PAGE_SIZE + 1 : 0}–
+            {Math.min(reviewPage * DIAGNOSTIC_REVIEW_PAGE_SIZE, reviewFilteredTotal)} de {reviewFilteredTotal} casos que coinciden con el filtro.
+          </p>
         ) : null}
-        {loading && reviewQueueTotal === 0 ? (
+        {(loading || reviewLoading) && reviewQueueTotal === 0 ? (
           <div className="reconciliation-empty">
             <div className="reconciliation-empty-icon">
               <RefreshCw size={18} />
@@ -3606,6 +3622,27 @@ function AdminAuditModule({
             ))}
           </div>
         )}
+        {reviewTotalPages > 1 ? (
+          <div className="review-pagination" aria-label="Paginacion de decisiones">
+            <button
+              className="ghost-btn"
+              type="button"
+              onClick={() => setReviewPage((current) => Math.max(1, current - 1))}
+              disabled={reviewPage <= 1 || reviewLoading || actionLoading}
+            >
+              Anterior
+            </button>
+            <span className="chip">Pagina {reviewPage} de {reviewTotalPages}</span>
+            <button
+              className="ghost-btn"
+              type="button"
+              onClick={() => setReviewPage((current) => Math.min(reviewTotalPages, current + 1))}
+              disabled={reviewPage >= reviewTotalPages || reviewLoading || actionLoading}
+            >
+              Siguiente
+            </button>
+          </div>
+        ) : null}
       </section>
 
       <details

@@ -484,6 +484,14 @@ export interface MockDataPurgeResult {
 }
 
 export interface RecentAudit {
+  received_dms: number;
+  analytic_dms: number;
+  visible_episodes: number;
+  fused_detections: number;
+  retained_for_review: number;
+  discarded_by_admin: number;
+  reconciled_dms: number;
+  unexplained_difference: number;
   raw_events: number;
   grouped_episodes: number;
   visible_alerts: number;
@@ -611,6 +619,12 @@ export interface ReconciliationReviewItem {
 
 export interface ReconciliationReviewList {
   total_items: number;
+  filtered_items: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  has_next: boolean;
+  has_previous: boolean;
   counts_by_action: Record<string, number>;
   counts_by_reason: Record<string, number>;
   items: ReconciliationReviewItem[];
