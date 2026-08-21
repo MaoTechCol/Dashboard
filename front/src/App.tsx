@@ -43,6 +43,7 @@ import type {
   AuthMeResponse,
   BackgroundJobStatus,
   CompanySummary,
+  DashboardRules,
   DashboardSnapshot,
   FeedState,
   FleetCandidate,
@@ -3552,8 +3553,10 @@ function AdminAuditModule({
           </div>
         ) : (
           <div className="review-queue-grid">
-            {filteredReviewQueue.map((review) => (
-              <article key={review.id} className={`review-card ${selectedReviewIds.includes(review.id) ? "selected" : ""}`}>
+            {filteredReviewQueue.map((review) => {
+              const ruleCopy = describeReviewRule(review.reason, snapshot?.rules);
+              return (
+                <article key={review.id} className={`review-card ${selectedReviewIds.includes(review.id) ? "selected" : ""}`}>
                 <div className="review-card-top">
                   <div className="chip-row">
                     <label className="chip chip-toggle active" style={{ display: "inline-flex", alignItems: "center", gap: "0.45rem" }}>
@@ -3592,9 +3595,15 @@ function AdminAuditModule({
                   </div>
                 </div>
                 <div className="review-card-title">
-                  {review.raw_alarm_type ?? `tp ${review.raw_tp ?? "-"} / ec ${review.raw_event_code ?? "-"}`}
+                  {review.category
+                    ? formatCategory(review.category)
+                    : review.raw_alarm_type ?? `tp ${review.raw_tp ?? "-"} / ec ${review.raw_event_code ?? "-"}`}
                 </div>
-                <div className="review-card-copy">{formatAuditReason(review.reason)}</div>
+                <div className="review-rule-box">
+                  <div className="review-rule-label">Regla aplicada</div>
+                  <strong>{ruleCopy.title}</strong>
+                  <p>{ruleCopy.description}</p>
+                </div>
                 <div className="review-card-meta">
                   <div className="review-meta-row">
                     <span>Begin</span>
@@ -3624,8 +3633,9 @@ function AdminAuditModule({
                     Descartar
                   </button>
                 </div>
-              </article>
-            ))}
+                </article>
+              );
+            })}
           </div>
         )}
         {reviewTotalPages > 1 ? (
@@ -4081,6 +4091,7 @@ function formatAuditReason(value: string) {
     .replace("rejected temporal", "rechazada por temporalidad")
     .replace("fused in episode", "fusionada en episodio")
     .replace("visible episode", "abre episodio")
+    .replace("eyes closed daytime limit", "limite diurno de ojos cerrados")
     .replace("single eye closed", "ojo cerrado aislado")
     .replace("distraction below 3x", "distraccion bajo umbral 3x")
     .replace("merged yawn into fatigue", "bostezo fusionado a fatiga")
@@ -4089,6 +4100,82 @@ function formatAuditReason(value: string) {
     .replace("missing day km", "sin kilometraje diario confiable")
     .replace("day gt total", "km del dia mayor que el total")
     .replace("total regression", "regresion de odometro");
+}
+
+function describeReviewRule(reason: string, rules: DashboardRules | undefined) {
+  const eyeThreshold = rules?.eyes_closed_daytime_review_threshold ?? 5;
+  const eyeStart = formatRuleHour(rules?.eyes_closed_daytime_start_hour ?? 7);
+  const eyeEnd = formatRuleHour(rules?.eyes_closed_daytime_end_hour ?? 17);
+
+  switch (reason) {
+    case "eyes_closed_daytime_limit":
+      return {
+        title: "Limite diurno de ojos cerrados",
+        description: `Entre ${eyeStart} y ${eyeEnd}, se publican automaticamente las primeras ${eyeThreshold} detecciones por vehiculo y dia. Desde la deteccion ${eyeThreshold + 1}, cada caso requiere aprobacion humana.`,
+      };
+    case "distraction_below_3x_fleet_average":
+    case "distraction_below_3x":
+      return {
+        title: "Distraccion por debajo del umbral de flota",
+        description: "La distraccion solo se publica automaticamente cuando la frecuencia diaria de la placa supera 3 veces el promedio diario por vehiculo de la flota.",
+      };
+    case "single_eye_closed":
+      return {
+        title: "Deteccion aislada de ojos cerrados",
+        description: "El evento quedo aislado dentro de su ventana de agrupacion y requiere validacion humana antes de publicarse al cliente.",
+      };
+    case "future_timestamp":
+    case "future_rejected":
+    case "rejected_temporal":
+      return {
+        title: "Hora del evento fuera de tolerancia",
+        description: "La hora informada por Howen supera la tolerancia temporal frente a la recepcion. Debe validarse antes de afectar el dashboard.",
+      };
+    case "total_regression":
+      return {
+        title: "Regresion del odometro",
+        description: "El kilometraje total recibido es menor que el ultimo valor valido. Se requiere confirmar un reinicio o corregir la lectura antes de publicarla.",
+      };
+    case "missing_day_km":
+      return {
+        title: "Kilometraje diario sin evidencia suficiente",
+        description: "No existe una lectura diaria confiable para este vehiculo y fecha. El caso permanece fuera del total hasta ser aprobado o descartado.",
+      };
+    case "day_gt_total":
+      return {
+        title: "Kilometraje diario mayor que el odometro",
+        description: "La distancia del dia supera el kilometraje total informado, por lo que la lectura no puede publicarse sin revision.",
+      };
+    case "normalization_failed":
+      return {
+        title: "Dato sin formato valido",
+        description: "El payload del proveedor no pudo normalizarse de forma segura. Debe revisarse antes de incorporarlo a la analitica.",
+      };
+    case "unmapped":
+    case "dms_like_unmapped":
+    case "raw_pending_review":
+      return {
+        title: "Alarma DMS pendiente de clasificacion",
+        description: "El evento parece corresponder a DMS, pero su tipo o codigo no tiene un mapeo concluyente y necesita una decision humana.",
+      };
+    case "missing_local":
+      return {
+        title: "Evento del proveedor no encontrado localmente",
+        description: "Howen reporta el evento, pero no existe una coincidencia local concluyente. Debe aprobarse para recuperarlo o descartarse como inconsistencia del proveedor.",
+      };
+    default:
+      return {
+        title: formatAuditReason(reason),
+        description: "Este caso no cumplio automaticamente una validacion del dashboard y necesita una decision humana antes de publicarse al cliente.",
+      };
+  }
+}
+
+function formatRuleHour(hour: number) {
+  const normalized = ((hour % 24) + 24) % 24;
+  const suffix = normalized >= 12 ? "PM" : "AM";
+  const displayHour = normalized % 12 || 12;
+  return `${displayHour}:00 ${suffix}`;
 }
 
 function formatReviewSource(value: string) {
