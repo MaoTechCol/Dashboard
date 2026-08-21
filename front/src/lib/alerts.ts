@@ -43,13 +43,13 @@ interface TimelineAlertEntry {
 
 const DISPLAY_LABELS: Record<string, string> = {
   "Uso de celular": "Uso de celular",
-  "Fatiga en progresion": "Fatiga en progresion",
+  "Fatiga en progresion": "Fatiga en progresión",
   "Ojos cerrados": "Ojos cerrados",
-  "Riesgo de colision": "Riesgo de colision",
+  "Riesgo de colision": "Riesgo de colisión",
   Bostezo: "Bostezo",
-  "Camara cubierta": "Camara cubierta",
+  "Camara cubierta": "Cámara cubierta",
   Fumando: "Fumando",
-  Distraccion: "Distraccion",
+  Distraccion: "Distracción",
 };
 
 const WEIGHTS: Record<string, number> = {
@@ -125,7 +125,10 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
   const openGroups = new Map<string, { plate: string; category: string; events: Array<(RecentEvent & { occurredAtDayjs: dayjs.Dayjs })> }>();
 
   for (const event of rawEvents) {
-    const key = `${event.plate}|${event.category}`;
+    const episodeCategory = event.episodeTitle ?? event.category;
+    const key = event.episodeGuid
+      ? `episode|${event.episodeGuid}`
+      : `${event.plate}|${event.category}`;
     const current = openGroups.get(key);
     const gapMinutes = current
       ? event.occurredAtDayjs.diff(current.events[current.events.length - 1].occurredAtDayjs, "minute", true)
@@ -137,12 +140,12 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
           ? rules.yawn_window_minutes
           : rules.streak_window_minutes;
 
-    if (current && gapMinutes !== null && gapMinutes <= windowMinutes) {
+    if (current && (event.episodeGuid || (gapMinutes !== null && gapMinutes <= windowMinutes))) {
       current.events.push(event);
       continue;
     }
 
-    const nextGroup = { plate: event.plate, category: event.category, events: [event] };
+    const nextGroup = { plate: event.plate, category: episodeCategory, events: [event] };
     openGroups.set(key, nextGroup);
     grouped.push(nextGroup);
   }
@@ -173,8 +176,18 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
     let label = "Medio";
     let note: string | undefined;
 
-    if (group.category === "Ojos cerrados") {
+    if (group.category === "Fatiga en progresion") {
+      const yawns = group.events.filter((event) => event.category === "Bostezo");
+      const eyes = group.events.filter((event) => event.category === "Ojos cerrados");
+      category = "Fatiga en progresion";
+      confidence = BASE_CONFIDENCE["Fatiga en progresion"];
+      level = "critico";
+      label = "Crítico · fatiga en progresión";
+      title = `${yawns.length} bostezos y ${eyes.length} ojos cerrados`;
+      detail = `${first.occurredAtDayjs.format("HH:mm")} -> ${last.occurredAtDayjs.format("HH:mm")}.`;
+    } else if (group.category === "Ojos cerrados") {
       const matchingYawn = grouped.find((candidate) => {
+        if (group.events.some((event) => event.episodeGuid)) return false;
         if (candidate.plate !== group.plate || candidate.category !== "Bostezo") return false;
         const tail = candidate.events[candidate.events.length - 1];
         return (
@@ -186,37 +199,34 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
         category = "Fatiga en progresion";
         confidence = BASE_CONFIDENCE["Fatiga en progresion"];
         level = "critico";
-        label = "Critico · fatiga en progresion";
+        label = "Crítico · fatiga en progresión";
         title = `${matchingYawn.events.length} bostezos y ${group.events.length} ojos cerrados`;
         detail = `Bostezos ${matchingYawn.events[0].occurredAtDayjs.format("HH:mm")} -> ${matchingYawn.events[matchingYawn.events.length - 1].occurredAtDayjs.format("HH:mm")}, luego ojos cerrados ${first.occurredAtDayjs.format("HH:mm")} -> ${last.occurredAtDayjs.format("HH:mm")}.`;
         consumed.add(`${matchingYawn.plate}|${matchingYawn.category}|${matchingYawn.events[0]?.guid}`);
       } else if (group.events.length >= rules.eyes_closed_critical_threshold) {
         level = "critico";
         confidence = 0.9;
-        label = "Critico · racha confirmada";
+        label = "Crítico · racha confirmada";
         title = `${group.events.length} eventos de ojos cerrados`;
         detail = `${first.occurredAtDayjs.format("HH:mm")} -> ${last.occurredAtDayjs.format("HH:mm")}.`;
-      } else if (group.events.length === 2) {
+      } else {
         level = "alto";
         label = "Alto · por verificar";
-        title = "2 eventos de ojos cerrados";
+        title = "1 evento de ojos cerrados";
         detail = `${first.occurredAtDayjs.format("HH:mm")} -> ${last.occurredAtDayjs.format("HH:mm")}.`;
-      } else {
-        dismissed += 1;
-        continue;
       }
       if (sameDayCount > 12) {
         note = "Puede ser por uso de gafas oscuras. Conviene revisar configuracion o calibracion del sensor.";
       }
     } else if (group.category === "Uso de celular") {
       level = "critico";
-      label = "Critico · deteccion confiable";
-      title = "Manipulacion de celular al conducir";
+      label = "Crítico · detección confiable";
+      title = "Manipulación de celular al conducir";
       detail = `${last.occurredAtDayjs.format("HH:mm")}. Un solo evento ya abre alerta.`;
     } else if (group.category === "Riesgo de colision") {
       if (group.events.length >= rules.collision_pattern_threshold) {
         level = "alto";
-        label = "Alto · conduccion";
+        label = "Alto · conducción";
       }
       title = `${group.events.length} riesgos de colision`;
       detail = `${first.occurredAtDayjs.format("HH:mm")} -> ${last.occurredAtDayjs.format("HH:mm")}.`;
@@ -228,34 +238,23 @@ export function buildTimeline(snapshot: DashboardSnapshot, filter: TimelineFilte
       title = `${group.events.length} bostezos`;
       detail = `${first.occurredAtDayjs.format("HH:mm")} -> ${last.occurredAtDayjs.format("HH:mm")}.`;
     } else if (group.category === "Distraccion") {
-      if (vehicleDeviation < 3) {
-        dismissed += 1;
-        continue;
-      }
       title = `${group.events.length} distracciones`;
       detail = `${first.occurredAtDayjs.format("HH:mm")} -> ${last.occurredAtDayjs.format("HH:mm")}.`;
     } else if (group.category === "Camara cubierta") {
-      const activeDays = new Set(
-        rawEvents
-          .filter((event) => event.plate === group.plate && event.category === group.category)
-          .map((event) => event.occurredAtDayjs.format("YYYY-MM-DD")),
-      );
-      if (activeDays.size >= 2) {
+      if (last.ruleLevel === "alto") {
         level = "alto";
         label = "Alto · recurrencia";
       }
-      title = "Camara cubierta";
+      title = "Cámara cubierta";
       detail = `${last.occurredAtDayjs.format("HH:mm")}.`;
     } else {
       title = formatCategory(group.category);
       detail = `${last.occurredAtDayjs.format("HH:mm")}.`;
     }
 
-    if (sameDayCount > rules.anti_noise_daily_cap) {
-      level = "medio";
-      label = "Medio · posible falla de calibracion";
-      title = `${formatCategory(group.category)} fuera de patron`;
-      detail = `${sameDayCount} eventos del mismo tipo en el dia para ${group.plate}.`;
+    const backendLevel = group.events.find((event) => event.ruleLevel)?.ruleLevel;
+    if (backendLevel) {
+      level = backendLevel;
     }
 
     const streakFactor = group.events.length >= 4 ? 1.8 : group.events.length >= 2 ? 1.4 : 1;

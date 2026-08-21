@@ -106,6 +106,9 @@ export interface DashboardRules {
   eyes_closed_critical_threshold: number;
   collision_pattern_threshold: number;
   yawn_fatigue_threshold: number;
+  eyes_closed_daytime_review_threshold: number;
+  eyes_closed_daytime_start_hour: number;
+  eyes_closed_daytime_end_hour: number;
   fatigue_merge_window_minutes: number;
   echo_window_seconds: number;
   anti_noise_daily_cap: number;
@@ -184,6 +187,10 @@ export interface RecentEvent {
   latitude: number | null;
   longitude: number | null;
   totalMileageKm: number | null;
+  episodeGuid?: string | null;
+  episodeTitle?: string | null;
+  ruleLevel?: "critico" | "alto" | "medio" | null;
+  ruleReason?: string | null;
 }
 
 export interface ReportFile {

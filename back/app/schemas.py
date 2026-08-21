@@ -10,9 +10,12 @@ class DashboardRules(BaseModel):
     streak_window_minutes: int = 15
     collision_window_minutes: int = 30
     yawn_window_minutes: int = 60
-    eyes_closed_critical_threshold: int = 3
+    eyes_closed_critical_threshold: int = 2
     collision_pattern_threshold: int = 3
-    yawn_fatigue_threshold: int = 5
+    yawn_fatigue_threshold: int = 4
+    eyes_closed_daytime_review_threshold: int = 5
+    eyes_closed_daytime_start_hour: int = 7
+    eyes_closed_daytime_end_hour: int = 17
     fatigue_merge_window_minutes: int = 60
     echo_window_seconds: int = 60
     anti_noise_daily_cap: int = 20

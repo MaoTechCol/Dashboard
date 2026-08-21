@@ -110,6 +110,14 @@ const CATEGORY_COLORS: Record<string, string> = {
   Fumando: "#a855f7",
   Distraccion: "#10b981",
 };
+const N2_MONTH_CATEGORIES = [
+  "Ojos cerrados",
+  "Bostezo",
+  "Riesgo de colision",
+  "Distraccion",
+  "Uso de celular",
+  "Fumando",
+] as const;
 
 const GRID_COLOR = "rgba(138, 144, 168, 0.18)";
 const TICK_COLOR = "#8a90a8";
@@ -923,7 +931,7 @@ function WeekTab({ snapshot }: { snapshot: DashboardSnapshot }) {
   const trendEntries = Object.entries(snapshot.dms.semana.linea_veh);
   const categoryData = {
     labels,
-    datasets: snapshot.dms.cat_order.map((category) => ({
+    datasets: N2_MONTH_CATEGORIES.map((category) => ({
       label: formatCategory(category),
       data: snapshot.dms.semana.cat_veh[category] ?? [],
       backgroundColor: CATEGORY_COLORS[category] ?? "#10b981",
@@ -1012,24 +1020,26 @@ function MonthTab({ snapshot }: { snapshot: DashboardSnapshot }) {
     ],
   };
   const distribution = {
-    labels: snapshot.dms.dist_tipo.slice(0, 8).map((row) => row.tipo),
+    labels: N2_MONTH_CATEGORIES.map(formatCategory),
     datasets: [
       {
         label: "Eventos",
-        data: snapshot.dms.dist_tipo.slice(0, 8).map((row) => row.n),
-        backgroundColor: snapshot.dms.dist_tipo.slice(0, 8).map((row) => CATEGORY_COLORS[row.cat] ?? "#10b981"),
+        data: N2_MONTH_CATEGORIES.map((category) =>
+          (snapshot.dms.serie_cat[category] ?? []).reduce((sum, value) => sum + value, 0),
+        ),
+        backgroundColor: N2_MONTH_CATEGORIES.map((category) => CATEGORY_COLORS[category]),
       },
     ],
   };
   const composition = {
-    labels: snapshot.dms.cat_order.map(formatCategory),
+    labels: N2_MONTH_CATEGORIES.map(formatCategory),
     datasets: [
       {
-        label: "Composicion por categoria",
-        data: snapshot.dms.cat_order.map((category) =>
+        label: "Composición por categoría",
+        data: N2_MONTH_CATEGORIES.map((category) =>
           (snapshot.dms.serie_cat[category] ?? []).reduce((sum, value) => sum + value, 0),
         ),
-        backgroundColor: snapshot.dms.cat_order.map((category) => CATEGORY_COLORS[category] ?? "#10b981"),
+        backgroundColor: N2_MONTH_CATEGORIES.map((category) => CATEGORY_COLORS[category]),
       },
     ],
   };
@@ -1061,19 +1071,19 @@ function MonthTab({ snapshot }: { snapshot: DashboardSnapshot }) {
         <MetricCard label="Alarmas nocturnas" value={`${snapshot.dms.kpis.nocturno_pct}%`} />
       </div>
 
-      <ChartPanel title="Evolucion diaria de alarmas por categoria">
+      <ChartPanel title="Evolución diaria de alarmas por categoría">
         <Bar data={categorySeries} options={STACKED_BAR_OPTIONS} />
       </ChartPanel>
 
-      <ChartPanel title="Km recorridos por dia (flota)">
+      <ChartPanel title="Km recorridos por día (flota)">
         <Line data={kmSeries} options={LINE_OPTIONS} />
       </ChartPanel>
 
       <div className="double-panel">
-        <ChartPanel title="Distribucion por tipo de alarma">
+        <ChartPanel title="Distribución por categoría DMS">
           <Bar data={distribution} options={HORIZONTAL_BAR_OPTIONS} />
         </ChartPanel>
-        <ChartPanel title="Composicion por categoria">
+        <ChartPanel title="Composición por categoría">
           <Doughnut data={composition} options={DOUGHNUT_OPTIONS} />
         </ChartPanel>
       </div>
@@ -1187,16 +1197,16 @@ function PatternsTab({ snapshot }: { snapshot: DashboardSnapshot }) {
       </ChartPanel>
 
       <div className="patterns-heading">
-        <h3>Huella de conducta por vehiculo</h3>
-        <p className="panel-copy">La mezcla de categorias dice que hacer mejor que el total.</p>
+        <h3>Huella de conducta por vehículo</h3>
+        <p className="panel-copy">La mezcla de categorías orienta acciones específicas por vehículo.</p>
       </div>
 
       <div className="triple-panel">
         <ProfileInsightCard
           accent="#ef4444"
-          action="Accion: revisar jornada, turno y descansos."
-          summary={`${fatigueVehicleCount} vehiculos`}
-          subtitle="Mas del 70% de sus alarmas son ojos cerrados o bostezo."
+          action="Acción sugerida: revisar jornada, turno y descansos."
+          summary={`${fatigueVehicleCount} vehículos`}
+          subtitle="Vehículos donde más del 70% de las alertas corresponde a ojos cerrados o bostezo."
           title="Perfil fatiga"
           rows={fatigueProfiles.map((entry) => ({
             label: entry.row.placa,
@@ -1207,9 +1217,9 @@ function PatternsTab({ snapshot }: { snapshot: DashboardSnapshot }) {
         />
         <ProfileInsightCard
           accent="#ec4899"
-          action="Accion: es conducta, no sensor. Campana de flota."
+          action="Acción sugerida: revisar o descargar en Howen los videos de uso de celular de estas placas y definir una intervención de conducta."
           summary={`${cellphoneVehicleCount} de ${snapshot.meta.vehicleCount}`}
-          subtitle="Vehiculos con al menos un uso de celular en 30 dias. No es asunto de unos pocos."
+          subtitle="Vehículos con más alertas de uso de celular y promedio de alertas por cada 100 km."
           title="Perfil celular"
           rows={cellphoneProfiles.map((row) => {
             const cellphoneCount = row.cats["Uso de celular"] ?? 0;
@@ -1223,9 +1233,9 @@ function PatternsTab({ snapshot }: { snapshot: DashboardSnapshot }) {
         />
         <ProfileInsightCard
           accent="#818cf8"
-          action="Accion: contrastar con la programacion de turnos."
-          summary={`${snapshot.dms.kpis.nocturno_pct}% flota`}
-          subtitle="Media de alarmas nocturnas, pero muy desigual entre vehiculos."
+          action="Acción sugerida: contrastar las placas con mayor actividad nocturna frente a la programación de turnos."
+          summary={`${snapshot.dms.kpis.nocturno_pct}% de las alertas`}
+          subtitle="Porcentaje de alertas nocturnas del total y vehículos con más alertas durante la noche."
           title="Perfil nocturno"
           rows={nightProfiles.map((row) => ({
             label: row.placa,
@@ -2228,7 +2238,7 @@ function AdminOperationsModule({
           }
           detail={
             overview?.backgroundJobs
-              ? `${overview.backgroundJobs.running} ejecutando · ${overview.backgroundJobs.queued} en espera · ${overview.backgroundJobs.failed} fallidos${overview.backgroundJobs.stale_running ? ` · ${overview.backgroundJobs.stale_running} sin heartbeat` : ""}`
+              ? `${overview.backgroundJobs.running} ejecutando · ${overview.backgroundJobs.queued} en espera · ${overview.backgroundJobs.failed} fallidos históricos${overview.backgroundJobs.stale_running ? ` · ${overview.backgroundJobs.stale_running} sin heartbeat` : ""}`
               : "Jobs persistidos con lease y reintentos"
           }
         />

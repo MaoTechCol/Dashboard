@@ -435,7 +435,31 @@ class DashboardService:
             legacy_daily_km=canonical_legacy_daily_km,
         )
         _merge_current_day_from_device_state(company_devices, daily_km_by_vehicle, fleet_km_by_date, latest_day, tz)
-        recent_events = [_serialize_event(event, tz) for event in company_events if event.occurred_at >= recent_cutoff]
+        episode_analysis = _build_recent_episode_analysis(
+            company_events,
+            company,
+            tz,
+            daily_km_by_vehicle,
+            review_status_by_guid=review_status_by_guid,
+            fleet_vehicle_count=len(company_devices),
+        )
+        event_visibility = episode_analysis["guid_status"]
+        self._persist_suppressed_rule_reviews(
+            company=company,
+            events=company_events,
+            guid_status=event_visibility,
+        )
+        company_events = [
+            event
+            for event in company_events
+            if event_visibility.get(event.guid, {}).get("visibility_status")
+            in {"visible_episode", "fused_in_episode"}
+        ]
+        recent_events = [
+            _serialize_event(event, tz, event_visibility.get(event.guid))
+            for event in company_events
+            if event.occurred_at >= recent_cutoff
+        ]
         last_dms_event_at = company_events[-1].occurred_at.isoformat() if company_events else None
         current_day_km_provisional = round(fleet_km_by_date.get(latest_day, 0.0), 1)
         km_total_closed_window = round(sum(fleet_km_by_date.get(day_key, 0.0) for day_key in closed_days), 1)
@@ -1493,6 +1517,7 @@ class DashboardService:
         review_status_by_guid: dict[str, str],
         tz: ZoneInfo,
         daily_km_by_vehicle: dict[str, dict[date, float]] | None = None,
+        fleet_vehicle_count: int | None = None,
     ) -> dict[str, Any]:
         visible_alarms = [event for event in alarms if event.classification_status == "classified_dms"]
         effective_daily_km_by_vehicle = daily_km_by_vehicle
@@ -1504,6 +1529,7 @@ class DashboardService:
             tz,
             effective_daily_km_by_vehicle,
             review_status_by_guid=review_status_by_guid,
+            fleet_vehicle_count=fleet_vehicle_count,
         )
         metrics = dict(analysis["metrics"])
         metrics["raw_events"] = sum(
@@ -1774,6 +1800,9 @@ class DashboardService:
 
         with self.session_factory() as session:
             review_status_by_guid = _load_review_status_map(session, company_slug)
+            fleet_vehicle_count = session.scalar(
+                select(func.count(DeviceRecord.device_id)).where(DeviceRecord.company_slug == company_slug)
+            ) or 0
             alarm_membership = _membership_clause(AlarmEvent)
             raw_membership = _membership_clause(HowenAlarmRaw)
             snapshot_membership = _membership_clause(DailyMileageSnapshot)
@@ -1878,6 +1907,7 @@ class DashboardService:
             review_status_by_guid=review_status_by_guid,
             tz=tz,
             daily_km_by_vehicle=daily_km_by_vehicle,
+            fleet_vehicle_count=fleet_vehicle_count,
         )
         recent_metrics = self._build_admin_recent_metrics(
             company=company,
@@ -1887,6 +1917,7 @@ class DashboardService:
             review_status_by_guid=review_status_by_guid,
             tz=tz,
             daily_km_by_vehicle=daily_km_by_vehicle,
+            fleet_vehicle_count=fleet_vehicle_count,
         )
         recent_7d_metrics = self._build_admin_recent_metrics(
             company=company,
@@ -1896,6 +1927,7 @@ class DashboardService:
             review_status_by_guid=review_status_by_guid,
             tz=tz,
             daily_km_by_vehicle=daily_km_by_vehicle,
+            fleet_vehicle_count=fleet_vehicle_count,
         )
 
         payload = AdminAuditView(
@@ -2316,6 +2348,9 @@ class DashboardService:
         baseline_start = ensure_utc(end_at).astimezone(tz).date() - timedelta(days=30)
         with self.session_factory() as session:
             review_status_by_guid = _load_review_status_map(session, company.slug)
+            fleet_vehicle_count = session.scalar(
+                select(func.count(DeviceRecord.device_id)).where(DeviceRecord.company_slug == company.slug)
+            ) or 0
             events = [
                 event
                 for event in session.scalars(
@@ -2353,28 +2388,68 @@ class DashboardService:
                 tz,
                 daily_km_by_vehicle,
                 review_status_by_guid=review_status_by_guid,
+                fleet_vehicle_count=fleet_vehicle_count,
             )
             guid_status = episode_analysis["guid_status"]
-            for event in events:
-                status = guid_status.get(event.guid)
-                if not status or status.get("visibility_status") != "suppressed_by_rule":
-                    continue
-                review_key = f"suppressed:{event.guid}"
-                review = session.scalar(
-                    select(ReconciliationReview).where(ReconciliationReview.review_key == review_key)
+
+        self._persist_suppressed_rule_reviews(
+            company=company,
+            events=events,
+            guid_status=guid_status,
+        )
+
+    def _persist_suppressed_rule_reviews(
+        self,
+        *,
+        company: CompanyConfig,
+        events: list[AlarmEvent],
+        guid_status: dict[str, dict[str, Any]],
+    ) -> None:
+        suppressed = [
+            (event, guid_status[event.guid])
+            for event in events
+            if guid_status.get(event.guid, {}).get("visibility_status") == "suppressed_by_rule"
+        ]
+        review_keys = [f"suppressed:{event.guid}" for event, _status in suppressed]
+        analyzed_guids = {event.guid for event in events}
+        with self.session_factory() as session:
+            existing = {
+                review.review_key: review
+                for review in (
+                    session.scalars(
+                        select(ReconciliationReview).where(ReconciliationReview.review_key.in_(review_keys))
+                    )
+                    if review_keys
+                    else []
                 )
+            }
+            pending_rule_reviews = list(
+                session.scalars(
+                    select(ReconciliationReview).where(
+                        ReconciliationReview.company_slug == company.slug,
+                        ReconciliationReview.review_status == "pending",
+                        ReconciliationReview.suggested_action == "review_visibility",
+                    )
+                )
+            )
+            active_review_keys = set(review_keys)
+            for review in pending_rule_reviews:
+                if review.guid in analyzed_guids and review.review_key not in active_review_keys:
+                    review.review_status = "resolved"
+                    review.decision_note = "La regla vigente ya no retiene este evento."
+                    review.applied_at = utc_now()
+                    session.add(review)
+            for event, status in suppressed:
+                review_key = f"suppressed:{event.guid}"
+                review = existing.get(review_key)
                 if not review:
                     review = ReconciliationReview(
                         review_key=review_key,
                         company_slug=company.slug,
                         review_status="pending",
                     )
-                elif review.review_status == "resolved":
-                    review.review_status = "pending"
-                    review.decision_note = None
-                    review.decided_by = None
-                    review.decided_at = None
-                    review.applied_at = None
+                elif review.review_status in {"approved", "discarded"}:
+                    continue
                 review.guid = event.guid
                 review.device_id = event.device_id
                 review.plate_no = event.plate_no
@@ -2390,7 +2465,7 @@ class DashboardService:
                 review.subtype = event.subtype
                 review.reason = status.get("reason") or "suppressed_by_rule"
                 review.diagnostic_note = (
-                    "La alerta existe en la base operativa, pero hoy las reglas del dashboard cliente la estan suprimiendo. Administracion puede aprobarla para forzar su visibilidad o descartarla."
+                    "La alerta existe en la base operativa, pero una regla N2 requiere decision humana antes de publicarla."
                 )
                 review.suggested_action = "review_visibility"
                 review.source_job_id = None
@@ -3304,6 +3379,9 @@ class DashboardService:
         baseline_start = ensure_utc(range_end).astimezone(tz).date() - timedelta(days=30)
         with self.session_factory() as session:
             review_status_by_guid = _load_review_status_map(session, company.slug)
+            fleet_vehicle_count = session.scalar(
+                select(func.count(DeviceRecord.device_id)).where(DeviceRecord.company_slug == company.slug)
+            ) or 0
             local_raw_alarms = [
                 row
                 for row in session.scalars(
@@ -3368,6 +3446,7 @@ class DashboardService:
             tz,
             daily_km_by_vehicle,
             review_status_by_guid=review_status_by_guid,
+            fleet_vehicle_count=fleet_vehicle_count,
         )
         guid_status = episode_analysis["guid_status"]
         normalized_portal_rows: list[tuple[dict[str, Any], Any, str]] = []
@@ -4287,6 +4366,7 @@ def _build_recent_episode_analysis(
     tz: ZoneInfo,
     daily_km_by_vehicle: dict[str, dict[date, float]],
     review_status_by_guid: dict[str, str] | None = None,
+    fleet_vehicle_count: int | None = None,
 ) -> dict[str, Any]:
     if not events:
         return {
@@ -4314,10 +4394,58 @@ def _build_recent_episode_analysis(
     )
     event_local_dt = {event.guid: event.occurred_at.astimezone(tz) for event in raw_events}
     event_local_date = {guid: value.date() for guid, value in event_local_dt.items()}
+    guid_status: dict[str, dict[str, Any]] = {}
+
+    # N2: only the first five daytime eye-closed detections per vehicle/day flow
+    # automatically. Later detections remain auditable and require a human decision.
+    daytime_eye_counts: Counter[tuple[str, date]] = Counter()
+    rule_events: list[AlarmEvent] = []
+    suppressed_eye_events = 0
+    for event in raw_events:
+        local_dt = event_local_dt[event.guid]
+        plate = event.plate_no or event.device_id
+        if (
+            event.category == "Ojos cerrados"
+            and company.rules.eyes_closed_daytime_start_hour
+            <= local_dt.hour
+            < company.rules.eyes_closed_daytime_end_hour
+        ):
+            eye_key = (plate, local_dt.date())
+            daytime_eye_counts[eye_key] += 1
+            if (
+                daytime_eye_counts[eye_key] > company.rules.eyes_closed_daytime_review_threshold
+                and event.guid not in approved_guids
+            ):
+                suppressed_eye_events += 1
+                guid_status[event.guid] = {
+                    "visibility_status": "suppressed_by_rule",
+                    "reason": "eyes_closed_daytime_limit",
+                    "episode_guid": None,
+                    "episode_title": None,
+                }
+                continue
+        rule_events.append(event)
+
     grouped: list[dict[str, Any]] = []
     open_groups: dict[str, dict[str, Any]] = {}
-    for event in raw_events:
-        key = f"{event.plate_no or event.device_id}|{event.category}"
+    for event in rule_events:
+        local_dt = event_local_dt[event.guid]
+        plate = event.plate_no or event.device_id
+        if event.category == "Fumando":
+            is_night_shift = _is_night(
+                local_dt.hour,
+                company.rules.night_window_start,
+                company.rules.night_window_end,
+            )
+            shift_day = (
+                local_dt.date() - timedelta(days=1)
+                if is_night_shift and local_dt.hour < company.rules.night_window_end
+                else local_dt.date()
+            )
+            shift_key = f"{'night' if is_night_shift else 'day'}:{shift_day.isoformat()}"
+            key = f"{plate}|{event.category}|{shift_key}"
+        else:
+            key = f"{plate}|{event.category}"
         current = open_groups.get(key)
         event_dt = event_local_dt[event.guid]
         gap_minutes = (
@@ -4331,122 +4459,160 @@ def _build_recent_episode_analysis(
             else company.rules.streak_window_minutes
         )
 
-        if current and gap_minutes is not None and gap_minutes <= window_minutes:
+        if current and (
+            event.category == "Fumando"
+            or (gap_minutes is not None and gap_minutes <= window_minutes)
+        ):
             current["events"].append(event)
             continue
 
         next_group = {
-            "plate": event.plate_no or event.device_id,
+            "plate": plate,
             "category": event.category,
             "events": [event],
-            "group_id": (event.plate_no or event.device_id, event.category, event.guid),
+            "group_id": (plate, event.category, event.guid),
         }
         open_groups[key] = next_group
         grouped.append(next_group)
 
     visible = 0
-    dismissed = 0
-    suppressed_raw = 0
+    dismissed = suppressed_eye_events
+    suppressed_raw = suppressed_eye_events
     visible_raw = 0
-    consumed: set[tuple[str, str, str]] = set()
-    guid_status: dict[str, dict[str, Any]] = {}
     episodes: list[dict[str, Any]] = []
     company_events_by_vehicle_day = defaultdict(Counter)
     same_day_category_counts: Counter[tuple[str, str, date]] = Counter()
-    for event in raw_events:
+    for event in rule_events:
         plate = event.plate_no or event.device_id
         day_key = event_local_date[event.guid]
         company_events_by_vehicle_day[plate][day_key] += 1
         same_day_category_counts[(plate, event.category, day_key)] += 1
-    baselines = _build_baselines(
-        baseline_dates=_date_window(utc_now().astimezone(tz).date() - timedelta(days=1), 30),
-        daily_km_by_vehicle=daily_km_by_vehicle,
-        events_by_vehicle_day=company_events_by_vehicle_day,
+    effective_fleet_size = max(
+        fleet_vehicle_count or 0,
+        len({event.plate_no or event.device_id for event in rule_events}),
+        len(daily_km_by_vehicle),
+        1,
     )
-    today = utc_now().astimezone(tz).date()
-    today_counts = Counter((event.plate_no or event.device_id) for event in raw_events if event_local_date[event.guid] == today)
-    prior_yawn_groups_by_plate: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    distraction_totals_by_day = Counter(
+        event_local_date[event.guid]
+        for event in rule_events
+        if event.category == "Distraccion"
+    )
+    camera_days_by_plate: dict[str, set[date]] = defaultdict(set)
+    for event in rule_events:
+        if event.category == "Camara cubierta":
+            camera_days_by_plate[event.plate_no or event.device_id].add(event_local_date[event.guid])
+
+    # Reserve the most recent yawning episode before an eye-closed episode so the
+    # client receives one fatigue episode instead of two duplicated cards.
+    yawn_group_for_eye: dict[tuple[str, str, str], dict[str, Any]] = {}
+    reserved_yawn_groups: set[tuple[str, str, str]] = set()
+    yawn_groups_by_plate: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for group in grouped:
+        if group["category"] == "Bostezo":
+            yawn_groups_by_plate[group["plate"]].append(group)
+            continue
+        if group["category"] != "Ojos cerrados":
+            continue
+        first_eye_dt = event_local_dt[group["events"][0].guid]
+        for candidate in reversed(yawn_groups_by_plate.get(group["plate"], [])):
+            if candidate["group_id"] in reserved_yawn_groups:
+                continue
+            candidate_last_dt = event_local_dt[candidate["events"][-1].guid]
+            if candidate_last_dt >= first_eye_dt:
+                continue
+            if (
+                first_eye_dt - candidate_last_dt
+            ).total_seconds() / 60 <= company.rules.fatigue_merge_window_minutes:
+                yawn_group_for_eye[group["group_id"]] = candidate
+                reserved_yawn_groups.add(candidate["group_id"])
+                break
 
     for group in grouped:
         first = group["events"][0]
         last = group["events"][-1]
         plate = group["plate"]
         group_key = group["group_id"]
-        if group_key in consumed:
-            if group["category"] == "Bostezo":
-                prior_yawn_groups_by_plate[plate].append(group)
+        if group_key in reserved_yawn_groups:
             continue
 
         last_local_dt = event_local_dt[last.guid]
         first_local_dt = event_local_dt[first.guid]
         same_day_count = same_day_category_counts[(plate, group["category"], event_local_date[last.guid])]
-        baseline = baselines.get(plate, 0.0)
-        deviation = round((today_counts.get(plate, 0) / baseline), 2) if baseline else float(today_counts.get(plate, 0) or 1.0)
         current_category = group["category"]
         reason = "visible"
         merged_groups = [group]
         episode_title = current_category
+        episode_level = "medio"
 
         if group["category"] == "Ojos cerrados":
-            matching_yawn = None
-            for candidate in reversed(prior_yawn_groups_by_plate.get(plate, [])):
-                if candidate["group_id"] in consumed:
-                    continue
-                candidate_last_dt = event_local_dt[candidate["events"][-1].guid]
-                if candidate_last_dt >= first_local_dt:
-                    continue
-                if (first_local_dt - candidate_last_dt).total_seconds() / 60 <= company.rules.fatigue_merge_window_minutes:
-                    matching_yawn = candidate
-                    break
+            matching_yawn = yawn_group_for_eye.get(group_key)
             if matching_yawn:
-                consumed.add(matching_yawn["group_id"])
                 merged_groups.append(matching_yawn)
                 current_category = "Fatiga en progresion"
                 reason = "merged_yawn_into_fatigue"
                 episode_title = "Fatiga en progresion"
-            elif len(group["events"]) >= company.rules.eyes_closed_critical_threshold or len(group["events"]) == 2:
-                episode_title = "Ojos cerrados"
-            elif any(event.guid in approved_guids for event in group["events"]):
-                episode_title = "Ojos cerrados"
-                reason = "manual_approved"
+                episode_level = "critico"
             else:
-                dismissed += 1
-                suppressed_raw += len(group["events"])
-                for event in group["events"]:
-                    guid_status[event.guid] = {
-                        "visibility_status": "suppressed_by_rule",
-                        "reason": "single_eye_closed",
-                        "episode_guid": None,
-                        "episode_title": None,
-                    }
-                continue
+                episode_title = "Ojos cerrados"
+                episode_level = (
+                    "critico"
+                    if len(group["events"]) >= company.rules.eyes_closed_critical_threshold
+                    else "alto"
+                )
+                if any(event.guid in approved_guids for event in group["events"]):
+                    reason = "manual_approved"
         elif group["category"] == "Distraccion":
             episode_title = "Distraccion"
             if any(event.guid in approved_guids for event in group["events"]):
                 reason = "manual_approved"
-            elif deviation < 3:
-                dismissed += 1
-                suppressed_raw += len(group["events"])
-                for event in group["events"]:
-                    guid_status[event.guid] = {
-                        "visibility_status": "suppressed_by_rule",
-                        "reason": "distraction_below_3x",
-                        "episode_guid": None,
-                        "episode_title": None,
-                    }
-                continue
+            else:
+                day_total = distraction_totals_by_day[event_local_date[last.guid]]
+                fleet_average = day_total / effective_fleet_size
+                above_fleet_threshold = same_day_count > fleet_average * 3
+                if above_fleet_threshold:
+                    reason = "distraction_above_3x_fleet_average"
+                else:
+                    dismissed += 1
+                    suppressed_raw += len(group["events"])
+                    for event in group["events"]:
+                        guid_status[event.guid] = {
+                            "visibility_status": "suppressed_by_rule",
+                            "reason": "distraction_below_3x_fleet_average",
+                            "episode_guid": None,
+                            "episode_title": None,
+                        }
+                    continue
         elif group["category"] == "Uso de celular":
             episode_title = "Uso de celular"
+            episode_level = "critico"
         elif group["category"] == "Riesgo de colision":
             episode_title = "Riesgo de colision"
+            episode_level = (
+                "alto"
+                if len(group["events"]) >= company.rules.collision_pattern_threshold
+                else "medio"
+            )
         elif group["category"] == "Bostezo":
             episode_title = "Bostezo"
+            episode_level = (
+                "alto"
+                if len(group["events"]) >= company.rules.yawn_fatigue_threshold
+                else "medio"
+            )
         elif group["category"] == "Camara cubierta":
             episode_title = "Camara cubierta"
-
-        if same_day_count > company.rules.anti_noise_daily_cap:
-            reason = "anti_noise_daily_cap"
-            episode_title = f"{group['category']} fuera de patron"
+            event_day = event_local_date[last.guid]
+            episode_level = (
+                "alto"
+                if event_day - timedelta(days=1) in camera_days_by_plate.get(plate, set())
+                else "medio"
+            )
+            if episode_level == "alto":
+                reason = "camera_covered_consecutive_days"
+        elif group["category"] == "Fumando":
+            episode_title = "Fumando"
+            reason = "smoking_grouped_by_shift"
 
         merged_events = sorted(
             [event for merged_group in merged_groups for event in merged_group["events"]],
@@ -4460,6 +4626,11 @@ def _build_recent_episode_analysis(
                 "episode_guid": episode_guid,
                 "episode_title": episode_title,
                 "category": current_category,
+                "level": episode_level,
+                "reason": reason,
+                "plate": plate,
+                "started_at": first_local_dt.isoformat(),
+                "ended_at": last_local_dt.isoformat(),
                 "guid_count": len(merged_events),
                 "raw_guids": [event.guid for event in merged_events],
             }
@@ -4470,9 +4641,8 @@ def _build_recent_episode_analysis(
                 "reason": reason if index == 0 else "fused_in_episode",
                 "episode_guid": episode_guid,
                 "episode_title": episode_title,
+                "episode_level": episode_level,
             }
-        if group["category"] == "Bostezo":
-            prior_yawn_groups_by_plate[plate].append(group)
 
     return {
         "metrics": {
@@ -4492,8 +4662,12 @@ def _build_recent_episode_analysis(
     }
 
 
-def _serialize_event(event: AlarmEvent, tz: ZoneInfo) -> dict[str, Any]:
-    return {
+def _serialize_event(
+    event: AlarmEvent,
+    tz: ZoneInfo,
+    rule_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
         "guid": event.guid,
         "deviceId": event.device_id,
         "plate": event.plate_no or event.device_id,
@@ -4505,6 +4679,16 @@ def _serialize_event(event: AlarmEvent, tz: ZoneInfo) -> dict[str, Any]:
         "longitude": event.longitude,
         "totalMileageKm": event.total_mileage_km,
     }
+    if rule_status:
+        payload.update(
+            {
+                "episodeGuid": rule_status.get("episode_guid"),
+                "episodeTitle": rule_status.get("episode_title"),
+                "ruleLevel": rule_status.get("episode_level"),
+                "ruleReason": rule_status.get("reason"),
+            }
+        )
+    return payload
 
 
 def _build_publication_state(*, company: CompanyConfig, settings: Any) -> dict[str, Any]:
