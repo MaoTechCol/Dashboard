@@ -97,7 +97,7 @@ export function useDashboardStream(companySlug: string | null) {
       const delay = nextAlignedRefreshDelay(DASHBOARD_REFRESH_MS);
       setNextRefreshAt(Date.now() + delay);
       refreshTimer = window.setTimeout(async () => {
-        await runLoad(false, true);
+        await runLoad(false, false);
         scheduleNextRefresh();
       }, delay);
     };
