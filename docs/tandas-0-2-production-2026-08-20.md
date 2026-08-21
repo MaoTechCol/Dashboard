@@ -32,6 +32,37 @@
 - API and worker use systemd readiness notifications, watchdogs, restart throttling,
   memory limits and the existing 2 GB swap file.
 
+## Production verification (2026-08-20/21 UTC)
+
+- Automated tests: `36 passed` after the ingestion and publication query changes.
+- Live API and worker remained active with zero restarts during real Howen cuts.
+- `/api/healthz`: HTTP 200 in approximately 2 ms.
+- `/api/readyz`: HTTP 200 in approximately 52-57 ms, including the bounded
+  Supabase readiness query.
+- Authenticated reads while a cut was running:
+  - `/api/auth/me`: 200 in 0.27 s.
+  - `/api/dashboard?company=ismocol`: 200 in 0.22 s.
+  - `/api/feed?company=ismocol`: 200 in 0.23 s.
+  - `/api/admin/overview`: 200 in 2.90 s.
+- Worker memory stayed below 110 MB during a real 45-device ISMOCOL cut, with no
+  swap usage. Before the fix, publication and identity propagation reached roughly
+  700 MB plus swap.
+- Snapshot publication no longer loads the global `mileage_readings` table. The
+  production database had 409,990 readings; publication now aggregates the
+  company/device/day values in PostgreSQL and materializes roughly 177 daily rows
+  for ISMOCOL.
+- Snapshot benchmark: approximately 13.4 s and 120 MB peak RSS, with no swap. Alarm
+  metrics matched the previous implementation exactly. The small provisional km
+  movement observed between runs came from newer validated device status, not from
+  a change in historical aggregation.
+- A real ISMOCOL cut completed 45/45 devices and published successfully while the
+  API remained available. Subsequent due cuts were kept as durable jobs and claimed
+  by priority.
+
+The monthly diagnostic audit remains a known expensive interactive query. It is not
+executed by the worker and does not block health, authentication or snapshot reads,
+but its reduction through daily aggregates belongs to the later performance tanda.
+
 ## Production acceptance commands
 
 ```bash
@@ -42,7 +73,24 @@ systemctl show dashboard-api.service dashboard-worker.service \
   -p ActiveState -p SubState -p WatchdogUSec -p MemoryCurrent -p MemoryPeak
 ```
 
-The current Droplet has 2 GB RAM. The software safeguards are complete, but the
-recommended production capacity remains 4 GB RAM before onboarding more fleets.
-That resize is an infrastructure control-panel action and does not alter application
-data or code.
+The current Droplet has 2 GB RAM. The Tanda 2 software safeguards are complete:
+separate processes, swap, cgroup limits, watchdogs, bounded readiness and durable
+jobs. The recommended production capacity remains 4 GB RAM before onboarding more
+fleets. That resize is an infrastructure control-panel action and does not alter
+application data or code.
+
+## Recovery and rollback
+
+- Baseline tag: `v1-pre-batch`.
+- API/worker baseline tag: `v1-api-worker-20260820.1`.
+- Tandas 0-2 release marker: `v1-tanda-0-2`.
+- Restore source: the off-host and Droplet copies of `20260820T171446Z`.
+- Immediate application rollback: deploy the desired tag and restart
+  `dashboard-api.service` and `dashboard-worker.service`.
+- Data rollback: restore the Supabase custom-format dump and the uploads/config
+  archive from the same timestamp so code and data stay aligned.
+
+The custom-format dump integrity and its 577-entry restore catalog were verified.
+A destructive full restore was intentionally not run against the production
+database; final disaster-recovery certification still requires restoring it into an
+isolated PostgreSQL target.
