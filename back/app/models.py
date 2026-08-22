@@ -407,7 +407,7 @@ class CompanyHistoricalRebuildJob(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     company_slug: Mapped[str] = mapped_column(String(64), index=True)
-    purpose: Mapped[str] = mapped_column(String(32), index=True, default="activation_bootstrap")
+    purpose: Mapped[str] = mapped_column(String(64), index=True, default="activation_bootstrap")
     status: Mapped[str] = mapped_column(String(32), index=True, default="queued")
     start_date: Mapped[date] = mapped_column(Date, index=True)
     end_date: Mapped[date] = mapped_column(Date, index=True)
