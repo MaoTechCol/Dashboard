@@ -43,7 +43,9 @@ def _settings(**overrides):
         "howen_request_spacing_seconds": 0,
         "howen_request_spacing_max_seconds": 0,
         "howen_request_recovery_successes": 20,
+        "backfill_rate_limit_max_retries": 2,
         "backfill_rate_limit_cooldown_seconds": 0,
+        "backfill_rate_limit_max_cooldown_seconds": 0,
         "default_timezone": "America/Bogota",
     }
     values.update(overrides)
@@ -118,6 +120,28 @@ class HowenEvidenceBulkTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([row["alarmGuid"] for row in rows], ["a", "b"])
         self.assertEqual(client._post_form.await_count, 2)
+
+    async def test_retries_the_current_page_without_losing_previous_pages(self) -> None:
+        client = HowenClient(settings=_settings(), registry=_Registry())
+        client._post_form = AsyncMock(
+            side_effect=[
+                {"status": 10000, "data": {"list": [{"alarmGuid": "a"}, {"alarmGuid": "b"}]}},
+                {"status": 10014, "msg": "Requests too frequent, please try again later"},
+                {"status": 10000, "data": {"list": [{"alarmGuid": "c"}]}},
+                {"status": 10000, "data": {"list": []}},
+            ]
+        )
+
+        rows = await client.fetch_evidence_alarms(
+            "token",
+            device_ids=["1"],
+            start_at=datetime(2026, 8, 21, 10, 0),
+            end_at=datetime(2026, 8, 21, 10, 30),
+        )
+
+        self.assertEqual([row["alarmGuid"] for row in rows], ["a", "b", "c"])
+        calls = client._post_form.await_args_list
+        self.assertEqual([call.args[1]["pageNum"] for call in calls], ["1", "2", "2", "3"])
 
     def test_normalizes_alarm_clip_fields_without_losing_portal_identity(self) -> None:
         client = HowenClient(settings=_settings(), registry=_Registry())

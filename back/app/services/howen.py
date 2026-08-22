@@ -613,6 +613,15 @@ class HowenClient:
         page_size = max(int(getattr(self.settings, "howen_evidence_page_size", 100)), 1)
         max_pages = max(int(getattr(self.settings, "howen_evidence_max_pages_per_batch", 1000)), 1)
         max_devices = max(int(getattr(self.settings, "howen_evidence_max_devices_per_request", 50)), 1)
+        max_page_retries = max(int(getattr(self.settings, "backfill_rate_limit_max_retries", 4)), 0)
+        retry_cooldown = max(
+            float(getattr(self.settings, "backfill_rate_limit_cooldown_seconds", 20)),
+            0.0,
+        )
+        max_retry_cooldown = max(
+            float(getattr(self.settings, "backfill_rate_limit_max_cooldown_seconds", 180)),
+            retry_cooldown,
+        )
         rows: list[dict[str, Any]] = []
 
         for offset in range(0, len(normalized_ids), max_devices):
@@ -634,15 +643,28 @@ class HowenClient:
                     "pageNum": str(page_num),
                     "pageCount": str(page_size),
                 }
-                payload = await self._post_form(url, body, token=token, timeout=45.0)
-                if payload.get("status") != 10000:
-                    if self.is_no_data_error(payload.get("msg") or ""):
+                page_retry = 0
+                while True:
+                    payload = await self._post_form(url, body, token=token, timeout=45.0)
+                    message = payload.get("msg") or ""
+                    if payload.get("status") == 10000 or not self.is_rate_limited(message):
                         break
-                    if self.is_rate_limited(payload.get("msg") or ""):
+                    if page_retry >= max_page_retries:
                         raise HowenRateLimitError(
-                            payload.get("msg") or "Requests too frequent, please try again later"
+                            message or "Requests too frequent, please try again later"
                         )
-                    raise RuntimeError(payload.get("msg") or "Unable to fetch Howen alarm evidences")
+                    cooldown = min(retry_cooldown * (2**page_retry), max_retry_cooldown)
+                    if cooldown > 0:
+                        await asyncio.sleep(cooldown)
+                    page_retry += 1
+                if payload.get("status") != 10000:
+                    if self.is_no_data_error(message):
+                        break
+                    if self.is_rate_limited(message):
+                        raise HowenRateLimitError(
+                            message or "Requests too frequent, please try again later"
+                        )
+                    raise RuntimeError(message or "Unable to fetch Howen alarm evidences")
 
                 page_rows = _extract_rows(payload)
                 if not page_rows:
