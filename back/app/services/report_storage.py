@@ -104,7 +104,13 @@ class ReportStorage:
             headers=headers,
             timeout=15.0,
         )
-        if response.status_code == 404:
+        missing_bucket = response.status_code == 404
+        if response.status_code == 400:
+            try:
+                missing_bucket = response.json().get("code") == "NoSuchBucket"
+            except ValueError:
+                missing_bucket = False
+        if missing_bucket:
             response = httpx.post(
                 f"{base}/storage/v1/bucket",
                 headers={**headers, "Content-Type": "application/json"},
