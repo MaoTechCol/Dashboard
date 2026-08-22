@@ -435,6 +435,24 @@ class JobQueue:
                 ).limit(1)
             ) is not None
 
+    def cancel_company_jobs_for_purge(
+        self,
+        *,
+        company_slug: str,
+        purge_job_id: str,
+    ) -> int:
+        """Cancel work enqueued while a company purge was already running."""
+        now = utc_now()
+        with self.session_factory() as session:
+            cancelled = self._cancel_for_company_purge(
+                session,
+                company_slug=company_slug,
+                purge_job_id=purge_job_id,
+                now=now,
+            )
+            session.commit()
+        return cancelled
+
     def has_active_jobs(self, *, job_types: set[str]) -> bool:
         if not job_types:
             return False
@@ -656,7 +674,7 @@ class JobQueue:
         company_slug: str,
         purge_job_id: str,
         now: datetime,
-    ) -> None:
+    ) -> int:
         rows = list(
             session.scalars(
                 select(BackgroundJob).where(
@@ -690,6 +708,7 @@ class JobQueue:
             row.lease_owner = None
             row.lease_expires_at = None
             session.add(row)
+        return len(rows)
 
     @staticmethod
     def _requeue_failed_job(

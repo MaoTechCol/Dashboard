@@ -233,6 +233,45 @@ def test_company_purge_waits_for_healthy_writer_and_blocks_new_harvest() -> None
     assert claimed_purge.id == purge["job_id"]
 
 
+def test_company_purge_cancels_work_enqueued_after_it_was_claimed() -> None:
+    queue, session_factory = _queue()
+    purge = queue.enqueue(
+        job_type="company_purge",
+        payload={"company_slug": "purge-demo"},
+        priority=80,
+        idempotency_key="purge:purge-demo:late-work",
+        company_slug="purge-demo",
+    )
+    claimed_purge = queue.claim(worker_id="purger", job_types={"company_purge"})
+    assert claimed_purge is not None
+
+    late_rebuild = queue.enqueue(
+        job_type="historical_rebuild",
+        payload={"company_slug": "purge-demo"},
+        priority=10,
+        idempotency_key="rebuild:purge-demo:late-work",
+        company_slug="purge-demo",
+    )
+
+    cancelled = queue.cancel_company_jobs_for_purge(
+        company_slug="purge-demo",
+        purge_job_id=purge["job_id"],
+    )
+
+    assert cancelled == 1
+    with session_factory() as session:
+        purge_row = session.get(BackgroundJob, purge["job_id"])
+        late_row = session.get(BackgroundJob, late_rebuild["job_id"])
+        assert purge_row is not None
+        assert purge_row.status == "running"
+        assert late_row is not None
+        assert late_row.status == "succeeded"
+        assert json.loads(late_row.result_json or "{}") == {
+            "status": "cancelled_by_company_purge",
+            "purge_job_id": purge["job_id"],
+        }
+
+
 def test_summary_distinguishes_healthy_and_stale_workers() -> None:
     queue, session_factory = _queue()
     created = queue.enqueue(

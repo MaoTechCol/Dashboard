@@ -315,7 +315,11 @@ class DashboardWorker:
                 job.attempts,
             )
             try:
-                result = await self._execute(job.job_type, self.queue.payload(job))
+                result = await self._execute(
+                    job.job_type,
+                    self.queue.payload(job),
+                    job_id=job.id,
+                )
             except asyncio.CancelledError:
                 raise
             except RetryJob as exc:
@@ -369,7 +373,13 @@ class DashboardWorker:
             if not owned:
                 return
 
-    async def _execute(self, job_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _execute(
+        self,
+        job_type: str,
+        payload: dict[str, Any],
+        *,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
         self.context.registry.reload()
         if job_type == "harvest_cut":
             cut_at = _parse_datetime(payload.get("cut_at"))
@@ -446,6 +456,13 @@ class DashboardWorker:
                 result = await self.context.ingestion.purge_company_operational_data(company_slug=company_slug)
                 self.context.auth.delete_company_users(company_slug=company_slug)
                 self.context.registry.delete_company(slug=company_slug)
+                if not job_id:
+                    raise RuntimeError("company_purge requiere un job_id durable")
+                result["late_background_jobs_cancelled"] = await asyncio.to_thread(
+                    self.queue.cancel_company_jobs_for_purge,
+                    company_slug=company_slug,
+                    purge_job_id=job_id,
+                )
                 self.context.ingestion.finish_company_lifecycle_audit(
                     audit_id=int(backup["audit_id"]),
                     status="completed",
