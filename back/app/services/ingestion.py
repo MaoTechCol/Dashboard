@@ -1873,10 +1873,17 @@ class IngestionService:
                     running_harvests = session.scalar(
                         select(func.count())
                         .select_from(AlarmHarvestRun)
-                        .where(AlarmHarvestRun.status == "running")
+                        .where(
+                            AlarmHarvestRun.company_slug == company_slug,
+                            AlarmHarvestRun.status == "running",
+                        )
                     ) or 0
-                if running_harvests <= 0 or monotonic() >= drain_deadline:
+                if running_harvests <= 0:
                     break
+                if monotonic() >= drain_deadline:
+                    raise RuntimeError(
+                        f"No se puede purgar {company_slug}: todavia tiene un corte en ejecucion"
+                    )
                 await asyncio.sleep(1.0)
 
             with self.session_factory() as session:

@@ -176,6 +176,16 @@ class DashboardWorker:
         due_cuts = await asyncio.to_thread(self.context.ingestion.due_harvest_cuts)
         queued_count = 0
         for company_slug, cut_at in due_cuts:
+            if await asyncio.to_thread(
+                self.queue.company_purge_pending,
+                company_slug=company_slug,
+            ):
+                logger.info(
+                    "worker_harvest_skipped_company_purge company=%s cut_at=%s",
+                    company_slug,
+                    cut_at.isoformat(),
+                )
+                continue
             cut_iso = cut_at.isoformat()
             result = await asyncio.to_thread(
                 self.queue.enqueue_latest_harvest,

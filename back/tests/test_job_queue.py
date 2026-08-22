@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -161,6 +162,75 @@ def test_expired_lease_is_recovered_by_another_worker() -> None:
     assert recovered.id == created["job_id"]
     assert recovered.lease_owner == "worker-b"
     assert recovered.attempts == 2
+
+
+def test_company_purge_cancels_queued_company_jobs_before_claim() -> None:
+    queue, session_factory = _queue()
+    rebuild = queue.enqueue(
+        job_type="historical_rebuild",
+        payload={},
+        priority=10,
+        idempotency_key="rebuild:purge-demo:1",
+        company_slug="purge-demo",
+    )
+    purge = queue.enqueue(
+        job_type="company_purge",
+        payload={"company_slug": "purge-demo"},
+        priority=80,
+        idempotency_key="purge:purge-demo:1",
+        company_slug="purge-demo",
+    )
+
+    claimed = queue.claim(worker_id="maintenance", job_types={"historical_rebuild", "company_purge"})
+
+    assert claimed is not None
+    assert claimed.id == purge["job_id"]
+    with session_factory() as session:
+        cancelled = session.get(BackgroundJob, rebuild["job_id"])
+        assert cancelled is not None
+        assert cancelled.status == "succeeded"
+        assert json.loads(cancelled.result_json or "{}")["status"] == "cancelled_by_company_purge"
+
+
+def test_company_purge_waits_for_healthy_writer_and_blocks_new_harvest() -> None:
+    queue, session_factory = _queue()
+    rebuild = queue.enqueue(
+        job_type="historical_rebuild",
+        payload={},
+        priority=10,
+        idempotency_key="rebuild:purge-demo:running",
+        company_slug="purge-demo",
+    )
+    running = queue.claim(worker_id="maintenance", job_types={"historical_rebuild"})
+    assert running is not None
+
+    purge = queue.enqueue(
+        job_type="company_purge",
+        payload={"company_slug": "purge-demo"},
+        priority=80,
+        idempotency_key="purge:purge-demo:running",
+        company_slug="purge-demo",
+    )
+    queue.enqueue_latest_harvest(
+        company_slug="purge-demo",
+        cut_at=utc_now(),
+        payload={"company_slug": "purge-demo", "cut_at": utc_now().isoformat()},
+    )
+
+    assert queue.claim(worker_id="harvest", job_types={"harvest_cut"}) is None
+    assert queue.claim(worker_id="purger", job_types={"company_purge"}) is None
+
+    queue.complete(job_id=rebuild["job_id"], worker_id="maintenance", result={"status": "succeeded"})
+    with session_factory() as session:
+        purge_row = session.get(BackgroundJob, purge["job_id"])
+        assert purge_row is not None
+        purge_row.next_attempt_at = utc_now() - timedelta(seconds=1)
+        session.add(purge_row)
+        session.commit()
+
+    claimed_purge = queue.claim(worker_id="purger", job_types={"company_purge"})
+    assert claimed_purge is not None
+    assert claimed_purge.id == purge["job_id"]
 
 
 def test_summary_distinguishes_healthy_and_stale_workers() -> None:

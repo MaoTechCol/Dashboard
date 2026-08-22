@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from app.core.time import ensure_utc, utc_now
 from app.models import BackgroundJob
@@ -337,12 +338,22 @@ class JobQueue:
         now = utc_now()
         lease_expires_at = now + timedelta(seconds=max(int(self.settings.worker_lease_seconds), 30))
         with self.session_factory() as session:
+            purge_job = aliased(BackgroundJob)
+            companies_being_purged = select(purge_job.company_slug).where(
+                purge_job.job_type == "company_purge",
+                purge_job.status.in_(("queued", "running")),
+                purge_job.company_slug.is_not(None),
+            )
             if defer_while_job_types_active:
                 blocking_job = session.scalar(
                     select(BackgroundJob.id)
                     .where(
                         BackgroundJob.job_type.in_(defer_while_job_types_active),
                         BackgroundJob.status.in_(("queued", "running")),
+                        or_(
+                            BackgroundJob.company_slug.is_(None),
+                            BackgroundJob.company_slug.not_in(companies_being_purged),
+                        ),
                     )
                     .limit(1)
                 )
@@ -362,6 +373,11 @@ class JobQueue:
                         BackgroundJob.lease_expires_at < now,
                     ),
                 ),
+                or_(
+                    BackgroundJob.job_type == "company_purge",
+                    BackgroundJob.company_slug.is_(None),
+                    BackgroundJob.company_slug.not_in(companies_being_purged),
+                ),
             )
             if job_types:
                 query = query.where(BackgroundJob.job_type.in_(job_types))
@@ -373,6 +389,27 @@ class JobQueue:
             )
             if not job:
                 return None
+            if job.job_type == "company_purge" and job.company_slug:
+                healthy_writer = session.scalar(
+                    select(BackgroundJob.id).where(
+                        BackgroundJob.id != job.id,
+                        BackgroundJob.company_slug == job.company_slug,
+                        BackgroundJob.status == "running",
+                        BackgroundJob.lease_expires_at.is_not(None),
+                        BackgroundJob.lease_expires_at >= now,
+                    ).limit(1)
+                )
+                if healthy_writer is not None:
+                    job.next_attempt_at = now + timedelta(seconds=2)
+                    session.add(job)
+                    session.commit()
+                    return None
+                self._cancel_for_company_purge(
+                    session,
+                    company_slug=job.company_slug,
+                    purge_job_id=job.id,
+                    now=now,
+                )
             job.status = "running"
             job.lease_owner = worker_id
             job.lease_expires_at = lease_expires_at
@@ -387,6 +424,16 @@ class JobQueue:
             session.refresh(job)
             session.expunge(job)
             return job
+
+    def company_purge_pending(self, *, company_slug: str) -> bool:
+        with self.session_factory() as session:
+            return session.scalar(
+                select(BackgroundJob.id).where(
+                    BackgroundJob.company_slug == company_slug,
+                    BackgroundJob.job_type == "company_purge",
+                    BackgroundJob.status.in_(("queued", "running")),
+                ).limit(1)
+            ) is not None
 
     def has_active_jobs(self, *, job_types: set[str]) -> bool:
         if not job_types:
@@ -593,6 +640,48 @@ class JobQueue:
             row.status = "succeeded"
             row.result_json = json.dumps(
                 {"status": "superseded", "superseded_by": superseded_by},
+                ensure_ascii=True,
+            )
+            row.last_error = None
+            row.finished_at = now
+            row.heartbeat_at = now
+            row.lease_owner = None
+            row.lease_expires_at = None
+            session.add(row)
+
+    @staticmethod
+    def _cancel_for_company_purge(
+        session: Any,
+        *,
+        company_slug: str,
+        purge_job_id: str,
+        now: datetime,
+    ) -> None:
+        rows = list(
+            session.scalars(
+                select(BackgroundJob).where(
+                    BackgroundJob.id != purge_job_id,
+                    BackgroundJob.company_slug == company_slug,
+                    or_(
+                        BackgroundJob.status == "queued",
+                        and_(
+                            BackgroundJob.status == "running",
+                            or_(
+                                BackgroundJob.lease_expires_at.is_(None),
+                                BackgroundJob.lease_expires_at < now,
+                            ),
+                        ),
+                    ),
+                )
+            )
+        )
+        for row in rows:
+            row.status = "succeeded"
+            row.result_json = json.dumps(
+                {
+                    "status": "cancelled_by_company_purge",
+                    "purge_job_id": purge_job_id,
+                },
                 ensure_ascii=True,
             )
             row.last_error = None
