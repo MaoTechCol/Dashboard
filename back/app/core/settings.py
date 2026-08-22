@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     howen_request_recovery_successes: int = 20
     howen_alarm_source: str = "evidence_bulk"
     howen_evidence_page_size: int = 500
+    howen_evidence_max_pages_per_batch: int = 1000
     howen_evidence_max_devices_per_request: int = 200
     howen_evidence_fallback_to_device_api: bool = False
     harvest_cut_interval_minutes: int = 15

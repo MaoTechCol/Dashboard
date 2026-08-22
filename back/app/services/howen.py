@@ -611,6 +611,7 @@ class HowenClient:
 
         url = f"{self.settings.howen_http_base.rstrip('/')}/record/findEvidences.action"
         page_size = max(int(getattr(self.settings, "howen_evidence_page_size", 100)), 1)
+        max_pages = max(int(getattr(self.settings, "howen_evidence_max_pages_per_batch", 1000)), 1)
         max_devices = max(int(getattr(self.settings, "howen_evidence_max_devices_per_request", 50)), 1)
         rows: list[dict[str, Any]] = []
 
@@ -618,7 +619,7 @@ class HowenClient:
             device_batch = normalized_ids[offset : offset + max_devices]
             page_num = 1
             previous_fingerprint: tuple[str, ...] | None = None
-            while True:
+            while page_num <= max_pages:
                 body = {
                     "token": token,
                     "scheme": "http",
@@ -654,9 +655,12 @@ class HowenClient:
                     break
                 rows.extend(page_rows)
                 previous_fingerprint = fingerprint
-                if len(page_rows) < page_size:
-                    break
                 page_num += 1
+            else:
+                raise RuntimeError(
+                    "Howen evidence pagination exceeded "
+                    f"{max_pages} pages for devices {device_batch[0]}..{device_batch[-1]}"
+                )
 
         return rows
 

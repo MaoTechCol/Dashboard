@@ -38,6 +38,7 @@ def _settings(**overrides):
         "howen_http_base": "https://provider.example/vss",
         "howen_username": "account",
         "howen_evidence_page_size": 2,
+        "howen_evidence_max_pages_per_batch": 100,
         "howen_evidence_max_devices_per_request": 2,
         "howen_request_spacing_seconds": 0,
         "howen_request_spacing_max_seconds": 0,
@@ -56,7 +57,9 @@ class HowenEvidenceBulkTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[
                 {"status": 10000, "data": {"list": [{"alarmGuid": "a"}, {"alarmGuid": "b"}]}},
                 {"status": 10000, "data": {"list": [{"alarmGuid": "c"}]}},
+                {"status": 10000, "data": {"list": []}},
                 {"status": 10000, "data": {"list": [{"alarmGuid": "d"}]}},
+                {"status": 10000, "data": {"list": []}},
             ]
         )
 
@@ -72,7 +75,34 @@ class HowenEvidenceBulkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0].args[1]["conditionName"], "1,2")
         self.assertEqual(calls[0].args[1]["pageNum"], "1")
         self.assertEqual(calls[1].args[1]["pageNum"], "2")
-        self.assertEqual(calls[2].args[1]["conditionName"], "3")
+        self.assertEqual(calls[2].args[1]["pageNum"], "3")
+        self.assertEqual(calls[3].args[1]["conditionName"], "3")
+        self.assertEqual(calls[4].args[1]["pageNum"], "2")
+
+    async def test_continues_when_provider_caps_pages_below_requested_size(self) -> None:
+        client = HowenClient(
+            settings=_settings(howen_evidence_page_size=500),
+            registry=_Registry(),
+        )
+        first_page = [{"alarmGuid": f"event-{index}"} for index in range(100)]
+        client._post_form = AsyncMock(
+            side_effect=[
+                {"status": 10000, "data": {"list": first_page}},
+                {"status": 10000, "data": {"list": [{"alarmGuid": "event-100"}]}},
+                {"status": 10000, "data": {"list": []}},
+            ]
+        )
+
+        rows = await client.fetch_evidence_alarms(
+            "token",
+            device_ids=["1"],
+            start_at=datetime(2026, 8, 21, 10, 0),
+            end_at=datetime(2026, 8, 21, 10, 30),
+        )
+
+        self.assertEqual(len(rows), 101)
+        self.assertEqual(rows[-1]["alarmGuid"], "event-100")
+        self.assertEqual(client._post_form.await_count, 3)
 
     async def test_stops_if_provider_repeats_the_same_page(self) -> None:
         client = HowenClient(settings=_settings(), registry=_Registry())
