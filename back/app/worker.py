@@ -214,6 +214,7 @@ class DashboardWorker:
             if (
                 not self.context.registry.is_operational(company)
                 or company.slug not in published_companies
+                or self.queue.company_purge_pending(company_slug=company.slug)
             ):
                 continue
             local_today = datetime.now(ZoneInfo(company.timezone)).date()
