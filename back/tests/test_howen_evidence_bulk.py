@@ -247,6 +247,50 @@ class EvidencePartitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["device_ids"], ["1"])
         self.assertEqual([row["alarmGuid"] for row in grouped["1"]], ["a", "c"])
 
+    async def test_backfill_splits_wide_ranges_into_daily_provider_windows(self) -> None:
+        service = self._service()
+        service.settings = _settings(
+            howen_evidence_max_range_days=1,
+            backfill_rate_limit_max_retries=0,
+            backfill_rate_limit_cooldown_seconds=0,
+            backfill_rate_limit_max_cooldown_seconds=0,
+        )
+        service.howen.is_rate_limited = lambda exc: False
+        service._fetch_evidence_harvest_rows = AsyncMock(
+            side_effect=[
+                {"1": [{"alarmGuid": "day-1", "deviceID": "1"}]},
+                {"1": [{"alarmGuid": "day-2", "deviceID": "1"}]},
+                {"1": [{"alarmGuid": "day-3", "deviceID": "1"}]},
+            ]
+        )
+
+        start_at = datetime(2026, 7, 24, 0, 0, tzinfo=ZoneInfo("UTC"))
+        end_at = datetime(2026, 7, 26, 23, 59, 59, tzinfo=ZoneInfo("UTC"))
+        grouped = await service._fetch_evidence_backfill_rows(
+            device_ids=["1"],
+            start_at=start_at,
+            end_at=end_at,
+            source="harvest",
+            company_slug="alpha",
+            defer_on_rate_limit=False,
+        )
+
+        self.assertEqual(
+            [row["alarmGuid"] for row in grouped["1"]],
+            ["day-1", "day-2", "day-3"],
+        )
+        calls = service._fetch_evidence_harvest_rows.await_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0].kwargs["start_at"], start_at)
+        self.assertEqual(
+            calls[0].kwargs["end_at"],
+            datetime(2026, 7, 24, 23, 59, 59, tzinfo=ZoneInfo("UTC")),
+        )
+        self.assertEqual(
+            calls[-1].kwargs["end_at"],
+            end_at,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

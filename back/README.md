@@ -10,6 +10,8 @@ Las reconstrucciones iniciales de empresas usan escritura masiva sin cambiar los
 - `HISTORICAL_BATCH_MODE=off` vuelve inmediatamente al pipeline individual anterior.
 - `HISTORICAL_BATCH_MODE=all_historical` queda reservado para una ampliacion posterior.
 - `HISTORICAL_BATCH_SIZE=500` controla el tamano de cada transaccion.
+- `HISTORICAL_REBUILD_CHUNK_DAYS=1` permite progreso y reanudacion por dia.
+- `HOWEN_EVIDENCE_MAX_RANGE_DAYS=1` evita que Howen trunque silenciosamente rangos amplios de clips.
 - `HOWEN_ALARM_SOURCE=evidence_bulk` usa la misma consulta agrupada de Alarm Clips para los cortes de 15 minutos.
 - `HOWEN_ALARM_SOURCE=official_device` restaura inmediatamente la consulta historica por vehiculo.
 

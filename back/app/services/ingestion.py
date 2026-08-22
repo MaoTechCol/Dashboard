@@ -2444,54 +2444,72 @@ class IngestionService:
         company_slug: str | None,
         defer_on_rate_limit: bool,
     ) -> dict[str, list[dict[str, Any]]]:
-        """Fetch the authoritative Alarm Clips rows once for a historical company window."""
+        """Fetch complete Alarm Clips history without relying on wide provider windows."""
         max_retries = max(int(self.settings.backfill_rate_limit_max_retries), 0)
         base_cooldown = max(float(self.settings.backfill_rate_limit_cooldown_seconds), 1.0)
         max_cooldown = max(float(self.settings.backfill_rate_limit_max_cooldown_seconds), base_cooldown)
-        attempt = 0
-        while True:
-            try:
-                return await self._fetch_evidence_harvest_rows(
-                    device_ids=device_ids,
-                    start_at=start_at,
-                    end_at=end_at,
-                    account_scope=False,
-                )
-            except Exception as exc:
-                if not self.howen.is_rate_limited(exc) or attempt >= max_retries:
-                    raise
-                cooldown = min(base_cooldown * (2**attempt), max_cooldown)
-                next_retry_at = utc_now() + timedelta(seconds=cooldown)
-                await self._record_anomaly(
-                    source_type="backfill",
-                    device_id=None,
-                    company_slug=company_slug,
-                    received_at=utc_now(),
-                    raw_event_time=None,
-                    reason="evidence_backfill_rate_limited_retry",
-                    payload={
-                        "source": source,
-                        "company_slug": company_slug,
-                        "device_count": len(device_ids),
-                        "range_start": ensure_utc(start_at).isoformat(),
-                        "range_end": ensure_utc(end_at).isoformat(),
-                        "attempt": attempt + 1,
-                        "max_retries": max_retries,
-                        "cooldown_seconds": cooldown,
-                        "next_retry_at": ensure_utc(next_retry_at).isoformat(),
-                        "error": str(exc),
-                    },
-                )
-                if defer_on_rate_limit:
-                    raise HistoricalBackfillDeferred(
-                        next_retry_at=next_retry_at,
-                        message=(
-                            "Proveedor limitando la consulta historica de clips. "
-                            f"Reintento programado para {ensure_utc(next_retry_at).isoformat()}."
-                        ),
-                    ) from exc
-                await asyncio.sleep(cooldown)
-                attempt += 1
+        max_range_days = max(
+            int(getattr(self.settings, "howen_evidence_max_range_days", 1) or 1),
+            1,
+        )
+        grouped: dict[str, list[dict[str, Any]]] = {device_id: [] for device_id in device_ids}
+        window_start = start_at
+        while window_start <= end_at:
+            window_end = min(
+                window_start + timedelta(days=max_range_days) - timedelta(seconds=1),
+                end_at,
+            )
+            attempt = 0
+            while True:
+                try:
+                    window_rows = await self._fetch_evidence_harvest_rows(
+                        device_ids=device_ids,
+                        start_at=window_start,
+                        end_at=window_end,
+                        account_scope=False,
+                    )
+                    for device_id, rows in window_rows.items():
+                        grouped.setdefault(device_id, []).extend(rows)
+                    break
+                except Exception as exc:
+                    if not self.howen.is_rate_limited(exc) or attempt >= max_retries:
+                        raise
+                    cooldown = min(base_cooldown * (2**attempt), max_cooldown)
+                    next_retry_at = utc_now() + timedelta(seconds=cooldown)
+                    await self._record_anomaly(
+                        source_type="backfill",
+                        device_id=None,
+                        company_slug=company_slug,
+                        received_at=utc_now(),
+                        raw_event_time=None,
+                        reason="evidence_backfill_rate_limited_retry",
+                        payload={
+                            "source": source,
+                            "company_slug": company_slug,
+                            "device_count": len(device_ids),
+                            "range_start": ensure_utc(start_at).isoformat(),
+                            "range_end": ensure_utc(end_at).isoformat(),
+                            "provider_window_start": ensure_utc(window_start).isoformat(),
+                            "provider_window_end": ensure_utc(window_end).isoformat(),
+                            "attempt": attempt + 1,
+                            "max_retries": max_retries,
+                            "cooldown_seconds": cooldown,
+                            "next_retry_at": ensure_utc(next_retry_at).isoformat(),
+                            "error": str(exc),
+                        },
+                    )
+                    if defer_on_rate_limit:
+                        raise HistoricalBackfillDeferred(
+                            next_retry_at=next_retry_at,
+                            message=(
+                                "Proveedor limitando la consulta historica de clips. "
+                                f"Reintento programado para {ensure_utc(next_retry_at).isoformat()}."
+                            ),
+                        ) from exc
+                    await asyncio.sleep(cooldown)
+                    attempt += 1
+            window_start = window_end + timedelta(seconds=1)
+        return grouped
 
     async def _run_live_forever(self) -> None:
         force_login = False

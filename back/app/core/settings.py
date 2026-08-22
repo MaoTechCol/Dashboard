@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     howen_evidence_page_size: int = 500
     howen_evidence_max_pages_per_batch: int = 1000
     howen_evidence_max_devices_per_request: int = 200
+    howen_evidence_max_range_days: int = 1
     howen_evidence_fallback_to_device_api: bool = False
     harvest_cut_interval_minutes: int = 15
     harvest_overlap_minutes: int = 30
@@ -74,7 +75,7 @@ class Settings(BaseSettings):
     backfill_rate_limit_max_retries: int = 4
     backfill_rate_limit_cooldown_seconds: int = 20
     backfill_rate_limit_max_cooldown_seconds: int = 180
-    historical_rebuild_chunk_days: int = 30
+    historical_rebuild_chunk_days: int = 1
     historical_rebuild_max_concurrency: int = 1
     historical_batch_mode: str = "activation_only"
     historical_batch_size: int = 500
