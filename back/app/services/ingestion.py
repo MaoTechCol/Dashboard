@@ -1215,6 +1215,85 @@ class IngestionService:
                         session.add(rebuild_job)
                         session.commit()
 
+            evidence_retention_days = max(
+                int(getattr(self.settings, "howen_evidence_retention_days", 20) or 20),
+                1,
+            )
+            fallback_enabled = bool(
+                getattr(self.settings, "howen_historical_prefix_fallback", True)
+            )
+            evidence_cutoff_date = utc_now().astimezone(company_tz).date() - timedelta(
+                days=evidence_retention_days
+            )
+            official_prefix_end = min(end_date_local, evidence_cutoff_date - timedelta(days=1))
+            if fallback_enabled and current_local_date <= official_prefix_end:
+                if rebuild_job_id is not None:
+                    self._set_rebuild_phase(rebuild_job_id, phase="alarm_provider_archive")
+                prefix_start_date = current_local_date
+                prefix_start = datetime.combine(prefix_start_date, time.min, company_tz)
+                prefix_end = datetime.combine(
+                    official_prefix_end,
+                    time.max.replace(microsecond=0),
+                    company_tz,
+                )
+                result = await self._backfill_device_ids(
+                    device_ids=device_ids,
+                    start_at=prefix_start,
+                    end_at=prefix_end,
+                    source="harvest",
+                    company_slug=request.company_slug,
+                    rebuild_job_id=rebuild_job_id,
+                    yield_to_live_harvest=True,
+                    defer_on_rate_limit=True,
+                    force_official_api=True,
+                    progress_callback=(
+                        None
+                        if rebuild_job_id is None
+                        else lambda processed_devices, devices_total: self._update_rebuild_progress(
+                            rebuild_job_id=rebuild_job_id,
+                            days_total=days_total,
+                            completed_days_offset=completed_days_total,
+                            chunk_start_date=prefix_start_date,
+                            chunk_end_date=official_prefix_end,
+                            processed_devices=processed_devices,
+                            devices_total=devices_total,
+                        )
+                    ),
+                )
+                processed_days = (official_prefix_end - prefix_start_date).days + 1
+                total_inserted += int(result.get("inserted", 0))
+                total_anomalies += int(result.get("anomalies", 0))
+                total_failed_count += int(result.get("failed_count", 0))
+                observed_at = parse_timestamp(result.get("latest_observed_at"))
+                latest_observed_at = _max_datetime(latest_observed_at, observed_at)
+                _merge_alarm_batch_metrics(batch_metrics, result.get("batch"))
+                completed_days_total = min(days_total, completed_days_total + processed_days)
+                day_results.append(
+                    {
+                        "start_date_local": prefix_start_date.isoformat(),
+                        "end_date_local": official_prefix_end.isoformat(),
+                        "processed_days": processed_days,
+                        "provider": "official_device_archive",
+                        "inserted": int(result.get("inserted", 0)),
+                        "anomalies": int(result.get("anomalies", 0)),
+                        "failed_count": int(result.get("failed_count", 0)),
+                        "latest_observed_at": result.get("latest_observed_at"),
+                        "batch": result.get("batch"),
+                    }
+                )
+                if rebuild_job_id is not None:
+                    with self.session_factory() as session:
+                        rebuild_job = session.get(CompanyHistoricalRebuildJob, rebuild_job_id)
+                        if rebuild_job:
+                            rebuild_job.days_done = completed_days_total
+                            rebuild_job.inserted = total_inserted
+                            rebuild_job.anomalies = total_anomalies
+                            rebuild_job.failed_count = total_failed_count
+                            rebuild_job.last_processed_date = official_prefix_end
+                            session.add(rebuild_job)
+                            session.commit()
+                current_local_date = official_prefix_end + timedelta(days=1)
+
             while current_local_date <= end_date_local:
                 if rebuild_job_id is not None:
                     self._set_rebuild_phase(rebuild_job_id, phase="alarm_provider")
@@ -2791,6 +2870,7 @@ class IngestionService:
         yield_to_live_harvest: bool = False,
         defer_on_rate_limit: bool = False,
         progress_callback: Callable[[int, int], Awaitable[None] | None] | None = None,
+        force_official_api: bool = False,
     ) -> dict[str, Any]:
         inserted = 0
         anomalies = 0
@@ -2805,7 +2885,7 @@ class IngestionService:
         per_device_pause = max(float(self.settings.catchup_batch_pause_seconds), 0.0) if source == "catchup" else 0.0
         evidence_rows_by_device: dict[str, list[dict[str, Any]]] | None = None
         evidence_fetch_error: Exception | None = None
-        use_evidence_bulk = (
+        use_evidence_bulk = not force_official_api and (
             str(getattr(self.settings, "howen_alarm_source", "evidence_bulk")) == "evidence_bulk"
         )
         if use_evidence_bulk and device_ids:

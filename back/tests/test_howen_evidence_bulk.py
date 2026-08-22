@@ -291,6 +291,32 @@ class EvidencePartitionTests(unittest.IsolatedAsyncioTestCase):
             end_at,
         )
 
+    async def test_forced_archive_backfill_bypasses_evidence_bulk(self) -> None:
+        service = self._service()
+        service.settings = _settings(
+            howen_alarm_source="evidence_bulk",
+            catchup_batch_pause_seconds=0,
+        )
+        service.registry.get = lambda slug: SimpleNamespace(slug=slug)
+        service._historical_batch_enabled = lambda **kwargs: False
+        service._fetch_evidence_backfill_rows = AsyncMock(
+            side_effect=AssertionError("Alarm Clips must not be used for the archive prefix")
+        )
+        service._fetch_historical_backfill_rows = AsyncMock(return_value=[])
+
+        result = await service._backfill_device_ids(
+            device_ids=["1"],
+            start_at=datetime(2026, 7, 24, 0, 0, tzinfo=ZoneInfo("UTC")),
+            end_at=datetime(2026, 8, 1, 23, 59, 59, tzinfo=ZoneInfo("UTC")),
+            source="harvest",
+            company_slug="alpha",
+            force_official_api=True,
+        )
+
+        self.assertEqual(result["failed_count"], 0)
+        service._fetch_historical_backfill_rows.assert_awaited_once()
+        service._fetch_evidence_backfill_rows.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

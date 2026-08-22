@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     howen_evidence_max_devices_per_request: int = 200
     howen_evidence_max_range_days: int = 1
     howen_evidence_fallback_to_device_api: bool = False
+    howen_evidence_retention_days: int = 20
+    howen_historical_prefix_fallback: bool = True
     harvest_cut_interval_minutes: int = 15
     harvest_overlap_minutes: int = 30
     harvest_check_interval_seconds: int = 20
