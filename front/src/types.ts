@@ -380,6 +380,12 @@ export interface AlarmHarvestOverview {
   activeRebuilds: number;
   queuedRebuilds: number;
   bootstrappingCompanies: number;
+  providerUniqueDms: number;
+  localRawDms: number;
+  localAnalyticDms: number;
+  temporalDms: number;
+  unexplainedDms: number;
+  certified: boolean;
 }
 
 export interface BackgroundJobQueueSummary {

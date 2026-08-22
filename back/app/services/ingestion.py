@@ -2043,6 +2043,11 @@ class IngestionService:
                     device_row.status = "queued"
                     device_row.provider_rows = 0
                     device_row.provider_dms_rows = 0
+                    device_row.provider_unique_dms_rows = 0
+                    device_row.local_raw_dms_rows = 0
+                    device_row.local_analytic_dms_rows = 0
+                    device_row.temporal_dms_rows = 0
+                    device_row.unexplained_dms_rows = 0
                     device_row.inserted_raw = 0
                     device_row.inserted_dms = 0
                     device_row.future_rejected = 0
@@ -2056,6 +2061,17 @@ class IngestionService:
                 run.devices_done = len(completed_devices)
                 run.rows_total = sum(int(row.provider_rows or 0) for row in completed_rows)
                 run.dms_total = sum(int(row.provider_dms_rows or 0) for row in completed_rows)
+                run.provider_unique_dms_total = sum(
+                    int(row.provider_unique_dms_rows or 0) for row in completed_rows
+                )
+                run.local_raw_dms_total = sum(int(row.local_raw_dms_rows or 0) for row in completed_rows)
+                run.local_analytic_dms_total = sum(
+                    int(row.local_analytic_dms_rows or 0) for row in completed_rows
+                )
+                run.temporal_dms_total = sum(int(row.temporal_dms_rows or 0) for row in completed_rows)
+                run.unexplained_dms_total = sum(
+                    int(row.unexplained_dms_rows or 0) for row in completed_rows
+                )
                 session.commit()
                 run_id = run.id
                 pending_device_ids = [device_id for device_id in device_ids if device_id not in completed_devices]
@@ -2082,6 +2098,11 @@ class IngestionService:
                 current_run = session.get(AlarmHarvestRun, run_id)
                 rows_total = int(current_run.rows_total or 0) if current_run else 0
                 dms_total = int(current_run.dms_total or 0) if current_run else 0
+                provider_unique_dms_total = int(current_run.provider_unique_dms_total or 0) if current_run else 0
+                local_raw_dms_total = int(current_run.local_raw_dms_total or 0) if current_run else 0
+                local_analytic_dms_total = int(current_run.local_analytic_dms_total or 0) if current_run else 0
+                temporal_dms_total = int(current_run.temporal_dms_total or 0) if current_run else 0
+                unexplained_dms_total = int(current_run.unexplained_dms_total or 0) if current_run else 0
             next_retry_at: datetime | None = None
             evidence_rows_by_device: dict[str, list[dict[str, Any]]] | None = None
             use_device_api_fallback = False
@@ -2204,6 +2225,7 @@ class IngestionService:
                     continue
 
                 provider_dms_rows = 0
+                provider_dms_keys: set[str] = set()
                 inserted_raw = 0
                 inserted_dms = 0
                 future_rejected = 0
@@ -2229,6 +2251,12 @@ class IngestionService:
                     if alarm.classification_status == "classified_dms":
                         provider_dms_rows += 1
                     ingest_result = await self.ingest_alarm(alarm, received_at=received_at, source="harvest")
+                    if alarm.classification_status == "classified_dms":
+                        provider_key = str(
+                            ingest_result.get("provider_event_key") or alarm.guid or ""
+                        ).strip()
+                        if provider_key:
+                            provider_dms_keys.add(provider_key)
                     if ingest_result["inserted_raw"]:
                         inserted_raw += 1
                     if ingest_result["inserted_alarm_event"]:
@@ -2236,8 +2264,21 @@ class IngestionService:
                     if ingest_result["temporal_status"] == "future_rejected":
                         future_rejected += 1
 
+                certification = self._harvest_device_certification(
+                    company_slug=company.slug,
+                    device_id=device_id,
+                    window_start=window_start,
+                    window_end=window_end,
+                    provider_unique_dms_rows=len(provider_dms_keys),
+                )
+
                 rows_total += len(rows)
                 dms_total += provider_dms_rows
+                provider_unique_dms_total += certification["provider_unique_dms_rows"]
+                local_raw_dms_total += certification["local_raw_dms_rows"]
+                local_analytic_dms_total += certification["local_analytic_dms_rows"]
+                temporal_dms_total += certification["temporal_dms_rows"]
+                unexplained_dms_total += certification["unexplained_dms_rows"]
                 with self.session_factory() as session:
                     device_row = session.scalar(
                         select(AlarmHarvestDevice).where(
@@ -2249,6 +2290,11 @@ class IngestionService:
                         device_row.status = "succeeded"
                         device_row.provider_rows = len(rows)
                         device_row.provider_dms_rows = provider_dms_rows
+                        device_row.provider_unique_dms_rows = certification["provider_unique_dms_rows"]
+                        device_row.local_raw_dms_rows = certification["local_raw_dms_rows"]
+                        device_row.local_analytic_dms_rows = certification["local_analytic_dms_rows"]
+                        device_row.temporal_dms_rows = certification["temporal_dms_rows"]
+                        device_row.unexplained_dms_rows = certification["unexplained_dms_rows"]
                         device_row.inserted_raw = inserted_raw
                         device_row.inserted_dms = inserted_dms
                         device_row.future_rejected = future_rejected
@@ -2259,6 +2305,11 @@ class IngestionService:
                         run_row.devices_done += 1
                         run_row.rows_total = rows_total
                         run_row.dms_total = dms_total
+                        run_row.provider_unique_dms_total = provider_unique_dms_total
+                        run_row.local_raw_dms_total = local_raw_dms_total
+                        run_row.local_analytic_dms_total = local_analytic_dms_total
+                        run_row.temporal_dms_total = temporal_dms_total
+                        run_row.unexplained_dms_total = unexplained_dms_total
                         session.add(run_row)
                     session.commit()
 
@@ -2267,6 +2318,11 @@ class IngestionService:
                 if run_row:
                     run_row.rows_total = rows_total
                     run_row.dms_total = dms_total
+                    run_row.provider_unique_dms_total = provider_unique_dms_total
+                    run_row.local_raw_dms_total = local_raw_dms_total
+                    run_row.local_analytic_dms_total = local_analytic_dms_total
+                    run_row.temporal_dms_total = temporal_dms_total
+                    run_row.unexplained_dms_total = unexplained_dms_total
                     run_row.finished_at = utc_now()
                     run_row.status = run_status if run_status != "succeeded" else ("partial" if any_failed else "succeeded")
                     session.add(run_row)
@@ -2583,6 +2639,73 @@ class IngestionService:
             run = session.get(AlarmHarvestRun, run_id)
             return run.error_message if run else None
 
+    def _harvest_device_certification(
+        self,
+        *,
+        company_slug: str,
+        device_id: str,
+        window_start: datetime,
+        window_end: datetime,
+        provider_unique_dms_rows: int,
+    ) -> dict[str, int]:
+        """Certify a device against the exact provider window used by the cut."""
+
+        def identity(provider_event_key: str | None, guid: str | None) -> str | None:
+            value = str(provider_event_key or "").strip()
+            if value:
+                return f"key:{value}"
+            value = str(guid or "").strip()
+            return f"guid:{value}" if value else None
+
+        with self.session_factory() as session:
+            raw_rows = session.execute(
+                select(
+                    HowenAlarmRaw.provider_event_key,
+                    HowenAlarmRaw.guid,
+                    HowenAlarmRaw.temporal_status,
+                ).where(
+                    HowenAlarmRaw.company_slug == company_slug,
+                    HowenAlarmRaw.device_id == device_id,
+                    HowenAlarmRaw.classification_status == "classified_dms",
+                    HowenAlarmRaw.occurred_at >= window_start,
+                    HowenAlarmRaw.occurred_at < window_end,
+                )
+            ).all()
+            analytic_rows = session.execute(
+                select(AlarmEvent.provider_event_key, AlarmEvent.guid).where(
+                    AlarmEvent.company_slug == company_slug,
+                    AlarmEvent.device_id == device_id,
+                    AlarmEvent.classification_status == "classified_dms",
+                    AlarmEvent.occurred_at >= window_start,
+                    AlarmEvent.occurred_at < window_end,
+                )
+            ).all()
+
+        accepted_raw = {
+            token
+            for provider_key, guid, temporal_status in raw_rows
+            if temporal_status == "accepted" and (token := identity(provider_key, guid))
+        }
+        temporal_raw = {
+            token
+            for provider_key, guid, temporal_status in raw_rows
+            if temporal_status != "accepted" and (token := identity(provider_key, guid))
+        }
+        analytic = {
+            token
+            for provider_key, guid in analytic_rows
+            if (token := identity(provider_key, guid))
+        }
+        raw_difference = abs(provider_unique_dms_rows - len(accepted_raw | temporal_raw))
+        analytic_difference = len(accepted_raw.symmetric_difference(analytic))
+        return {
+            "provider_unique_dms_rows": provider_unique_dms_rows,
+            "local_raw_dms_rows": len(accepted_raw),
+            "local_analytic_dms_rows": len(analytic),
+            "temporal_dms_rows": len(temporal_raw),
+            "unexplained_dms_rows": raw_difference + analytic_difference,
+        }
+
     def _serialize_harvest_run(self, run_id: int) -> dict[str, Any]:
         with self.session_factory() as session:
             run = session.get(AlarmHarvestRun, run_id)
@@ -2600,6 +2723,12 @@ class IngestionService:
             "devices_done": run.devices_done,
             "rows_total": run.rows_total,
             "dms_total": run.dms_total,
+            "provider_unique_dms_total": run.provider_unique_dms_total,
+            "local_raw_dms_total": run.local_raw_dms_total,
+            "local_analytic_dms_total": run.local_analytic_dms_total,
+            "temporal_dms_total": run.temporal_dms_total,
+            "unexplained_dms_total": run.unexplained_dms_total,
+            "certified": run.status == "succeeded" and run.unexplained_dms_total == 0,
             "started_at": ensure_utc(run.started_at).isoformat() if run.started_at else None,
             "finished_at": ensure_utc(run.finished_at).isoformat() if run.finished_at else None,
             "error_message": run.error_message,

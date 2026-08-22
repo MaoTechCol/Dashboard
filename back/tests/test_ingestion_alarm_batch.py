@@ -363,6 +363,69 @@ class IngestionAlarmBatchTests(unittest.TestCase):
 
         self.assertEqual(read_projection(self.session_factory), read_projection(individual_sessions))
 
+    def test_harvest_device_certification_explains_temporal_rows(self) -> None:
+        now = utc_now().replace(microsecond=0)
+        window_start = now - timedelta(hours=1)
+        with self.session_factory() as session:
+            session.add_all(
+                [
+                    HowenAlarmRaw(
+                        guid="accepted-1",
+                        provider_event_key="provider-accepted",
+                        company_slug="test-company",
+                        device_id="device-1",
+                        source="harvest",
+                        occurred_at=now - timedelta(minutes=20),
+                        received_at=now,
+                        payload_json="{}",
+                        classification_status="classified_dms",
+                        temporal_status="accepted",
+                    ),
+                    HowenAlarmRaw(
+                        guid="future-1",
+                        provider_event_key="provider-future",
+                        company_slug="test-company",
+                        device_id="device-1",
+                        source="harvest",
+                        occurred_at=now - timedelta(minutes=10),
+                        received_at=now,
+                        payload_json="{}",
+                        classification_status="classified_dms",
+                        temporal_status="future_rejected",
+                    ),
+                    AlarmEvent(
+                        guid="accepted-1",
+                        provider_event_key="provider-accepted",
+                        company_slug="test-company",
+                        device_id="device-1",
+                        category="Ojos cerrados",
+                        classification_status="classified_dms",
+                        occurred_at=now - timedelta(minutes=20),
+                        source="harvest",
+                    ),
+                ]
+            )
+            session.commit()
+
+        result = self.service._harvest_device_certification(
+            company_slug="test-company",
+            device_id="device-1",
+            window_start=window_start,
+            window_end=now,
+            provider_unique_dms_rows=2,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "provider_unique_dms_rows": 2,
+                "local_raw_dms_rows": 1,
+                "local_analytic_dms_rows": 1,
+                "temporal_dms_rows": 1,
+                "unexplained_dms_rows": 0,
+            },
+        )
+
     def test_failure_rolls_back_only_the_current_chunk(self) -> None:
         now = utc_now().replace(microsecond=0)
         alarms = [

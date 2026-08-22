@@ -1,6 +1,8 @@
 # Certificacion de datos reales
 
-La certificacion compara exportes de Howen con las capas autoritativas de Supabase sin modificar datos operativos.
+La certificacion usa los Excel entregados exclusivamente como benchmark externo y
+los compara con las capas autoritativas de Supabase. Nunca importa esos archivos
+en `howen_alarm_raw`, `alarm_events`, snapshots ni kilometraje operativo.
 
 ## Alarmas
 
@@ -22,10 +24,16 @@ El resultado separa las filas fisicas duplicadas por Howen de los eventos
 unicos y muestra `raw_source_counts`, para distinguir clips autoritativos de
 filas historicas heredadas.
 
-Tanto los cortes oficiales como las reconstrucciones historicas usan
+El benchmark puede provenir del reporte general de alarmas, mientras los cortes
+oficiales y las reconstrucciones historicas del producto usan
 `record/findEvidences.action`, la misma fuente de Alarm Clips con video. El API
 historico por dispositivo queda disponible solo como fallback configurable y
 no esta habilitado en produccion.
+
+Por esa diferencia de origen, el resultado conserva archivos, rango, duplicados y
+desviaciones como evidencia de control, pero nunca intenta "corregir" produccion
+copiando filas del Excel. Una diferencia debe investigarse contra el corte y el
+dispositivo correspondientes en Howen.
 
 ## Kilometraje
 

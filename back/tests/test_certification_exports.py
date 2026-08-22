@@ -39,6 +39,8 @@ class CertificationExportTests(unittest.TestCase):
         self.assertEqual(result["dms_rows"], 2)
         self.assertEqual(result["unique_dms_rows"], 1)
         self.assertEqual(result["provider_duplicates"], 1)
+        self.assertEqual(result["purpose"], "external_benchmark")
+        self.assertFalse(result["mutates_operational_data"])
         key = result["records"][0]["primary_key"]
         self.assertEqual(key[2], "2026-08-21T15:00:00+00:00")
 

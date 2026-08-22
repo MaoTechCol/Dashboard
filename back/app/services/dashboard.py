@@ -1560,6 +1560,11 @@ class DashboardService:
         active_rebuilds = sum(1 for row in latest_rebuilds.values() if row.status == "running")
         queued_rebuilds = sum(1 for row in latest_rebuilds.values() if row.status == "queued")
         queue_depth = running_cuts + queued_cuts + active_rebuilds + queued_rebuilds
+        provider_unique_dms = sum(int(run.provider_unique_dms_total or 0) for run in latest_cut_runs)
+        local_raw_dms = sum(int(run.local_raw_dms_total or 0) for run in latest_cut_runs)
+        local_analytic_dms = sum(int(run.local_analytic_dms_total or 0) for run in latest_cut_runs)
+        temporal_dms = sum(int(run.temporal_dms_total or 0) for run in latest_cut_runs)
+        unexplained_dms = sum(int(run.unexplained_dms_total or 0) for run in latest_cut_runs)
         delayed_companies = 0
         rate_limited_companies = 0
         completed_companies = 0
@@ -1584,6 +1589,12 @@ class DashboardService:
             "activeRebuilds": active_rebuilds,
             "queuedRebuilds": queued_rebuilds,
             "bootstrappingCompanies": len(bootstrap_slugs),
+            "providerUniqueDms": provider_unique_dms,
+            "localRawDms": local_raw_dms,
+            "localAnalyticDms": local_analytic_dms,
+            "temporalDms": temporal_dms,
+            "unexplainedDms": unexplained_dms,
+            "certified": bool(latest_cut_runs) and unexplained_dms == 0,
         }
 
     def _build_admin_recent_metrics(

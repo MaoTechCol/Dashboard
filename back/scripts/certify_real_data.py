@@ -162,6 +162,8 @@ def read_alarm_export(path: Path, *, fleet_name: str | None, timezone: ZoneInfo)
         raise ValueError("Alarm export does not contain DMS rows for the selected fleet")
     return {
         "path": str(path),
+        "purpose": "external_benchmark",
+        "mutates_operational_data": False,
         "physical_rows": physical_rows,
         "dms_rows": dms_rows,
         "unique_dms_rows": len(counter),
@@ -232,6 +234,8 @@ def read_mileage_export(path: Path, *, fleet_name: str | None) -> dict[str, Any]
         range_end = export_date
     return {
         "path": str(path),
+        "purpose": "external_benchmark",
+        "mutates_operational_data": False,
         "range_start": min(day for _, day in date_columns),
         "range_end": range_end,
         "device_count": len(by_device),
@@ -289,6 +293,8 @@ def _read_mileage_record_rows(
         raise ValueError("Mileage record export does not contain rows for the selected fleet")
     return {
         "path": str(path),
+        "purpose": "external_benchmark",
+        "mutates_operational_data": False,
         "range_start": min(observed_days),
         "range_end": max(observed_days),
         "device_count": len(by_device),
@@ -334,6 +340,8 @@ def certify(
     result: dict[str, Any] = {
         "company_slug": company_slug,
         "generated_at": utc_now().isoformat(),
+        "purpose": "external_benchmark",
+        "mutates_operational_data": False,
     }
     range_start: datetime | None = alarm_export["range_start"] if alarm_export else None
     range_end: datetime | None = alarm_export["range_end"] if alarm_export else None

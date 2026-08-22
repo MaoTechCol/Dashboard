@@ -2250,6 +2250,20 @@ function AdminOperationsModule({
           detail={`harvest ${status?.raw_dms_count_24h ?? 0} · no DMS ${status?.non_dms_count_24h ?? 0} · futuros ${status?.future_rejected_count_24h ?? 0}`}
         />
         <MetricCard
+          label="Certificacion ultimo corte"
+          tone={(overview?.alarmHarvest?.unexplainedDms ?? 0) > 0 ? "danger" : "white"}
+          value={
+            overview?.alarmHarvest
+              ? `${overview.alarmHarvest.unexplainedDms} sin explicar`
+              : (loading ? "..." : "sin corte certificado")
+          }
+          detail={
+            overview?.alarmHarvest
+              ? `Proveedor ${overview.alarmHarvest.providerUniqueDms} · raw ${overview.alarmHarvest.localRawDms} · analitica ${overview.alarmHarvest.localAnalyticDms} · temporales ${overview.alarmHarvest.temporalDms}`
+              : "La igualdad se certifica por empresa, corte y dispositivo"
+          }
+        />
+        <MetricCard
           label="Corte historico actual"
           value={overview?.alarmHarvest?.currentCutAt ? formatDateTime(overview.alarmHarvest.currentCutAt, company?.timezone) : (loading ? "..." : "sin corte")}
           detail={
