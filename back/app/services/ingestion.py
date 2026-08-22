@@ -19,7 +19,33 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.time import as_timezone, ensure_utc, parse_timestamp, to_local_date, utc_now
-from app.models import AlarmEvent, AlarmEventAudit, AlarmHarvestDevice, AlarmHarvestRun, BackgroundJob, CatchupCursor, CompanyHistoricalRebuildJob, CompanyLifecycleAudit, DailyMileageSnapshot, DeviceRecord, HowenAlarmRaw, IngestState, IngestionAnomaly, ManagedCompany, MileageObservation, MileageReading, PublishedDashboardSnapshot, ReconciliationJob, ReconciliationJobDevice, ReconciliationReview, ReportAsset, UserAccount
+from app.models import (
+    AlarmEvent,
+    AlarmEventAudit,
+    AlarmHarvestDevice,
+    AlarmHarvestRun,
+    BackgroundJob,
+    CatchupCursor,
+    CompanyDailyAggregate,
+    CompanyHistoricalRebuildJob,
+    CompanyLifecycleAudit,
+    CompanyWindowAggregate,
+    DailyMileageSnapshot,
+    DataCertificationRun,
+    DeviceRecord,
+    HowenAlarmRaw,
+    IngestState,
+    IngestionAnomaly,
+    ManagedCompany,
+    MileageObservation,
+    MileageReading,
+    PublishedDashboardSnapshot,
+    ReconciliationJob,
+    ReconciliationJobDevice,
+    ReconciliationReview,
+    ReportAsset,
+    UserAccount,
+)
 from app.schemas import BackfillRequest, HistoricalRebuildRequest, NormalizedAlarm, NormalizedStatus
 from app.services.company_registry import CompanyRegistry
 from app.services.dashboard import DashboardService
@@ -1661,9 +1687,30 @@ class IngestionService:
             ("alarm_events", AlarmEvent, AlarmEvent.company_slug == company_slug),
             ("alarm_event_audit", AlarmEventAudit, AlarmEventAudit.company_slug == company_slug),
             ("daily_mileage_snapshots", DailyMileageSnapshot, DailyMileageSnapshot.company_slug == company_slug),
+            ("mileage_readings", MileageReading, self._build_company_scope_filter(
+                company_slug=company_slug,
+                device_column=MileageReading.device_id,
+                fleet_column=MileageReading.fleet_id,
+                device_ids=device_ids,
+                fleet_ids=fleet_ids,
+            )),
             ("mileage_observations", MileageObservation, MileageObservation.company_slug == company_slug),
             ("ingestion_anomalies", IngestionAnomaly, IngestionAnomaly.company_slug == company_slug),
             ("reconciliation_reviews", ReconciliationReview, ReconciliationReview.company_slug == company_slug),
+            ("catchup_cursors", CatchupCursor, CatchupCursor.company_slug == company_slug),
+            ("alarm_harvest_runs", AlarmHarvestRun, AlarmHarvestRun.company_slug == company_slug),
+            ("alarm_harvest_devices", AlarmHarvestDevice, AlarmHarvestDevice.run_id.in_(
+                select(AlarmHarvestRun.id).where(AlarmHarvestRun.company_slug == company_slug)
+            )),
+            ("company_historical_rebuild_jobs", CompanyHistoricalRebuildJob, CompanyHistoricalRebuildJob.company_slug == company_slug),
+            ("reconciliation_jobs", ReconciliationJob, ReconciliationJob.company_slug == company_slug),
+            ("reconciliation_job_devices", ReconciliationJobDevice, ReconciliationJobDevice.job_id.in_(
+                select(ReconciliationJob.id).where(ReconciliationJob.company_slug == company_slug)
+            )),
+            ("company_daily_aggregates", CompanyDailyAggregate, CompanyDailyAggregate.company_slug == company_slug),
+            ("company_window_aggregates", CompanyWindowAggregate, CompanyWindowAggregate.company_slug == company_slug),
+            ("data_certification_runs", DataCertificationRun, DataCertificationRun.company_slug == company_slug),
+            ("background_jobs", BackgroundJob, BackgroundJob.company_slug == company_slug),
             ("report_assets", ReportAsset, ReportAsset.company_slug == company_slug),
             ("published_dashboard_snapshots", PublishedDashboardSnapshot, PublishedDashboardSnapshot.company_slug == company_slug),
         ]
@@ -1844,9 +1891,13 @@ class IngestionService:
                     "alarm_harvest_devices": 0,
                     "alarm_harvest_runs": 0,
                     "historical_rebuild_jobs": 0,
+                    "background_jobs": 0,
                     "reconciliation_job_devices": 0,
                     "reconciliation_jobs": 0,
                     "reconciliation_reviews": 0,
+                    "company_daily_aggregates": 0,
+                    "company_window_aggregates": 0,
+                    "data_certification_runs": 0,
                     "published_snapshots": 0,
                     "catchup_cursors": 0,
                     "report_assets": 0,
@@ -1888,6 +1939,25 @@ class IngestionService:
                 ).delete(synchronize_session=False)
                 deleted_counts["reconciliation_jobs"] = session.query(ReconciliationJob).filter(
                     ReconciliationJob.company_slug == company_slug
+                ).delete(synchronize_session=False)
+                deleted_counts["company_daily_aggregates"] = session.query(CompanyDailyAggregate).filter(
+                    CompanyDailyAggregate.company_slug == company_slug
+                ).delete(synchronize_session=False)
+                deleted_counts["company_window_aggregates"] = session.query(CompanyWindowAggregate).filter(
+                    CompanyWindowAggregate.company_slug == company_slug
+                ).delete(synchronize_session=False)
+                deleted_counts["data_certification_runs"] = session.query(DataCertificationRun).filter(
+                    DataCertificationRun.company_slug == company_slug
+                ).delete(synchronize_session=False)
+                # Keep the currently running purge job as the durable audit receipt;
+                # every other queued, failed, or completed company job is stale once
+                # the operational data has been removed.
+                deleted_counts["background_jobs"] = session.query(BackgroundJob).filter(
+                    BackgroundJob.company_slug == company_slug,
+                    or_(
+                        BackgroundJob.job_type != "company_purge",
+                        BackgroundJob.status != "running",
+                    ),
                 ).delete(synchronize_session=False)
 
                 snapshot_filter = self._build_company_scope_filter(
