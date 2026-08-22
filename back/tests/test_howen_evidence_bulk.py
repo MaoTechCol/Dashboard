@@ -296,6 +296,7 @@ class EvidencePartitionTests(unittest.IsolatedAsyncioTestCase):
         service.settings = _settings(
             howen_alarm_source="evidence_bulk",
             catchup_batch_pause_seconds=0,
+            howen_historical_device_pause_seconds=0,
         )
         service.registry.get = lambda slug: SimpleNamespace(slug=slug)
         service._historical_batch_enabled = lambda **kwargs: False

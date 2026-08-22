@@ -14,6 +14,7 @@ Las reconstrucciones iniciales de empresas usan escritura masiva sin cambiar los
 - `HOWEN_EVIDENCE_MAX_RANGE_DAYS=1` evita que Howen trunque silenciosamente rangos amplios de clips.
 - `HOWEN_EVIDENCE_RETENTION_DAYS=20` delimita el tramo reciente que Alarm Clips conserva de forma confiable.
 - `HOWEN_HISTORICAL_PREFIX_FALLBACK=true` recupera el prefijo anterior con el API historico oficial por dispositivo.
+- `HOWEN_HISTORICAL_DEVICE_PAUSE_SECONDS=6.0` espacia ese recorrido para respetar el rate limit de Howen sin reiniciar el job.
 - `HOWEN_ALARM_SOURCE=evidence_bulk` usa la misma consulta agrupada de Alarm Clips para los cortes de 15 minutos.
 - `HOWEN_ALARM_SOURCE=official_device` restaura inmediatamente la consulta historica por vehiculo.
 

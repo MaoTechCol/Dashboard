@@ -1244,7 +1244,7 @@ class IngestionService:
                     company_slug=request.company_slug,
                     rebuild_job_id=rebuild_job_id,
                     yield_to_live_harvest=True,
-                    defer_on_rate_limit=True,
+                    defer_on_rate_limit=False,
                     force_official_api=True,
                     progress_callback=(
                         None
@@ -2882,7 +2882,15 @@ class IngestionService:
         if company_slug:
             with suppress(KeyError):
                 batch_company = self.registry.get(company_slug)
-        per_device_pause = max(float(self.settings.catchup_batch_pause_seconds), 0.0) if source == "catchup" else 0.0
+        if force_official_api:
+            per_device_pause = max(
+                float(getattr(self.settings, "howen_historical_device_pause_seconds", 6.0) or 0.0),
+                0.0,
+            )
+        elif source == "catchup":
+            per_device_pause = max(float(self.settings.catchup_batch_pause_seconds), 0.0)
+        else:
+            per_device_pause = 0.0
         evidence_rows_by_device: dict[str, list[dict[str, Any]]] | None = None
         evidence_fetch_error: Exception | None = None
         use_evidence_bulk = not force_official_api and (
